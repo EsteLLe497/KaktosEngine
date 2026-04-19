@@ -314,8 +314,14 @@ std::wstring SerializeScenario(const ScenarioDocument& document)
             break;
         case ScriptCommand::Type::Background:
             output += L"[bg";
+            output += AppendAttribute(L"name", command.parameters.count(L"name") ? command.parameters.at(L"name") : L"");
             output += AppendAttribute(L"storage", command.parameters.count(L"storage") ? command.parameters.at(L"storage") : L"");
             output += AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"");
+            output += AppendAttribute(L"visible", command.parameters.count(L"visible") ? command.parameters.at(L"visible") : L"");
+            output += AppendAttribute(L"x", command.parameters.count(L"x") ? command.parameters.at(L"x") : L"");
+            output += AppendAttribute(L"y", command.parameters.count(L"y") ? command.parameters.at(L"y") : L"");
+            output += AppendAttribute(L"scale", command.parameters.count(L"scale") ? command.parameters.at(L"scale") : L"");
+            output += AppendAttribute(L"opacity", command.parameters.count(L"opacity") ? command.parameters.at(L"opacity") : L"");
             output += L"]\r\n";
             break;
         case ScriptCommand::Type::Character:
@@ -323,6 +329,11 @@ std::wstring SerializeScenario(const ScenarioDocument& document)
             output += AppendAttribute(L"pos", command.parameters.count(L"pos") ? command.parameters.at(L"pos") : L"");
             output += AppendAttribute(L"name", command.parameters.count(L"name") ? command.parameters.at(L"name") : L"");
             output += AppendAttribute(L"storage", command.parameters.count(L"storage") ? command.parameters.at(L"storage") : L"");
+            output += AppendAttribute(L"visible", command.parameters.count(L"visible") ? command.parameters.at(L"visible") : L"");
+            output += AppendAttribute(L"x", command.parameters.count(L"x") ? command.parameters.at(L"x") : L"");
+            output += AppendAttribute(L"y", command.parameters.count(L"y") ? command.parameters.at(L"y") : L"");
+            output += AppendAttribute(L"scale", command.parameters.count(L"scale") ? command.parameters.at(L"scale") : L"");
+            output += AppendAttribute(L"opacity", command.parameters.count(L"opacity") ? command.parameters.at(L"opacity") : L"");
             output += L"]\r\n";
             break;
         case ScriptCommand::Type::HideCharacter:
@@ -344,6 +355,93 @@ std::wstring SerializeScenario(const ScenarioDocument& document)
                 output += L"[option" + AppendAttribute(L"text", link.first) + AppendAttribute(L"target", link.second) + L"]\r\n";
             }
             output += L"[endchoice]\r\n";
+            break;
+        case ScriptCommand::Type::Bgm:
+            output += L"[bgm";
+            output += AppendAttribute(L"category", command.parameters.count(L"category") ? command.parameters.at(L"category") : L"");
+            output += AppendAttribute(L"storage", command.parameters.count(L"storage") ? command.parameters.at(L"storage") : L"");
+            output += AppendAttribute(L"volume", command.parameters.count(L"volume") ? command.parameters.at(L"volume") : L"");
+            output += AppendAttribute(L"loop", command.parameters.count(L"loop") ? command.parameters.at(L"loop") : L"");
+            output += AppendAttribute(L"fadein", command.parameters.count(L"fadein") ? command.parameters.at(L"fadein") : L"");
+            output += AppendAttribute(L"fadeout", command.parameters.count(L"fadeout") ? command.parameters.at(L"fadeout") : L"");
+            output += L"]\r\n";
+            break;
+        case ScriptCommand::Type::StopBgm:
+            output += L"[stopbgm]\r\n";
+            break;
+        case ScriptCommand::Type::Se:
+            output += L"[se";
+            output += AppendAttribute(L"category", command.parameters.count(L"category") ? command.parameters.at(L"category") : L"");
+            output += AppendAttribute(L"storage", command.parameters.count(L"storage") ? command.parameters.at(L"storage") : L"");
+            output += AppendAttribute(L"volume", command.parameters.count(L"volume") ? command.parameters.at(L"volume") : L"");
+            output += AppendAttribute(L"loop", command.parameters.count(L"loop") ? command.parameters.at(L"loop") : L"");
+            output += AppendAttribute(L"fadein", command.parameters.count(L"fadein") ? command.parameters.at(L"fadein") : L"");
+            output += AppendAttribute(L"fadeout", command.parameters.count(L"fadeout") ? command.parameters.at(L"fadeout") : L"");
+            output += L"]\r\n";
+            break;
+        case ScriptCommand::Type::Voice:
+            output += L"[voice";
+            output += AppendAttribute(L"category", command.parameters.count(L"category") ? command.parameters.at(L"category") : L"");
+            output += AppendAttribute(L"storage", command.parameters.count(L"storage") ? command.parameters.at(L"storage") : L"");
+            output += AppendAttribute(L"volume", command.parameters.count(L"volume") ? command.parameters.at(L"volume") : L"");
+            output += AppendAttribute(L"loop", command.parameters.count(L"loop") ? command.parameters.at(L"loop") : L"");
+            output += AppendAttribute(L"fadein", command.parameters.count(L"fadein") ? command.parameters.at(L"fadein") : L"");
+            output += AppendAttribute(L"fadeout", command.parameters.count(L"fadeout") ? command.parameters.at(L"fadeout") : L"");
+            output += L"]\r\n";
+            break;
+        case ScriptCommand::Type::Wait:
+            output += L"[wait" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::ClearText:
+            output += L"[cleartext]\r\n";
+            break;
+        case ScriptCommand::Type::MessageWindow:
+            output += L"[messagewindow" + AppendAttribute(L"visible", command.parameters.count(L"visible") ? command.parameters.at(L"visible") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::TextSpeed:
+            output += L"[textspeed" + AppendAttribute(L"value", command.parameters.count(L"value") ? command.parameters.at(L"value") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::MessageFont:
+            output += L"[font" + AppendAttribute(L"face", command.parameters.count(L"face") ? command.parameters.at(L"face") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::MessageFontReset:
+            output += L"[fontreset]\r\n";
+            break;
+        case ScriptCommand::Type::TextColor:
+            output += L"[textcolor" + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::NameColor:
+            output += L"[namecolor" + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::NameWindow:
+            output += L"[namewindow" + AppendAttribute(L"visible", command.parameters.count(L"visible") ? command.parameters.at(L"visible") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::VerticalText:
+            output += L"[vertical" + AppendAttribute(L"enabled", command.parameters.count(L"enabled") ? command.parameters.at(L"enabled") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::PageBreak:
+            output += L"[page]\r\n";
+            break;
+        case ScriptCommand::Type::Shake:
+            output += L"[shake" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"power", command.parameters.count(L"power") ? command.parameters.at(L"power") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::Fade:
+            output += L"[fade" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::Transition:
+            output += L"[transition" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"style", command.parameters.count(L"style") ? command.parameters.at(L"style") : L"") + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + AppendAttribute(L"parallel", command.parameters.count(L"parallel") ? command.parameters.at(L"parallel") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::Zoom:
+            output += L"[zoom" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"scale", command.parameters.count(L"scale") ? command.parameters.at(L"scale") : L"") + AppendAttribute(L"parallel", command.parameters.count(L"parallel") ? command.parameters.at(L"parallel") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::Pan:
+            output += L"[pan" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"x", command.parameters.count(L"x") ? command.parameters.at(L"x") : L"") + AppendAttribute(L"y", command.parameters.count(L"y") ? command.parameters.at(L"y") : L"") + AppendAttribute(L"parallel", command.parameters.count(L"parallel") ? command.parameters.at(L"parallel") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::Flash:
+            output += L"[flash" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + AppendAttribute(L"opacity", command.parameters.count(L"opacity") ? command.parameters.at(L"opacity") : L"") + AppendAttribute(L"parallel", command.parameters.count(L"parallel") ? command.parameters.at(L"parallel") : L"") + L"]\r\n";
+            break;
+        case ScriptCommand::Type::Tint:
+            output += L"[tint" + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + AppendAttribute(L"opacity", command.parameters.count(L"opacity") ? command.parameters.at(L"opacity") : L"") + L"]\r\n";
             break;
         case ScriptCommand::Type::SetValue:
             output += L"[set" + AppendAttribute(L"name", command.parameters.count(L"name") ? command.parameters.at(L"name") : L"") + AppendAttribute(L"value", command.parameters.count(L"value") ? command.parameters.at(L"value") : L"") + L"]\r\n";
@@ -432,8 +530,14 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
         if (tagName == L"bg")
         {
             ScriptCommand command = MakeCommand(ScriptCommand::Type::Background, lineNumber);
+            SetCommandParameter(command, L"name", GetAttributeValue(body, L"name"));
             SetCommandParameter(command, L"storage", GetAttributeValue(body, L"storage"));
             SetCommandParameter(command, L"color", GetAttributeValue(body, L"color"));
+            SetCommandParameter(command, L"visible", GetAttributeValue(body, L"visible"));
+            SetCommandParameter(command, L"x", GetAttributeValue(body, L"x"));
+            SetCommandParameter(command, L"y", GetAttributeValue(body, L"y"));
+            SetCommandParameter(command, L"scale", GetAttributeValue(body, L"scale"));
+            SetCommandParameter(command, L"opacity", GetAttributeValue(body, L"opacity"));
             document.commands.push_back(std::move(command));
             continue;
         }
@@ -444,6 +548,11 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
             SetCommandParameter(command, L"pos", GetAttributeValue(body, L"pos"));
             SetCommandParameter(command, L"storage", GetAttributeValue(body, L"storage"));
             SetCommandParameter(command, L"name", GetAttributeValue(body, L"name"));
+            SetCommandParameter(command, L"visible", GetAttributeValue(body, L"visible"));
+            SetCommandParameter(command, L"x", GetAttributeValue(body, L"x"));
+            SetCommandParameter(command, L"y", GetAttributeValue(body, L"y"));
+            SetCommandParameter(command, L"scale", GetAttributeValue(body, L"scale"));
+            SetCommandParameter(command, L"opacity", GetAttributeValue(body, L"opacity"));
             document.commands.push_back(std::move(command));
             continue;
         }
@@ -534,6 +643,203 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
                 return false;
             }
 
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"bgm")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Bgm, lineNumber);
+            SetCommandParameter(command, L"category", GetAttributeValue(body, L"category"));
+            SetCommandParameter(command, L"storage", GetAttributeValue(body, L"storage"));
+            SetCommandParameter(command, L"volume", GetAttributeValue(body, L"volume"));
+            SetCommandParameter(command, L"loop", GetAttributeValue(body, L"loop"));
+            SetCommandParameter(command, L"fadein", GetAttributeValue(body, L"fadein"));
+            SetCommandParameter(command, L"fadeout", GetAttributeValue(body, L"fadeout"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"stopbgm")
+        {
+            document.commands.push_back(MakeCommand(ScriptCommand::Type::StopBgm, lineNumber));
+            continue;
+        }
+
+        if (tagName == L"se")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Se, lineNumber);
+            SetCommandParameter(command, L"category", GetAttributeValue(body, L"category"));
+            SetCommandParameter(command, L"storage", GetAttributeValue(body, L"storage"));
+            SetCommandParameter(command, L"volume", GetAttributeValue(body, L"volume"));
+            SetCommandParameter(command, L"loop", GetAttributeValue(body, L"loop"));
+            SetCommandParameter(command, L"fadein", GetAttributeValue(body, L"fadein"));
+            SetCommandParameter(command, L"fadeout", GetAttributeValue(body, L"fadeout"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"voice")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Voice, lineNumber);
+            SetCommandParameter(command, L"category", GetAttributeValue(body, L"category"));
+            SetCommandParameter(command, L"storage", GetAttributeValue(body, L"storage"));
+            SetCommandParameter(command, L"volume", GetAttributeValue(body, L"volume"));
+            SetCommandParameter(command, L"loop", GetAttributeValue(body, L"loop"));
+            SetCommandParameter(command, L"fadein", GetAttributeValue(body, L"fadein"));
+            SetCommandParameter(command, L"fadeout", GetAttributeValue(body, L"fadeout"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"wait")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Wait, lineNumber);
+            SetCommandParameter(command, L"time", GetAttributeValue(body, L"time"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"cleartext")
+        {
+            document.commands.push_back(MakeCommand(ScriptCommand::Type::ClearText, lineNumber));
+            continue;
+        }
+
+        if (tagName == L"messagewindow")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::MessageWindow, lineNumber);
+            SetCommandParameter(command, L"visible", GetAttributeValue(body, L"visible"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"textspeed")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::TextSpeed, lineNumber);
+            SetCommandParameter(command, L"value", GetAttributeValue(body, L"value"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"font")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::MessageFont, lineNumber);
+            SetCommandParameter(command, L"face", GetAttributeValue(body, L"face"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"fontreset")
+        {
+            document.commands.push_back(MakeCommand(ScriptCommand::Type::MessageFontReset, lineNumber));
+            continue;
+        }
+
+        if (tagName == L"textcolor")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::TextColor, lineNumber);
+            SetCommandParameter(command, L"color", GetAttributeValue(body, L"color"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"namecolor")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::NameColor, lineNumber);
+            SetCommandParameter(command, L"color", GetAttributeValue(body, L"color"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"namewindow")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::NameWindow, lineNumber);
+            SetCommandParameter(command, L"visible", GetAttributeValue(body, L"visible"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"vertical")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::VerticalText, lineNumber);
+            SetCommandParameter(command, L"enabled", GetAttributeValue(body, L"enabled"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"page")
+        {
+            document.commands.push_back(MakeCommand(ScriptCommand::Type::PageBreak, lineNumber));
+            continue;
+        }
+
+        if (tagName == L"shake")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Shake, lineNumber);
+            SetCommandParameter(command, L"time", GetAttributeValue(body, L"time"));
+            SetCommandParameter(command, L"power", GetAttributeValue(body, L"power"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"fade")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Fade, lineNumber);
+            SetCommandParameter(command, L"time", GetAttributeValue(body, L"time"));
+            SetCommandParameter(command, L"color", GetAttributeValue(body, L"color"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"transition")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Transition, lineNumber);
+            SetCommandParameter(command, L"time", GetAttributeValue(body, L"time"));
+            SetCommandParameter(command, L"style", GetAttributeValue(body, L"style"));
+            SetCommandParameter(command, L"color", GetAttributeValue(body, L"color"));
+            SetCommandParameter(command, L"parallel", GetAttributeValue(body, L"parallel"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"zoom")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Zoom, lineNumber);
+            SetCommandParameter(command, L"time", GetAttributeValue(body, L"time"));
+            SetCommandParameter(command, L"scale", GetAttributeValue(body, L"scale"));
+            SetCommandParameter(command, L"parallel", GetAttributeValue(body, L"parallel"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"pan")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Pan, lineNumber);
+            SetCommandParameter(command, L"time", GetAttributeValue(body, L"time"));
+            SetCommandParameter(command, L"x", GetAttributeValue(body, L"x"));
+            SetCommandParameter(command, L"y", GetAttributeValue(body, L"y"));
+            SetCommandParameter(command, L"parallel", GetAttributeValue(body, L"parallel"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"flash")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Flash, lineNumber);
+            SetCommandParameter(command, L"time", GetAttributeValue(body, L"time"));
+            SetCommandParameter(command, L"color", GetAttributeValue(body, L"color"));
+            SetCommandParameter(command, L"opacity", GetAttributeValue(body, L"opacity"));
+            SetCommandParameter(command, L"parallel", GetAttributeValue(body, L"parallel"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
+        if (tagName == L"tint")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::Tint, lineNumber);
+            SetCommandParameter(command, L"color", GetAttributeValue(body, L"color"));
+            SetCommandParameter(command, L"opacity", GetAttributeValue(body, L"opacity"));
             document.commands.push_back(std::move(command));
             continue;
         }
