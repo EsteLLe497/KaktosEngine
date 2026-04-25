@@ -15,7 +15,9 @@
 #include <cstdlib>
 #include <cwctype>
 #include <functional>
+#include <iterator>
 #include <sstream>
+#include <unordered_set>
 
 #define STB_VORBIS_HEADER_ONLY
 #include "stb_vorbis.c"
@@ -150,6 +152,21 @@ namespace
         return normalized == L"true" || normalized == L"1" || normalized == L"yes" || normalized == L"on";
     }
 
+    bool FileExistsForScenario(const std::wstring& baseDir, const std::wstring& path)
+    {
+        if (path.empty())
+        {
+            return true;
+        }
+
+        DWORD attributes = GetFileAttributesW(CombinePath(baseDir, path).c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES)
+        {
+            attributes = GetFileAttributesW(path.c_str());
+        }
+        return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+    }
+
     int ParseIntValue(const std::wstring& value, int defaultValue)
     {
         if (value.empty())
@@ -200,6 +217,27 @@ namespace
         FillRect(hdc, &thumbRect, thumbBrush);
         DeleteObject(thumbBrush);
         FrameRect(hdc, &thumbRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+    }
+
+    void DrawAlphaOverlay(HDC hdc, const RECT& targetRect, COLORREF color, int alpha)
+    {
+        if (alpha <= 0 || targetRect.right <= targetRect.left || targetRect.bottom <= targetRect.top)
+        {
+            return;
+        }
+
+        HDC overlayDc = CreateCompatibleDC(hdc);
+        HBITMAP overlayBitmap = CreateCompatibleBitmap(hdc, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top);
+        HGDIOBJ oldBitmap = SelectObject(overlayDc, overlayBitmap);
+        RECT overlayRect = { 0, 0, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top };
+        HBRUSH overlayBrush = CreateSolidBrush(color);
+        FillRect(overlayDc, &overlayRect, overlayBrush);
+        DeleteObject(overlayBrush);
+        BLENDFUNCTION overlayBlend = { AC_SRC_OVER, 0, static_cast<BYTE>((std::max)(0, (std::min)(255, alpha))), 0 };
+        AlphaBlend(hdc, targetRect.left, targetRect.top, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top, overlayDc, 0, 0, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top, overlayBlend);
+        SelectObject(overlayDc, oldBitmap);
+        DeleteObject(overlayBitmap);
+        DeleteDC(overlayDc);
     }
 
     std::wstring GetLegacyAudioAlias(AudioChannel channel)
@@ -295,7 +333,7 @@ namespace
                     break;
                 }
             }
-            else if (!CopyFileW(sourcePath.c_str(), targetPath.c_str(), FALSE))
+            else if (!CopyFileW(sourcePath.c_str(), targetPath.c_str(), TRUE))
             {
                 ok = false;
                 break;
@@ -1114,19 +1152,19 @@ RECT NovelRuntime::GetStageRect(const RECT& previewRect) const
     if (!showPreviewPanel_)
     {
         const int top = GetPreviewContentTop(previewRect);
-        return RECT{ previewRect.left + 16, top, previewRect.right - 16, top };
+        return RECT{ previewRect.left, top, previewRect.right, top };
     }
     const int top = GetPreviewContentTop(previewRect);
-    return RECT{ previewRect.left + 16, top, previewRect.right - 16, previewRect.bottom - 16 };
+    return RECT{ previewRect.left, top, previewRect.right, previewRect.bottom };
 }
 
 RECT NovelRuntime::GetMessageRect(const RECT& previewRect) const
 {
     if (!showPreviewPanel_)
     {
-        return RECT{ previewRect.left + 16, previewRect.bottom - 20, previewRect.right - 16, previewRect.bottom - 20 };
+        return RECT{ previewRect.left, previewRect.bottom, previewRect.right, previewRect.bottom };
     }
-    return RECT{ previewRect.left + 16, previewRect.bottom - 190, previewRect.right - 16, previewRect.bottom - 20 };
+    return RECT{ previewRect.left, previewRect.bottom - 170, previewRect.right, previewRect.bottom };
 }
 
 RECT NovelRuntime::GetEventListRect(const RECT& previewRect) const
@@ -1969,7 +2007,19 @@ void NovelRuntime::ApplyFadeCommand(const ScriptCommand& command)
         fadeColor_ = color;
     }
     const std::wstring target = Trim(GetCommandParameter(command, L"target"));
-    fadeTarget_ = (target == L"message" || target == L"all") ? target : L"stage";
+    if (target == L"message" ||
+        target == L"all" ||
+        target == L"background" ||
+        target == L"character:left" ||
+        target == L"character:center" ||
+        target == L"character:right")
+    {
+        fadeTarget_ = target;
+    }
+    else
+    {
+        fadeTarget_ = L"stage";
+    }
     statusText_ = L"フェード: " + std::to_wstring(duration) + L"ms";
     if (duration > 0 && !ParseBoolValue(GetCommandParameter(command, L"parallel"), false))
     {
@@ -2098,9 +2148,51 @@ bool NovelRuntime::EvaluateCondition(const ScriptCommand& command) const
 
 bool NovelRuntime::JumpToLabel(const std::wstring& target)
 {
+    if (target == L"__load")
+    {
+        LoadRuntimeStateFromDialog();
+        return false;
+    }
+    if (target == L"__options")
+    {
+        ShowSettingsDialog();
+        return false;
+    }
+    if (target == L"__exit")
+    {
+        if (hostWindow_)
+        {
+            PostMessageW(hostWindow_, WM_CLOSE, 0, 0);
+        }
+        return false;
+    }
+
     const auto found = scenario_.labels.find(target);
     if (found == scenario_.labels.end())
     {
+        std::wstring normalizedTarget = target;
+        if (!normalizedTarget.empty())
+        {
+            CharLowerBuffW(&normalizedTarget[0], static_cast<DWORD>(normalizedTarget.size()));
+        }
+        if (normalizedTarget.size() >= 3 && normalizedTarget.substr(normalizedTarget.size() - 3) == L".ks")
+        {
+            const std::wstring candidates[] =
+            {
+                target,
+                CombinePath(scenarioBaseDir_, target),
+                CombinePath(GetScenarioDirectory(), target),
+                CombinePath(GetAssetsRootDirectory(), target),
+            };
+            for (const std::wstring& candidate : candidates)
+            {
+                if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
+                {
+                    LoadScenario(candidate);
+                    return false;
+                }
+            }
+        }
         currentText_ = L"jump target not found: " + target;
         reachedEnd_ = true;
         return false;
@@ -2270,6 +2362,268 @@ void NovelRuntime::SelectChoice(size_t index)
     }
 }
 
+std::vector<ScenarioIssue> NovelRuntime::ValidateScenario() const
+{
+    std::vector<ScenarioIssue> issues;
+    std::unordered_map<std::wstring, size_t> labelFirstIndex;
+    std::unordered_set<std::wstring> knownVariables;
+
+    auto addIssue = [&](size_t commandIndex, const std::wstring& message)
+    {
+        issues.push_back(ScenarioIssue{ commandIndex, message });
+    };
+
+    auto hasLabel = [&](const std::wstring& label)
+    {
+        return !label.empty() && scenario_.labels.find(label) != scenario_.labels.end();
+    };
+    auto isScenarioFileTarget = [&](const std::wstring& target)
+    {
+        std::wstring normalized = target;
+        if (!normalized.empty())
+        {
+            CharLowerBuffW(&normalized[0], static_cast<DWORD>(normalized.size()));
+        }
+        if (normalized.size() < 3 || normalized.substr(normalized.size() - 3) != L".ks")
+        {
+            return false;
+        }
+
+        const std::wstring candidates[] =
+        {
+            target,
+            CombinePath(scenarioBaseDir_, target),
+            CombinePath(GetScenarioDirectory(), target),
+            CombinePath(GetAssetsRootDirectory(), target),
+        };
+        for (const std::wstring& candidate : candidates)
+        {
+            if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (const VariableDefinition& variable : variableDefinitions_)
+    {
+        if (!variable.name.empty())
+        {
+            knownVariables.insert(variable.name);
+        }
+    }
+
+    for (size_t i = 0; i < scenario_.commands.size(); ++i)
+    {
+        const ScriptCommand& command = scenario_.commands[i];
+        if (command.type != ScriptCommand::Type::Label)
+        {
+            continue;
+        }
+
+        const std::wstring label = GetCommandParameter(command, L"name");
+        if (label.empty())
+        {
+            addIssue(i, L"ラベル名が空です");
+            continue;
+        }
+
+        const auto inserted = labelFirstIndex.insert({ label, i });
+        if (!inserted.second)
+        {
+            addIssue(i, L"ラベルが重複しています: " + label);
+        }
+    }
+
+    std::vector<bool> reachable(scenario_.commands.size(), false);
+    std::vector<size_t> stack;
+    if (!scenario_.commands.empty())
+    {
+        stack.push_back(0);
+    }
+    while (!stack.empty())
+    {
+        const size_t index = stack.back();
+        stack.pop_back();
+        if (index >= scenario_.commands.size() || reachable[index])
+        {
+            continue;
+        }
+
+        reachable[index] = true;
+        const ScriptCommand& command = scenario_.commands[index];
+        auto pushNext = [&]()
+        {
+            if (index + 1 < scenario_.commands.size())
+            {
+                stack.push_back(index + 1);
+            }
+        };
+        auto pushLabel = [&](const std::wstring& label)
+        {
+            const auto found = scenario_.labels.find(label);
+            if (found != scenario_.labels.end())
+            {
+                stack.push_back(found->second);
+            }
+        };
+
+        if (command.type == ScriptCommand::Type::Jump)
+        {
+            pushLabel(GetCommandParameter(command, L"target"));
+        }
+        else if (command.type == ScriptCommand::Type::Choice)
+        {
+            for (const auto& link : command.links)
+            {
+                pushLabel(link.second);
+            }
+        }
+        else if (command.type == ScriptCommand::Type::IfJump)
+        {
+            pushLabel(GetCommandParameter(command, L"target"));
+            pushNext();
+        }
+        else
+        {
+            pushNext();
+        }
+    }
+
+    for (size_t i = 0; i < scenario_.commands.size(); ++i)
+    {
+        const ScriptCommand& command = scenario_.commands[i];
+        if (!reachable.empty() && !reachable[i])
+        {
+            addIssue(i, L"このイベントには到達できません");
+        }
+
+        if (command.type == ScriptCommand::Type::Jump || command.type == ScriptCommand::Type::IfJump)
+        {
+            const std::wstring target = GetCommandParameter(command, L"target");
+            if (target.empty())
+            {
+                addIssue(i, L"遷移先ラベルが空です");
+            }
+            else if (!hasLabel(target) && !isScenarioFileTarget(target))
+            {
+                addIssue(i, L"遷移先ラベルが見つかりません: " + target);
+            }
+        }
+
+        if (command.type == ScriptCommand::Type::Choice)
+        {
+            if (command.links.empty())
+            {
+                addIssue(i, L"選択肢の枝がありません");
+            }
+            for (size_t linkIndex = 0; linkIndex < command.links.size(); ++linkIndex)
+            {
+                const auto& link = command.links[linkIndex];
+                if (link.first.empty())
+                {
+                    addIssue(i, L"選択肢文が空です: " + std::to_wstring(linkIndex + 1));
+                }
+                if (link.second.empty())
+                {
+                    addIssue(i, L"選択肢の遷移先が空です: " + std::to_wstring(linkIndex + 1));
+                }
+                else if (!hasLabel(link.second) && !isScenarioFileTarget(link.second))
+                {
+                    addIssue(i, L"選択肢の遷移先が見つかりません: " + link.second);
+                }
+
+                const std::wstring conditionName = GetCommandParameter(command, GetChoiceParamKey(L"__choice_cond_name_", linkIndex));
+                if (!conditionName.empty() && knownVariables.find(conditionName) == knownVariables.end())
+                {
+                    addIssue(i, L"選択肢条件の変数が未定義です: " + conditionName);
+                }
+            }
+        }
+
+        if (command.type == ScriptCommand::Type::SetValue || command.type == ScriptCommand::Type::AddValue || command.type == ScriptCommand::Type::IfJump)
+        {
+            const std::wstring name = GetCommandParameter(command, L"name");
+            if (name.empty())
+            {
+                addIssue(i, L"変数名が空です");
+            }
+            else
+            {
+                if (command.type == ScriptCommand::Type::IfJump && knownVariables.find(name) == knownVariables.end())
+                {
+                    addIssue(i, L"条件分岐の変数が未定義です: " + name);
+                }
+                knownVariables.insert(name);
+            }
+        }
+
+        if (command.type == ScriptCommand::Type::AddValue)
+        {
+            long long number = 0;
+            if (!TryGetNumber(GetCommandParameter(command, L"value"), number))
+            {
+                addIssue(i, L"加算値が数値ではありません");
+            }
+        }
+
+        if (command.type == ScriptCommand::Type::Background ||
+            command.type == ScriptCommand::Type::Character ||
+            command.type == ScriptCommand::Type::Bgm ||
+            command.type == ScriptCommand::Type::Se ||
+            command.type == ScriptCommand::Type::Voice)
+        {
+            const std::wstring storage = GetCommandParameter(command, L"storage");
+            if (!storage.empty() && !FileExistsForScenario(scenarioBaseDir_, storage))
+            {
+                addIssue(i, L"素材ファイルが見つかりません: " + storage);
+            }
+        }
+
+        const wchar_t* numericKeys[] = { L"time", L"x", L"y", L"scale", L"opacity", L"volume", L"fadein", L"fadeout", L"power" };
+        for (const wchar_t* key : numericKeys)
+        {
+            const std::wstring value = GetCommandParameter(command, key);
+            long long number = 0;
+            if (!value.empty() && !TryGetNumber(value, number))
+            {
+                addIssue(i, std::wstring(L"数値欄が不正です: ") + key);
+            }
+        }
+    }
+
+    return issues;
+}
+
+std::wstring NovelRuntime::GetFirstIssueForCommand(size_t commandIndex) const
+{
+    const std::vector<ScenarioIssue> issues = ValidateScenario();
+    for (const ScenarioIssue& issue : issues)
+    {
+        if (issue.commandIndex == commandIndex)
+        {
+            return issue.message;
+        }
+    }
+    return L"";
+}
+
+bool NovelRuntime::SelectFirstScenarioIssue()
+{
+    const std::vector<ScenarioIssue> issues = ValidateScenario();
+    if (issues.empty())
+    {
+        statusText_ = L"検証完了: 問題は見つかりませんでした";
+        return true;
+    }
+
+    selectedCommandIndex_ = (std::min)(issues.front().commandIndex, scenario_.commands.empty() ? 0 : scenario_.commands.size() - 1);
+    selectedChoiceLinkIndex_ = 0;
+    statusText_ = L"検証: " + std::to_wstring(issues.size()) + L" 件 / " + issues.front().message;
+    return true;
+}
+
 void NovelRuntime::LoadScenario(const std::wstring& requestedPath)
 {
     StopBgmPlayback();
@@ -2308,6 +2662,7 @@ void NovelRuntime::LoadScenario(const std::wstring& requestedPath)
     inspectorEditTargets_.clear();
     eventAddTextRect_ = {};
     eventAddChoiceRect_ = {};
+    eventValidateRect_ = {};
     eventDeleteRect_ = {};
     eventDuplicateRect_ = {};
     inspectorCommitRect_ = {};
@@ -2410,6 +2765,7 @@ void NovelRuntime::LoadScenario(const std::wstring& requestedPath)
     LoadUiButtonIcons();
     selectedCommandIndex_ = 0;
     selectedChoiceLinkIndex_ = 0;
+    MarkCurrentStateSaved();
     Advance();
 }
 
@@ -2855,6 +3211,33 @@ bool NovelRuntime::HandleClick(POINT point)
                     SaveAutosaveSnapshot();
                 }
                 SaveProject();
+                return true;
+            }
+            auto toggleTitleMenu = [&](bool& value, const std::wstring& label)
+            {
+                value = !value;
+                statusText_ = label + (value ? L" を表示します" : L" を非表示にしました");
+                SaveProject();
+                RefreshPreviewIfActive();
+            };
+            if (target.action == L"title_start_toggle")
+            {
+                toggleTitleMenu(editorSettings_.titleMenuStartEnabled, L"はじめる");
+                return true;
+            }
+            if (target.action == L"title_load_toggle")
+            {
+                toggleTitleMenu(editorSettings_.titleMenuLoadEnabled, L"ロード");
+                return true;
+            }
+            if (target.action == L"title_options_toggle")
+            {
+                toggleTitleMenu(editorSettings_.titleMenuOptionsEnabled, L"オプション");
+                return true;
+            }
+            if (target.action == L"title_exit_toggle")
+            {
+                toggleTitleMenu(editorSettings_.titleMenuExitEnabled, L"終了");
                 return true;
             }
             if (target.action == L"msg_toggle")
@@ -3307,8 +3690,10 @@ bool NovelRuntime::HandleRightClick(POINT clientPoint, POINT screenPoint)
         const std::wstring scenePath = FindScenePathFromPoint(clientPoint);
         if (!scenePath.empty())
         {
-            selectedScenePath_ = scenePath;
-            LoadScenario(scenePath);
+            if (!SwitchScenarioFile(scenePath))
+            {
+                return true;
+            }
             HMENU menu = CreatePopupMenu();
             AppendMenuW(menu, MF_STRING, kMenuPreviewFromScene, L"このシナリオからプレビュー");
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -3574,8 +3959,19 @@ bool NovelRuntime::HandleMouseMove(POINT point)
         if (eventReorderMoved_)
         {
             eventDragInsertIndex_ = scenario_.commands.size();
+            eventEffectDropTargetIndex_ = static_cast<size_t>(-1);
             if (showEventList_ && HasVisibleArea(currentEventListRect_) && PtInRect(&currentEventListRect_, point))
             {
+                const size_t hoverIndex = FindEventIndexFromPoint(point);
+                if (eventDragSourceIndex_ < scenario_.commands.size() &&
+                    hoverIndex < scenario_.commands.size() &&
+                    hoverIndex != eventDragSourceIndex_ &&
+                    (scenario_.commands[eventDragSourceIndex_].type == ScriptCommand::Type::Fade || scenario_.commands[eventDragSourceIndex_].type == ScriptCommand::Type::Transition) &&
+                    scenario_.commands[hoverIndex].type == ScriptCommand::Type::Character)
+                {
+                    eventEffectDropTargetIndex_ = hoverIndex;
+                    statusText_ = L"キャラへドロップすると演出対象にできます";
+                }
                 if (!eventRowRects_.empty())
                 {
                     for (size_t i = 0; i < eventRowRects_.size() && i < eventRowIndices_.size(); ++i)
@@ -3669,6 +4065,7 @@ bool NovelRuntime::HandleMouseUp(POINT point)
         assetDragActive_ = false;
         paletteDragActive_ = false;
         eventReorderDragActive_ = false;
+        eventEffectDropTargetIndex_ = static_cast<size_t>(-1);
         activeDragHandle_ = DragHandle::None;
         return false;
     }
@@ -3728,14 +4125,26 @@ bool NovelRuntime::HandleMouseUp(POINT point)
         const bool moved = eventReorderMoved_;
         const size_t sourceIndex = eventDragSourceIndex_;
         size_t insertIndex = eventDragInsertIndex_;
+        const size_t effectDropTargetIndex = eventEffectDropTargetIndex_;
         eventReorderDragActive_ = false;
         eventReorderMoved_ = false;
         eventDragSourceIndex_ = static_cast<size_t>(-1);
         eventDragInsertIndex_ = static_cast<size_t>(-1);
+        eventEffectDropTargetIndex_ = static_cast<size_t>(-1);
 
         if (!moved || sourceIndex >= scenario_.commands.size())
         {
             return false;
+        }
+
+        if (effectDropTargetIndex < scenario_.commands.size())
+        {
+            PushUndoSnapshot();
+            if (ApplyEffectToCharacterDrop(sourceIndex, effectDropTargetIndex))
+            {
+                return true;
+            }
+            undoStack_.pop_back();
         }
 
         if (insertIndex > scenario_.commands.size())
@@ -3967,7 +4376,7 @@ ScriptCommand NovelRuntime::CreateDefaultCommand(ScriptCommand::Type type) const
         command.parameters[L"target"] = L"start";
         break;
     case ScriptCommand::Type::Label:
-        command.parameters[L"name"] = L"new_label";
+        command.parameters[L"name"] = MakeUniqueLabelName(L"new_label");
         break;
     case ScriptCommand::Type::Background:
         command.parameters[L"name"] = L"背景";
@@ -4038,12 +4447,14 @@ ScriptCommand NovelRuntime::CreateDefaultCommand(ScriptCommand::Type type) const
         command.parameters[L"time"] = L"700";
         command.parameters[L"color"] = L"#000000";
         command.parameters[L"opacity"] = L"255";
+        command.parameters[L"target"] = L"stage";
         command.parameters[L"parallel"] = L"false";
         break;
     case ScriptCommand::Type::Transition:
         command.parameters[L"time"] = L"700";
         command.parameters[L"style"] = L"fade";
         command.parameters[L"color"] = L"#000000";
+        command.parameters[L"target"] = L"stage";
         command.parameters[L"parallel"] = L"false";
         break;
     case ScriptCommand::Type::Zoom:
@@ -4100,6 +4511,56 @@ void NovelRuntime::InsertCommandAfterSelection(ScriptCommand::Type type)
 {
     const size_t insertIndex = scenario_.commands.empty() ? 0 : (std::min)(selectedCommandIndex_ + 1, scenario_.commands.size());
     InsertCommandAtIndex(type, insertIndex);
+}
+
+void NovelRuntime::InsertChoiceTemplateAfterSelection()
+{
+    PushUndoSnapshot();
+    const size_t insertIndex = scenario_.commands.empty() ? 0 : (std::min)(selectedCommandIndex_ + 1, scenario_.commands.size());
+    const size_t clampedIndex = (std::min)(insertIndex, scenario_.commands.size());
+    const std::wstring base = L"choice_" + std::to_wstring(scenario_.commands.size() + 1);
+    const std::wstring firstLabelName = MakeUniqueLabelName(base + L"_1");
+    const std::wstring secondLabelName = MakeUniqueLabelName(base + L"_2");
+    const std::wstring endLabelName = MakeUniqueLabelName(base + L"_end");
+
+    ScriptCommand choice = CreateDefaultCommand(ScriptCommand::Type::Choice);
+    choice.parameters[L"prompt"] = L"どちらを選びますか？";
+    choice.links.clear();
+    choice.links.push_back({ L"選択肢1", firstLabelName });
+    choice.links.push_back({ L"選択肢2", secondLabelName });
+
+    ScriptCommand firstLabel = CreateDefaultCommand(ScriptCommand::Type::Label);
+    firstLabel.parameters[L"name"] = firstLabelName;
+    ScriptCommand firstText = CreateDefaultCommand(ScriptCommand::Type::Text);
+    firstText.parameters[L"value"] = L"選択肢1の本文";
+    ScriptCommand firstJump = CreateDefaultCommand(ScriptCommand::Type::Jump);
+    firstJump.parameters[L"target"] = endLabelName;
+
+    ScriptCommand secondLabel = CreateDefaultCommand(ScriptCommand::Type::Label);
+    secondLabel.parameters[L"name"] = secondLabelName;
+    ScriptCommand secondText = CreateDefaultCommand(ScriptCommand::Type::Text);
+    secondText.parameters[L"value"] = L"選択肢2の本文";
+    ScriptCommand endLabel = CreateDefaultCommand(ScriptCommand::Type::Label);
+    endLabel.parameters[L"name"] = endLabelName;
+
+    std::vector<ScriptCommand> commands;
+    commands.push_back(std::move(choice));
+    commands.push_back(std::move(firstLabel));
+    commands.push_back(std::move(firstText));
+    commands.push_back(std::move(firstJump));
+    commands.push_back(std::move(secondLabel));
+    commands.push_back(std::move(secondText));
+    commands.push_back(std::move(endLabel));
+
+    scenario_.commands.insert(
+        scenario_.commands.begin() + static_cast<std::ptrdiff_t>(clampedIndex),
+        std::make_move_iterator(commands.begin()),
+        std::make_move_iterator(commands.end()));
+    selectedCommandIndex_ = clampedIndex;
+    selectedChoiceLinkIndex_ = 0;
+    expandedTextCommandIndex_ = static_cast<size_t>(-1);
+    SyncDocumentMetadata();
+    statusText_ = L"分岐テンプレートを追加しました";
 }
 
 bool NovelRuntime::CopySelectedCommand()
@@ -4241,6 +4702,10 @@ bool NovelRuntime::ExecuteEditorCommand(UINT commandId)
     case IDM_PROJECT_OPEN:
         return LoadProjectFromDialog();
     case IDM_EDIT_RELOAD:
+        if (!ConfirmDiscardUnsavedChanges())
+        {
+            return true;
+        }
         LoadScenario(scenarioPath_);
         statusText_ = L"シナリオを再読み込みしました";
         return true;
@@ -4589,7 +5054,26 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
         {
             PushUndoSnapshot();
             const std::wstring current = GetCommandParameter(command, L"target");
-            command.parameters[L"target"] = current == L"stage" ? L"message" : (current == L"message" ? L"all" : L"stage");
+            const std::wstring targets[] =
+            {
+                L"stage",
+                L"background",
+                L"character:left",
+                L"character:center",
+                L"character:right",
+                L"message",
+                L"all"
+            };
+            size_t nextIndex = 0;
+            for (size_t i = 0; i < _countof(targets); ++i)
+            {
+                if (current == targets[i])
+                {
+                    nextIndex = (i + 1) % _countof(targets);
+                    break;
+                }
+            }
+            command.parameters[L"target"] = targets[nextIndex];
             SyncDocumentMetadata();
             statusText_ = L"フェード対象を更新しました";
             RefreshPreviewIfActive();
@@ -4692,10 +5176,72 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
         if (target.action == L"choice_add" && command.type == ScriptCommand::Type::Choice)
         {
             PushUndoSnapshot();
-            command.links.push_back({ L"新しい選択肢", L"start" });
-            selectedChoiceLinkIndex_ = command.links.size() - 1;
+            const std::wstring branchLabelName = MakeUniqueLabelName(L"choice_branch_" + std::to_wstring(command.links.size() + 1));
+            const size_t newLinkIndex = command.links.size();
+            std::wstring mergeLabelName;
+            size_t mergeInsertIndex = scenario_.commands.size();
+
+            for (const auto& link : command.links)
+            {
+                const auto labelIt = scenario_.labels.find(link.second);
+                if (labelIt == scenario_.labels.end())
+                {
+                    continue;
+                }
+
+                for (size_t scanIndex = labelIt->second + 1; scanIndex < scenario_.commands.size(); ++scanIndex)
+                {
+                    const ScriptCommand& scanned = scenario_.commands[scanIndex];
+                    if (scanned.type == ScriptCommand::Type::Label)
+                    {
+                        break;
+                    }
+                    if (scanned.type == ScriptCommand::Type::Jump)
+                    {
+                        const std::wstring jumpTarget = GetCommandParameter(scanned, L"target");
+                        if (!jumpTarget.empty() && scenario_.labels.find(jumpTarget) != scenario_.labels.end())
+                        {
+                            mergeLabelName = jumpTarget;
+                            mergeInsertIndex = scenario_.labels.at(jumpTarget);
+                            break;
+                        }
+                    }
+                }
+                if (!mergeLabelName.empty())
+                {
+                    break;
+                }
+            }
+
+            std::vector<ScriptCommand> branchCommands;
+            ScriptCommand branchLabel = CreateDefaultCommand(ScriptCommand::Type::Label);
+            branchLabel.parameters[L"name"] = branchLabelName;
+            ScriptCommand branchText = CreateDefaultCommand(ScriptCommand::Type::Text);
+            branchText.parameters[L"value"] = L"新しい選択肢の本文";
+            branchCommands.push_back(std::move(branchLabel));
+            branchCommands.push_back(std::move(branchText));
+
+            if (!mergeLabelName.empty())
+            {
+                ScriptCommand branchJump = CreateDefaultCommand(ScriptCommand::Type::Jump);
+                branchJump.parameters[L"target"] = mergeLabelName;
+                branchCommands.push_back(std::move(branchJump));
+            }
+
+            mergeInsertIndex = (std::min)(mergeInsertIndex, scenario_.commands.size());
+            command.links.push_back({ L"新しい選択肢", branchLabelName });
+            selectedChoiceLinkIndex_ = newLinkIndex;
+            const size_t insertedCount = branchCommands.size();
+            scenario_.commands.insert(
+                scenario_.commands.begin() + static_cast<std::ptrdiff_t>(mergeInsertIndex),
+                std::make_move_iterator(branchCommands.begin()),
+                std::make_move_iterator(branchCommands.end()));
+            if (mergeInsertIndex <= selectedCommandIndex_)
+            {
+                selectedCommandIndex_ += insertedCount;
+            }
             SyncDocumentMetadata();
-            statusText_ = L"選択肢の枝を追加しました";
+            statusText_ = mergeLabelName.empty() ? L"選択肢の枝を追加しました" : L"選択肢の枝を合流付きで追加しました";
             RefreshPreviewIfActive();
             return true;
         }
@@ -4899,6 +5445,21 @@ bool NovelRuntime::BrowseCommandAsset(size_t commandIndex, const std::wstring& k
 
 bool NovelRuntime::HandleEventActionClick(POINT point)
 {
+    if (PtInRect(&eventAddTextRect_, point))
+    {
+        InsertCommandAfterSelection(ScriptCommand::Type::Text);
+        expandedTextCommandIndex_ = selectedCommandIndex_;
+        return true;
+    }
+    if (PtInRect(&eventAddChoiceRect_, point))
+    {
+        InsertChoiceTemplateAfterSelection();
+        return true;
+    }
+    if (PtInRect(&eventValidateRect_, point))
+    {
+        return SelectFirstScenarioIssue();
+    }
     if (PtInRect(&eventDeleteRect_, point))
     {
         DeleteSelectedCommand();
@@ -5241,6 +5802,16 @@ bool NovelRuntime::HandleTimer()
             fadeStartTick_ = 0;
             fadeEndTick_ = 0;
         }
+    }
+
+    if (!toastText_.empty() && toastStartTick_ != 0)
+    {
+        if (now - toastStartTick_ >= toastDurationMs_)
+        {
+            toastText_.clear();
+            toastStartTick_ = 0;
+        }
+        needsRedraw = true;
     }
 
     if (shakeEndTick_ != 0)
@@ -5749,6 +6320,10 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
         else if (key == L"settings_message_opacity") editorSettings_.defaultMessageWindowOpacity = ClampByteValue(_wtoi(value.c_str()));
         else if (key == L"settings_message_padding") editorSettings_.defaultMessageWindowPadding = (std::max)(8, _wtoi(value.c_str()));
         else if (key == L"settings_message_image") editorSettings_.defaultMessageWindowImage = UnescapeSaveValue(value);
+        else if (key == L"settings_title_start_enabled") editorSettings_.titleMenuStartEnabled = value != L"0";
+        else if (key == L"settings_title_load_enabled") editorSettings_.titleMenuLoadEnabled = value != L"0";
+        else if (key == L"settings_title_options_enabled") editorSettings_.titleMenuOptionsEnabled = value != L"0";
+        else if (key == L"settings_title_exit_enabled") editorSettings_.titleMenuExitEnabled = value != L"0";
         else if (key == L"settings_name_visible") editorSettings_.defaultNameWindowVisible = value != L"0";
         else if (key == L"settings_name_color") editorSettings_.defaultNameWindowColor = static_cast<COLORREF>(_wtoi(value.c_str()));
         else if (key == L"settings_name_border") editorSettings_.defaultNameWindowBorderColor = static_cast<COLORREF>(_wtoi(value.c_str()));
@@ -5897,6 +6472,21 @@ bool NovelRuntime::SaveProject()
         return false;
     }
 
+    const std::wstring projectText = BuildProjectFileText();
+    if (!TryWriteTextFile(projectPath_, projectText))
+    {
+        statusText_ = L"\u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
+        return false;
+    }
+
+    MarkCurrentStateSaved();
+    statusText_ = L"\u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f";
+    ShowToast(L"保存しました");
+    return true;
+}
+
+std::wstring NovelRuntime::BuildProjectFileText() const
+{
     std::wstring projectText = SerializeProjectSettings();
     for (size_t i = 0; i < characterDefinitions_.size(); ++i)
     {
@@ -5920,15 +6510,135 @@ bool NovelRuntime::SaveProject()
         projectText += L"variable_def." + std::to_wstring(i) + L".initial=" + EscapeSaveValue(definition.initialValue) + L"\r\n";
         projectText += L"variable_def." + std::to_wstring(i) + L".description=" + EscapeSaveValue(definition.description) + L"\r\n";
     }
+    return projectText;
+}
 
-    if (!TryWriteTextFile(projectPath_, projectText))
+void NovelRuntime::MarkCurrentStateSaved()
+{
+    lastSavedScenarioText_ = SerializeScenario(scenario_);
+    lastSavedProjectText_ = BuildProjectFileText();
+}
+
+bool NovelRuntime::HasUnsavedChanges() const
+{
+    if (scenarioPath_.empty() && projectPath_.empty())
     {
-        statusText_ = L"\u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
+        return false;
+    }
+    return SerializeScenario(scenario_) != lastSavedScenarioText_ || BuildProjectFileText() != lastSavedProjectText_;
+}
+
+bool NovelRuntime::ConfirmDiscardUnsavedChanges()
+{
+    if (!HasUnsavedChanges())
+    {
+        return true;
+    }
+
+    const int result = MessageBoxW(
+        hostWindow_,
+        L"保存していない変更があります。\n保存してから移動しますか？",
+        L"未保存の変更",
+        MB_ICONWARNING | MB_YESNOCANCEL);
+    if (result == IDCANCEL)
+    {
+        statusText_ = L"移動をキャンセルしました";
+        return false;
+    }
+    if (result == IDYES)
+    {
+        return SaveProject();
+    }
+    return true;
+}
+
+bool NovelRuntime::SwitchScenarioFile(const std::wstring& scenarioPath)
+{
+    if (scenarioPath.empty() || scenarioPath == scenarioPath_)
+    {
+        selectedScenePath_ = scenarioPath_;
+        return true;
+    }
+    if (!ConfirmDiscardUnsavedChanges())
+    {
         return false;
     }
 
-    statusText_ = L"\u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f";
+    selectedScenePath_ = scenarioPath;
+    LoadScenario(scenarioPath);
+    statusText_ = L"\u30b7\u30fc\u30f3\u3092\u5207\u308a\u66ff\u3048\u307e\u3057\u305f";
     return true;
+}
+
+void NovelRuntime::ShowToast(const std::wstring& text)
+{
+    toastText_ = text;
+    toastStartTick_ = GetTickCount();
+    if (hostWindow_)
+    {
+        InvalidateRect(hostWindow_, nullptr, FALSE);
+    }
+}
+
+void NovelRuntime::DrawToast(HDC hdc, const RECT& clientRect) const
+{
+    if (toastText_.empty() || toastStartTick_ == 0)
+    {
+        return;
+    }
+
+    const DWORD elapsed = GetTickCount() - toastStartTick_;
+    if (elapsed >= toastDurationMs_)
+    {
+        return;
+    }
+
+    const int width = 230;
+    const int height = 46;
+    const int margin = 20;
+    int slide = 0;
+    if (elapsed < 240)
+    {
+        slide = width - static_cast<int>((static_cast<double>(elapsed) / 240.0) * width);
+    }
+    else if (elapsed > toastDurationMs_ - 280)
+    {
+        slide = static_cast<int>((static_cast<double>(elapsed - (toastDurationMs_ - 280)) / 280.0) * width);
+    }
+
+    RECT toastRect =
+    {
+        clientRect.right - margin - width + slide,
+        clientRect.bottom - margin - height,
+        clientRect.right - margin + slide,
+        clientRect.bottom - margin
+    };
+
+    HDC memoryDc = CreateCompatibleDC(hdc);
+    HBITMAP bitmap = CreateCompatibleBitmap(hdc, width, height);
+    HGDIOBJ oldBitmap = SelectObject(memoryDc, bitmap);
+    RECT localRect = { 0, 0, width, height };
+    HBRUSH brush = CreateSolidBrush(RGB(28, 34, 42));
+    FillRect(memoryDc, &localRect, brush);
+    DeleteObject(brush);
+    HBRUSH borderBrush = CreateSolidBrush(RGB(82, 152, 102));
+    FrameRect(memoryDc, &localRect, borderBrush);
+    DeleteObject(borderBrush);
+
+    SetBkMode(memoryDc, TRANSPARENT);
+    HFONT font = CreateFontW(18, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT oldFont = static_cast<HFONT>(SelectObject(memoryDc, font));
+    SetTextColor(memoryDc, RGB(236, 246, 238));
+    RECT textRect = { 16, 0, width - 16, height };
+    DrawTextW(memoryDc, toastText_.c_str(), -1, &textRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    SelectObject(memoryDc, oldFont);
+    DeleteObject(font);
+
+    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 236, 0 };
+    AlphaBlend(hdc, toastRect.left, toastRect.top, width, height, memoryDc, 0, 0, width, height, blend);
+    SelectObject(memoryDc, oldBitmap);
+    DeleteObject(bitmap);
+    DeleteDC(memoryDc);
 }
 
 std::wstring NovelRuntime::SerializeProjectSettings() const
@@ -5960,6 +6670,10 @@ std::wstring NovelRuntime::SerializeProjectSettings() const
     projectText += L"settings_message_opacity=" + std::to_wstring(editorSettings_.defaultMessageWindowOpacity) + L"\r\n";
     projectText += L"settings_message_padding=" + std::to_wstring(editorSettings_.defaultMessageWindowPadding) + L"\r\n";
     projectText += L"settings_message_image=" + EscapeSaveValue(editorSettings_.defaultMessageWindowImage) + L"\r\n";
+    projectText += L"settings_title_start_enabled=" + std::wstring(editorSettings_.titleMenuStartEnabled ? L"1" : L"0") + L"\r\n";
+    projectText += L"settings_title_load_enabled=" + std::wstring(editorSettings_.titleMenuLoadEnabled ? L"1" : L"0") + L"\r\n";
+    projectText += L"settings_title_options_enabled=" + std::wstring(editorSettings_.titleMenuOptionsEnabled ? L"1" : L"0") + L"\r\n";
+    projectText += L"settings_title_exit_enabled=" + std::wstring(editorSettings_.titleMenuExitEnabled ? L"1" : L"0") + L"\r\n";
     projectText += L"settings_name_visible=" + std::wstring(editorSettings_.defaultNameWindowVisible ? L"1" : L"0") + L"\r\n";
     projectText += L"settings_name_color=" + std::to_wstring(static_cast<unsigned int>(editorSettings_.defaultNameWindowColor)) + L"\r\n";
     projectText += L"settings_name_border=" + std::to_wstring(static_cast<unsigned int>(editorSettings_.defaultNameWindowBorderColor)) + L"\r\n";
@@ -6042,6 +6756,10 @@ std::wstring NovelRuntime::BuildDefaultProjectSettingsText(const std::wstring& s
     text += L"settings_message_opacity=178\r\n";
     text += L"settings_message_padding=24\r\n";
     text += L"settings_message_image=\r\n";
+    text += L"settings_title_start_enabled=1\r\n";
+    text += L"settings_title_load_enabled=0\r\n";
+    text += L"settings_title_options_enabled=0\r\n";
+    text += L"settings_title_exit_enabled=0\r\n";
     text += L"settings_name_visible=1\r\n";
     text += L"settings_name_color=" + std::to_wstring(static_cast<unsigned int>(RGB(12, 18, 28))) + L"\r\n";
     text += L"settings_name_border=" + std::to_wstring(static_cast<unsigned int>(RGB(80, 132, 180))) + L"\r\n";
@@ -6262,6 +6980,10 @@ bool NovelRuntime::CreateProjectFromDialog()
     {
         return false;
     }
+    if (!ConfirmDiscardUnsavedChanges())
+    {
+        return true;
+    }
 
     const int length = GetWindowTextLengthW(sceneNameEdit_);
     std::wstring projectName(static_cast<size_t>(length) + 1, L'\0');
@@ -6320,11 +7042,45 @@ bool NovelRuntime::CreateProjectFromDialog()
         CopyDirectoryTree(templateFonts, CombinePath(assetsRoot, L"fonts"));
     }
 
-    const std::wstring scenarioPath = CombinePath(scenarioDir, L"main.ks");
+    const std::wstring titleScenarioPath = CombinePath(scenarioDir, L"title.ks");
+    const std::wstring sceneScenarioPath = CombinePath(scenarioDir, L"scene.ks");
     const std::wstring projectPath = CombinePath(assetsRoot, L"project.kproj");
     const std::wstring title = projectName.empty() ? L"Kaktos Engine" : projectName;
-    const std::wstring scenarioText = L"[title name=\"" + title + L"\"]\r\n[text value=\"New Text\"]\r\n";
-    if (!TryWriteTextFile(scenarioPath, scenarioText) || !TryWriteTextFile(projectPath, BuildDefaultProjectSettingsText(L"scenario\\main.ks")))
+    std::wstring titleOptions;
+    if (editorSettings_.titleMenuStartEnabled)
+    {
+        titleOptions += L"[option text=\"はじめる\" target=\"scene.ks\"]\r\n";
+    }
+    if (editorSettings_.titleMenuLoadEnabled)
+    {
+        titleOptions += L"[option text=\"ロード\" target=\"__load\"]\r\n";
+    }
+    if (editorSettings_.titleMenuOptionsEnabled)
+    {
+        titleOptions += L"[option text=\"オプション\" target=\"__options\"]\r\n";
+    }
+    if (editorSettings_.titleMenuExitEnabled)
+    {
+        titleOptions += L"[option text=\"終了\" target=\"__exit\"]\r\n";
+    }
+    if (titleOptions.empty())
+    {
+        titleOptions += L"[option text=\"はじめる\" target=\"scene.ks\"]\r\n";
+    }
+    const std::wstring titleScenarioText =
+        L"[title name=\"" + title + L"\"]\r\n"
+        L"[messagewindow visible=\"false\"]\r\n"
+        L"[fade time=\"1000\" color=\"#000000\" opacity=\"255\" target=\"all\"]\r\n"
+        L"[choice prompt=\"\"]\r\n"
+        + titleOptions
+        + L"[endchoice]\r\n";
+    const std::wstring sceneScenarioText =
+        L"[title name=\"Scene\"]\r\n"
+        L"[fade time=\"1000\" color=\"#000000\" opacity=\"255\" target=\"all\"]\r\n"
+        L"[text value=\"New Text\"]\r\n";
+    if (!TryWriteTextFile(titleScenarioPath, titleScenarioText) ||
+        !TryWriteTextFile(sceneScenarioPath, sceneScenarioText) ||
+        !TryWriteTextFile(projectPath, BuildDefaultProjectSettingsText(L"scenario\\title.ks")))
     {
         statusText_ = L"プロジェクトファイル作成に失敗しました";
         return true;
@@ -6363,6 +7119,11 @@ bool NovelRuntime::LoadProjectFromDialog()
 
 bool NovelRuntime::LoadProjectFile(const std::wstring& projectPath)
 {
+    if (projectPath != projectPath_ && !ConfirmDiscardUnsavedChanges())
+    {
+        return false;
+    }
+
     std::wstring content;
     if (!TryReadTextFile(projectPath, content))
     {
@@ -6417,6 +7178,7 @@ bool NovelRuntime::LoadProjectFile(const std::wstring& projectPath)
     LoadUiButtonIcons();
     AddRecentProject(projectPath);
     projectLauncherVisible_ = false;
+    MarkCurrentStateSaved();
     statusText_ = L"プロジェクトを読み込みました: " + GetFileNamePart(projectPath);
     return true;
 }
@@ -6470,7 +7232,7 @@ bool NovelRuntime::ExportBuild()
         return false;
     }
 
-    const std::wstring sourceAssetsDir = scenarioBaseDir_.empty() ? L"assets" : scenarioBaseDir_;
+    const std::wstring sourceAssetsDir = GetAssetsRootDirectory();
     if (!CopyDirectoryTree(sourceAssetsDir, exportAssetsDir))
     {
         statusText_ = L"\u30a2\u30bb\u30c3\u30c8\u306e\u66f8\u304d\u51fa\u3057\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
@@ -6483,8 +7245,8 @@ bool NovelRuntime::ExportBuild()
         CopyDirectoryTree(sourceUiDir, exportAssetsDir + L"\\ui");
     }
 
-    const std::wstring exportScenarioPath = exportAssetsDir + L"\\" + GetFileNamePart(scenarioPath_);
-    if (!CopyFileW(scenarioPath_.c_str(), exportScenarioPath.c_str(), FALSE))
+    const std::wstring exportScenarioPath = exportAssetsDir + L"\\main.ks";
+    if (!CopyFileW(scenarioPath_.c_str(), exportScenarioPath.c_str(), TRUE))
     {
         statusText_ = L"\u30b7\u30ca\u30ea\u30aa\u306e\u66f8\u304d\u51fa\u3057\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
         return false;
@@ -6492,16 +7254,44 @@ bool NovelRuntime::ExportBuild()
 
     if (!projectPath_.empty())
     {
-        CopyFileW(projectPath_.c_str(), (exportAssetsDir + L"\\" + GetFileNamePart(projectPath_)).c_str(), FALSE);
+        std::wstring projectText;
+        if (TryReadTextFile(projectPath_, projectText))
+        {
+            std::wistringstream input(projectText);
+            std::wstring line;
+            std::wstring normalizedProjectText;
+            bool wroteScenarioPath = false;
+            while (std::getline(input, line))
+            {
+                if (!line.empty() && line.back() == L'\r')
+                {
+                    line.pop_back();
+                }
+                const size_t split = line.find(L'=');
+                if (split != std::wstring::npos && Trim(line.substr(0, split)) == L"scenario_path")
+                {
+                    normalizedProjectText += L"scenario_path=main.ks\r\n";
+                    wroteScenarioPath = true;
+                }
+                else
+                {
+                    normalizedProjectText += line + L"\r\n";
+                }
+            }
+            if (!wroteScenarioPath)
+            {
+                normalizedProjectText = L"scenario_path=main.ks\r\n" + normalizedProjectText;
+            }
+            TryWriteTextFile(exportAssetsDir + L"\\project.kproj", normalizedProjectText);
+        }
     }
 
     const std::wstring readmePath = exportRoot + L"\\README.txt";
     std::wstring readme;
     readme += L"Kaktos Engine Export\r\n";
     readme += L"1. kaktosPlayer.exe \u3092\u8d77\u52d5\r\n";
-    readme += L"2. \u30d7\u30ec\u30a4\u30e4\u30fc\u5c02\u7528UI\u3067 assets\\";
-    readme += GetFileNamePart(scenarioPath_);
-    readme += L" \u3092\u518d\u751f\r\n";
+    readme += L"2. assets\\main.ks \u3092\u8aad\u307f\u8fbc\u3093\u3067\u518d\u751f\r\n";
+    readme += L"3. assets \u30d5\u30a9\u30eb\u30c0\u306b\u7d20\u6750\u3068 project.kproj \u3092\u540c\u68b1\r\n";
     TryWriteTextFile(readmePath, readme);
 
     statusText_ = L"\u66f8\u304d\u51fa\u3057\u5b8c\u4e86: " + exportRoot;
@@ -7505,6 +8295,44 @@ bool NovelRuntime::ApplyAssetToCommand(size_t commandIndex, const AssetListItem&
     return false;
 }
 
+bool NovelRuntime::ApplyEffectToCharacterDrop(size_t effectCommandIndex, size_t characterCommandIndex)
+{
+    if (effectCommandIndex >= scenario_.commands.size() || characterCommandIndex >= scenario_.commands.size() || effectCommandIndex == characterCommandIndex)
+    {
+        return false;
+    }
+
+    ScriptCommand& effect = scenario_.commands[effectCommandIndex];
+    const ScriptCommand& character = scenario_.commands[characterCommandIndex];
+    if ((effect.type != ScriptCommand::Type::Fade && effect.type != ScriptCommand::Type::Transition) ||
+        character.type != ScriptCommand::Type::Character)
+    {
+        return false;
+    }
+
+    std::wstring position = GetCommandParameter(character, L"pos");
+    if (position != L"left" && position != L"right" && position != L"center")
+    {
+        position = L"center";
+    }
+    effect.parameters[L"target"] = L"character:" + position;
+
+    size_t insertIndex = characterCommandIndex + 1;
+    ScriptCommand movedEffect = effect;
+    scenario_.commands.erase(scenario_.commands.begin() + static_cast<std::ptrdiff_t>(effectCommandIndex));
+    if (effectCommandIndex < insertIndex)
+    {
+        --insertIndex;
+    }
+    insertIndex = (std::min)(insertIndex, scenario_.commands.size());
+    scenario_.commands.insert(scenario_.commands.begin() + static_cast<std::ptrdiff_t>(insertIndex), std::move(movedEffect));
+    selectedCommandIndex_ = insertIndex;
+    SyncDocumentMetadata();
+    statusText_ = L"演出対象を" + GetEffectTargetLabel(L"character:" + position) + L"に設定しました";
+    RefreshPreviewIfActive();
+    return true;
+}
+
 void NovelRuntime::ResetPlaybackState()
 {
     StopBgmPlayback();
@@ -8045,6 +8873,22 @@ std::wstring NovelRuntime::GetEffectTargetLabel(const std::wstring& target) cons
     {
         return L"全体";
     }
+    if (target == L"background")
+    {
+        return L"背景";
+    }
+    if (target == L"character:left")
+    {
+        return L"左キャラ";
+    }
+    if (target == L"character:center")
+    {
+        return L"中央キャラ";
+    }
+    if (target == L"character:right")
+    {
+        return L"右キャラ";
+    }
     return L"ステージ";
 }
 
@@ -8354,6 +9198,10 @@ void NovelRuntime::CancelVariableFieldEdit()
 
 bool NovelRuntime::CreateNewScene()
 {
+    if (!ConfirmDiscardUnsavedChanges())
+    {
+        return false;
+    }
     if (!sceneNameEdit_)
     {
         return false;
@@ -8405,6 +9253,7 @@ bool NovelRuntime::CreateNewScene()
     HideCreateSceneDialog();
     LoadScenario(newPath);
     RefreshSceneList();
+    MarkCurrentStateSaved();
     statusText_ = L"\u65b0\u898f\u30b7\u30fc\u30f3\u3092\u4f5c\u6210\u3057\u307e\u3057\u305f";
     return true;
 }
@@ -8488,6 +9337,10 @@ bool NovelRuntime::DeleteCurrentScene()
     {
         return false;
     }
+    if (!ConfirmDiscardUnsavedChanges())
+    {
+        return false;
+    }
 
     if (MessageBoxW(hostWindow_, (L"シナリオを削除しますか?\n" + GetFileNamePart(scenarioPath_)).c_str(), L"確認", MB_ICONWARNING | MB_YESNO) != IDYES)
     {
@@ -8505,6 +9358,7 @@ bool NovelRuntime::DeleteCurrentScene()
     if (!sceneItems_.empty())
     {
         LoadScenario(sceneItems_.front().path);
+        MarkCurrentStateSaved();
     }
     else
     {
@@ -8596,10 +9450,7 @@ bool NovelRuntime::HandleSceneClick(POINT point)
         {
             if (PtInRect(&item.rect, point))
             {
-                selectedScenePath_ = item.path;
-                LoadScenario(item.path);
-                statusText_ = L"\u30b7\u30fc\u30f3\u3092\u5207\u308a\u66ff\u3048\u307e\u3057\u305f";
-                return true;
+                return SwitchScenarioFile(item.path);
             }
         }
         return false;
@@ -8980,6 +9831,41 @@ void NovelRuntime::RewireSelectedSourceToLabel(size_t labelCommandIndex)
     statusText_ = L"target rewired to: " + labelName;
 }
 
+std::wstring NovelRuntime::MakeUniqueLabelName(const std::wstring& prefix) const
+{
+    const std::wstring base = prefix.empty() ? L"label" : prefix;
+    auto labelExists = [&](const std::wstring& candidate)
+    {
+        if (scenario_.labels.find(candidate) != scenario_.labels.end())
+        {
+            return true;
+        }
+        for (const ScriptCommand& command : scenario_.commands)
+        {
+            if (command.type == ScriptCommand::Type::Label && GetCommandParameter(command, L"name") == candidate)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (!labelExists(base))
+    {
+        return base;
+    }
+
+    for (int suffix = 2; suffix < 10000; ++suffix)
+    {
+        const std::wstring candidate = base + L"_" + std::to_wstring(suffix);
+        if (!labelExists(candidate))
+        {
+            return candidate;
+        }
+    }
+    return base + L"_" + std::to_wstring(GetTickCount());
+}
+
 bool NovelRuntime::HandleGraphNodeSelection(size_t commandIndex)
 {
     if (IsLabelNode(commandIndex) && IsEditableSourceNode(selectedCommandIndex_))
@@ -9204,9 +10090,8 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
     }
     if (standalone)
     {
-        const int margin = 16;
-        stageRect = { clientRect.left + margin, clientRect.top + margin, clientRect.right - margin, clientRect.bottom - margin };
-        messageRect = { clientRect.left + margin, clientRect.bottom - 170, clientRect.right - margin, clientRect.bottom - margin };
+        stageRect = clientRect;
+        messageRect = { clientRect.left, clientRect.bottom - 170, clientRect.right, clientRect.bottom };
     }
     else
     {
@@ -9283,6 +10168,12 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
     DeleteObject(shadeBrush);
 
     const int stageWidth = stageRect.right - stageRect.left;
+    if (fadeTarget_ == L"background" && fadeEndTick_ != 0 && fadeEndTick_ > fadeStartTick_)
+    {
+        const DWORD now = GetTickCount();
+        const double progress = static_cast<double>((std::min)(now, fadeEndTick_) - fadeStartTick_) / static_cast<double>((std::max<DWORD>)(1, fadeEndTick_ - fadeStartTick_));
+        DrawAlphaOverlay(hdc, stageRect, fadeColor_, static_cast<int>((1.0 - progress) * fadeOpacity_));
+    }
     DrawCharacterSlot(hdc, stageRect, leftCharacter_, stageRect.left + stageWidth / 4 + stageOffsetX_);
     DrawCharacterSlot(hdc, stageRect, centerCharacter_, stageRect.left + stageWidth / 2 + stageOffsetX_);
     DrawCharacterSlot(hdc, stageRect, rightCharacter_, stageRect.left + (stageWidth * 3) / 4 + stageOffsetX_);
@@ -9384,6 +10275,10 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
             DrawWrappedText(hdc, bodyRect, visibleText, DT_LEFT | DT_WORDBREAK);
         }
 
+    }
+    else
+    {
+        DrawChoices(hdc, messageRect);
     }
 
     if (standalone)
@@ -9542,26 +10437,7 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
 
     auto drawOverlayAlpha = [&](const RECT& targetRect, COLORREF color, int alpha)
     {
-        if (alpha <= 0)
-        {
-            return;
-        }
-        if (targetRect.right <= targetRect.left || targetRect.bottom <= targetRect.top)
-        {
-            return;
-        }
-        HDC overlayDc = CreateCompatibleDC(hdc);
-        HBITMAP overlayBitmap = CreateCompatibleBitmap(hdc, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top);
-        HGDIOBJ oldBitmap = SelectObject(overlayDc, overlayBitmap);
-        RECT overlayRect = { 0, 0, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top };
-        HBRUSH overlayBrush = CreateSolidBrush(color);
-        FillRect(overlayDc, &overlayRect, overlayBrush);
-        DeleteObject(overlayBrush);
-        BLENDFUNCTION overlayBlend = { AC_SRC_OVER, 0, static_cast<BYTE>((std::max)(0, (std::min)(255, alpha))), 0 };
-        AlphaBlend(hdc, targetRect.left, targetRect.top, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top, overlayDc, 0, 0, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top, overlayBlend);
-        SelectObject(overlayDc, oldBitmap);
-        DeleteObject(overlayBitmap);
-        DeleteDC(overlayDc);
+        DrawAlphaOverlay(hdc, targetRect, color, alpha);
     };
 
     if (tintOpacity_ > 0)
@@ -9581,6 +10457,42 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
         else if (fadeTarget_ == L"all")
         {
             fadeRect = clientRect;
+        }
+        else if (fadeTarget_ == L"background")
+        {
+            fadeRect = {};
+        }
+        else if (fadeTarget_ == L"character:left" || fadeTarget_ == L"character:center" || fadeTarget_ == L"character:right")
+        {
+            const CharacterSlot* slot = &centerCharacter_;
+            int centerX = stageRect.left + stageWidth / 2 + stageOffsetX_;
+            if (fadeTarget_ == L"character:left")
+            {
+                slot = &leftCharacter_;
+                centerX = stageRect.left + stageWidth / 4 + stageOffsetX_;
+            }
+            else if (fadeTarget_ == L"character:right")
+            {
+                slot = &rightCharacter_;
+                centerX = stageRect.left + (stageWidth * 3) / 4 + stageOffsetX_;
+            }
+
+            if (!slot->visible || (slot->displayName.empty() && !slot->image))
+            {
+                fadeRect = {};
+            }
+            else
+            {
+                const int slotWidth = (260 * slot->scale * stageScale_) / 10000;
+                const int slotHeight = (520 * slot->scale * stageScale_) / 10000;
+                fadeRect =
+                {
+                    centerX - slotWidth / 2 + slot->offsetX,
+                    stageRect.bottom - slotHeight - 20 + slot->offsetY,
+                    centerX + slotWidth / 2 + slot->offsetX,
+                    stageRect.bottom - 20 + slot->offsetY
+                };
+            }
         }
         drawOverlayAlpha(fadeRect, fadeColor_, static_cast<int>((1.0 - progress) * fadeOpacity_));
     }
@@ -9605,6 +10517,7 @@ void NovelRuntime::DrawPreviewWindow(HDC hdc, const RECT& clientRect)
     FillRect(hdc, &clientRect, backgroundBrush);
     DeleteObject(backgroundBrush);
     DrawPreviewSurface(hdc, clientRect, true);
+    DrawToast(hdc, clientRect);
 }
 
 void NovelRuntime::DrawToolbar(HDC hdc, const RECT& previewRect)
@@ -9717,6 +10630,11 @@ void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
     toolbarButtonRects_.clear();
     currentEventListRect_ = {};
     currentInspectorRect_ = {};
+    eventAddTextRect_ = {};
+    eventAddChoiceRect_ = {};
+    eventValidateRect_ = {};
+    eventDuplicateRect_ = {};
+    eventDeleteRect_ = {};
 
     HBRUSH backgroundBrush = CreateSolidBrush(RGB(10, 14, 18));
     FillRect(hdc, &clientRect, backgroundBrush);
@@ -9847,6 +10765,7 @@ void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
     {
         DrawSettingsDialog(hdc, clientRect);
     }
+    DrawToast(hdc, clientRect);
     UpdateChildControls();
 }
 
@@ -10750,6 +11669,15 @@ void NovelRuntime::DrawSettingsDialog(HDC hdc, const RECT& clientRect)
         drawPathRow(L"名前欄画像", editorSettings_.defaultNameWindowImage, L"name_browse_image", L"name_clear_image");
         drawPlaceholder(L"補足", { L"プリセット色から即時切替できます。", L"シナリオ内で個別指定した場合は、そのコマンド指定が優先されます。" });
     }
+    else if (selectedSettingsCategoryIndex_ == 5)
+    {
+        drawSectionTitle(L"タイトルメニュー");
+        drawToggleRow(L"はじめる", editorSettings_.titleMenuStartEnabled ? L"表示" : L"非表示", L"title_start_toggle", editorSettings_.titleMenuStartEnabled ? L"隠す" : L"表示");
+        drawToggleRow(L"ロード", editorSettings_.titleMenuLoadEnabled ? L"表示" : L"非表示", L"title_load_toggle", editorSettings_.titleMenuLoadEnabled ? L"隠す" : L"表示");
+        drawToggleRow(L"オプション", editorSettings_.titleMenuOptionsEnabled ? L"表示" : L"非表示", L"title_options_toggle", editorSettings_.titleMenuOptionsEnabled ? L"隠す" : L"表示");
+        drawToggleRow(L"終了", editorSettings_.titleMenuExitEnabled ? L"表示" : L"非表示", L"title_exit_toggle", editorSettings_.titleMenuExitEnabled ? L"隠す" : L"表示");
+        drawPlaceholder(L"補足", { L"新規プロジェクト作成時の title.ks に反映されます。", L"既存の title.ks はシナリオ側で直接編集してください。" });
+    }
     else if (selectedSettingsCategoryIndex_ == 9)
     {
         drawSectionTitle(L"オーディオ");
@@ -11595,11 +12523,11 @@ std::wstring NovelRuntime::GetCommandSummary(const ScriptCommand& command) const
     }
     if (command.type == ScriptCommand::Type::Fade)
     {
-        return GetCommandParameter(command, L"color") + L" / " + GetCommandParameter(command, L"time") + L"ms";
+        return GetEffectTargetLabel(GetCommandParameter(command, L"target")) + L" / " + GetCommandParameter(command, L"color") + L" / " + GetCommandParameter(command, L"time") + L"ms";
     }
     if (command.type == ScriptCommand::Type::Transition)
     {
-        return GetCommandParameter(command, L"style") + L" / " + GetCommandParameter(command, L"time") + L"ms";
+        return GetEffectTargetLabel(GetCommandParameter(command, L"target")) + L" / " + GetCommandParameter(command, L"style") + L" / " + GetCommandParameter(command, L"time") + L"ms";
     }
     if (command.type == ScriptCommand::Type::Zoom)
     {
@@ -11721,6 +12649,7 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
 {
     currentEventListRect_ = panelRect;
     eventTextEditRect_ = {};
+    const std::vector<ScenarioIssue> scenarioIssues = ValidateScenario();
     SetBkMode(hdc, TRANSPARENT);
     HFONT headerFont = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
     HFONT bodyFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
@@ -11738,8 +12667,9 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
     SetTextColor(hdc, RGB(168, 178, 188));
     DrawWrappedText(hdc, searchLabelRect, L"\u691c\u7d22", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    eventAddTextRect_ = {};
-    eventAddChoiceRect_ = {};
+    eventAddTextRect_ = { panelRect.right - 340, panelRect.top + 8, panelRect.right - 280, panelRect.top + 32 };
+    eventAddChoiceRect_ = { panelRect.right - 274, panelRect.top + 8, panelRect.right - 202, panelRect.top + 32 };
+    eventValidateRect_ = { panelRect.right - 194, panelRect.top + 8, panelRect.right - 124, panelRect.top + 32 };
     eventDuplicateRect_ = { panelRect.right - 116, panelRect.top + 8, panelRect.right - 56, panelRect.top + 32 };
     eventDeleteRect_ = { panelRect.right - 52, panelRect.top + 8, panelRect.right - 12, panelRect.top + 32 };
 
@@ -11750,6 +12680,9 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
         COLORREF fill;
     } actions[] =
     {
+        { eventAddTextRect_, L"+ 本文", RGB(68, 92, 118) },
+        { eventAddChoiceRect_, L"+ 分岐", RGB(92, 74, 118) },
+        { eventValidateRect_, scenarioIssues.empty() ? L"検証" : L"警告", scenarioIssues.empty() ? RGB(58, 88, 118) : RGB(154, 96, 44) },
         { eventDuplicateRect_, L"\u8907\u88fd", RGB(76, 96, 76) },
         { eventDeleteRect_, L"-", RGB(132, 58, 66) },
     };
@@ -11778,6 +12711,15 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
     {
         const size_t commandIndex = filteredIndices[filteredIndex];
         const ScriptCommand& command = scenario_.commands[commandIndex];
+        std::wstring issueMessage;
+        for (const ScenarioIssue& issue : scenarioIssues)
+        {
+            if (issue.commandIndex == commandIndex)
+            {
+                issueMessage = issue.message;
+                break;
+            }
+        }
         const bool disabled = ParseBoolValue(GetCommandParameter(command, L"disabled"), false);
         const bool expanded = command.type == ScriptCommand::Type::Text && expandedTextCommandIndex_ == commandIndex;
         const int fullHeight = rowHeight + (expanded ? expandedHeight : 0);
@@ -11799,6 +12741,12 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
             FrameRect(hdc, &rowRect, hoverBrush);
             DeleteObject(hoverBrush);
         }
+        if (eventReorderDragActive_ && eventReorderMoved_ && commandIndex == eventEffectDropTargetIndex_)
+        {
+            HBRUSH hoverBrush = CreateSolidBrush(RGB(56, 96, 150));
+            FrameRect(hdc, &rowRect, hoverBrush);
+            DeleteObject(hoverBrush);
+        }
 
         RECT accentRect = { rowRect.left, rowRect.top, rowRect.left + 118, rowRect.bottom };
         COLORREF accentColor = GetCommandAccentColor(command);
@@ -11814,9 +12762,19 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
         SetTextColor(hdc, RGB(255, 255, 255));
         DrawWrappedText(hdc, typeRect, GetCommandTypeLabel(command) + (disabled ? L" [OFF]" : L""), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-        RECT summaryRect = { accentRect.right + 10, rowRect.top + 2, rowRect.right - 30, rowRect.bottom - 2 };
+        RECT summaryRect = { accentRect.right + 10, rowRect.top + 2, rowRect.right - (issueMessage.empty() ? 30 : 54), rowRect.bottom - 2 };
         SetTextColor(hdc, disabled ? RGB(136, 144, 152) : RGB(206, 214, 222));
         DrawWrappedText(hdc, summaryRect, GetCommandSummary(command), DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER);
+
+        if (!issueMessage.empty())
+        {
+            RECT issueRect = { rowRect.right - 48, rowRect.top + 5, rowRect.right - 28, rowRect.bottom - 5 };
+            HBRUSH issueBrush = CreateSolidBrush(RGB(194, 126, 42));
+            FillRect(hdc, &issueRect, issueBrush);
+            DeleteObject(issueBrush);
+            SetTextColor(hdc, RGB(32, 24, 16));
+            DrawWrappedText(hdc, issueRect, L"!", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
 
         if (command.type == ScriptCommand::Type::Text)
         {
@@ -11869,6 +12827,15 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
     }
     else if (eventReorderDragActive_ && eventReorderMoved_)
     {
+        if (eventEffectDropTargetIndex_ < scenario_.commands.size())
+        {
+            RECT scrollContentRect = { panelRect.left, startY, panelRect.right, panelRect.bottom - 8 };
+            DrawVerticalScrollbar(hdc, scrollContentRect, eventListScrollOffset_, maxOffset, RGB(24, 30, 38), RGB(106, 120, 136));
+            SelectObject(hdc, oldFont);
+            DeleteObject(headerFont);
+            DeleteObject(bodyFont);
+            return;
+        }
         int indicatorY = panelRect.top + 52;
         int indicatorLeft = panelRect.left + 10;
         int indicatorRight = panelRect.right - 10;
@@ -11980,6 +12947,11 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
         drawLine(L"\u7a2e\u985e: " + GetCommandTypeLabel(command), RGB(255, 225, 160));
         drawLine(L"\u884c\u756a\u53f7: " + std::to_wstring(command.sourceLine), RGB(205, 214, 222));
         drawLine(L"\u6982\u8981: " + GetCommandSummary(command), RGB(230, 236, 240));
+        const std::wstring issueMessage = GetFirstIssueForCommand(selectedCommandIndex_);
+        if (!issueMessage.empty())
+        {
+            drawLine(L"警告: " + issueMessage, RGB(255, 188, 92));
+        }
         cursorY += 8;
         drawLine(L"\u30d1\u30e9\u30e1\u30fc\u30bf", RGB(255, 225, 160));
         if (command.type == ScriptCommand::Type::Text)
