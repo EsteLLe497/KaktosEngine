@@ -15,6 +15,12 @@ struct EditorSnapshot
     size_t selectedCommandIndex = 0;
 };
 
+struct ScenarioIssue
+{
+    size_t commandIndex = 0;
+    std::wstring message;
+};
+
 struct SceneListItem
 {
     std::wstring path;
@@ -149,6 +155,10 @@ struct EditorSettings
     int defaultMessageWindowOpacity = 178;
     int defaultMessageWindowPadding = 24;
     std::wstring defaultMessageWindowImage;
+    bool titleMenuStartEnabled = true;
+    bool titleMenuLoadEnabled = false;
+    bool titleMenuOptionsEnabled = false;
+    bool titleMenuExitEnabled = false;
     bool defaultNameWindowVisible = true;
     COLORREF defaultNameWindowColor = RGB(12, 18, 28);
     COLORREF defaultNameWindowBorderColor = RGB(80, 132, 180);
@@ -360,6 +370,7 @@ private:
     bool IsEditableSourceNode(size_t commandIndex) const;
     bool IsLabelNode(size_t commandIndex) const;
     void RewireSelectedSourceToLabel(size_t labelCommandIndex);
+    std::wstring MakeUniqueLabelName(const std::wstring& prefix) const;
     std::wstring GetCommandTypeLabel(const ScriptCommand& command) const;
     std::wstring GetCommandSummary(const ScriptCommand& command) const;
     bool TrySelectCommandFromPoint(POINT point, const RECT& clientRect);
@@ -382,6 +393,7 @@ private:
     void InsertCommandAfterSelection(ScriptCommand::Type type);
     ScriptCommand CreateDefaultCommand(ScriptCommand::Type type) const;
     void InsertCommandAtIndex(ScriptCommand::Type type, size_t insertIndex);
+    void InsertChoiceTemplateAfterSelection();
 public:
     bool ExecuteEditorCommand(UINT commandId);
 private:
@@ -389,6 +401,7 @@ private:
     bool CutSelectedCommand();
     bool PasteCopiedCommand();
     bool ApplyAssetToCommand(size_t commandIndex, const AssetListItem& item);
+    bool ApplyEffectToCharacterDrop(size_t effectCommandIndex, size_t characterCommandIndex);
     bool ImportMaterialFiles(const std::vector<std::wstring>& paths, const std::wstring& category);
     void DeleteSelectedCommand();
     void DuplicateSelectedCommand();
@@ -399,6 +412,13 @@ private:
     bool CreateProjectFromDialog();
     bool LoadProjectFromDialog();
     bool LoadProjectFile(const std::wstring& projectPath);
+    std::wstring BuildProjectFileText() const;
+    bool HasUnsavedChanges() const;
+    bool ConfirmDiscardUnsavedChanges();
+    bool SwitchScenarioFile(const std::wstring& scenarioPath);
+    void MarkCurrentStateSaved();
+    void ShowToast(const std::wstring& text);
+    void DrawToast(HDC hdc, const RECT& clientRect) const;
     std::wstring BuildDefaultProjectSettingsText(const std::wstring& scenarioPath) const;
     std::wstring GetRecentProjectsPath() const;
     void LoadRecentProjects();
@@ -466,6 +486,9 @@ private:
     void CancelInspectorEdit();
     bool HandleInspectorClick(POINT point);
     bool BrowseCommandAsset(size_t commandIndex, const std::wstring& key, bool audio);
+    std::vector<ScenarioIssue> ValidateScenario() const;
+    std::wstring GetFirstIssueForCommand(size_t commandIndex) const;
+    bool SelectFirstScenarioIssue();
     void RefreshAvailableFonts();
     std::wstring GetFontsDirectory() const;
     std::wstring GetNextAvailableFont(const std::wstring& current) const;
@@ -603,6 +626,7 @@ private:
     std::vector<InspectorActionTarget> inspectorActionTargets_;
     RECT eventAddTextRect_ = {};
     RECT eventAddChoiceRect_ = {};
+    RECT eventValidateRect_ = {};
     RECT eventDeleteRect_ = {};
     RECT eventDuplicateRect_ = {};
     RECT sceneAddRect_ = {};
@@ -681,6 +705,7 @@ private:
     size_t dragInsertIndex_ = 0;
     size_t eventDragSourceIndex_ = static_cast<size_t>(-1);
     size_t eventDragInsertIndex_ = static_cast<size_t>(-1);
+    size_t eventEffectDropTargetIndex_ = static_cast<size_t>(-1);
     size_t assetDragSourceIndex_ = static_cast<size_t>(-1);
     size_t assetDropTargetIndex_ = static_cast<size_t>(-1);
     int leftPanelWidth_ = 280;
@@ -707,6 +732,11 @@ private:
     std::wstring selectedAssetPreviewCategory_;
     int assetPreviewVolume_ = 100;
     std::wstring selectedScenePath_;
+    std::wstring lastSavedScenarioText_;
+    std::wstring lastSavedProjectText_;
+    std::wstring toastText_;
+    DWORD toastStartTick_ = 0;
+    DWORD toastDurationMs_ = 2200;
     std::vector<std::wstring> backlogEntries_;
     std::vector<UiButtonDefinition> uiButtons_;
     std::vector<EditorSnapshot> undoStack_;
