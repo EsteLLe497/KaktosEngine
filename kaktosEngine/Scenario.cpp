@@ -407,6 +407,15 @@ std::wstring SerializeScenario(const ScenarioDocument& document)
         case ScriptCommand::Type::MessageFontReset:
             output += L"[fontreset]\r\n";
             break;
+        case ScriptCommand::Type::MessageStyle:
+            output += L"[messageui";
+            output += AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"");
+            output += AppendAttribute(L"border", command.parameters.count(L"border") ? command.parameters.at(L"border") : L"");
+            output += AppendAttribute(L"opacity", command.parameters.count(L"opacity") ? command.parameters.at(L"opacity") : L"");
+            output += AppendAttribute(L"padding", command.parameters.count(L"padding") ? command.parameters.at(L"padding") : L"");
+            output += AppendAttribute(L"image", command.parameters.count(L"image") ? command.parameters.at(L"image") : L"");
+            output += L"]\r\n";
+            break;
         case ScriptCommand::Type::TextColor:
             output += L"[textcolor" + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + L"]\r\n";
             break;
@@ -426,10 +435,10 @@ std::wstring SerializeScenario(const ScenarioDocument& document)
             output += L"[shake" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"power", command.parameters.count(L"power") ? command.parameters.at(L"power") : L"") + L"]\r\n";
             break;
         case ScriptCommand::Type::Fade:
-            output += L"[fade" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + L"]\r\n";
+            output += L"[fade" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + AppendAttribute(L"opacity", command.parameters.count(L"opacity") ? command.parameters.at(L"opacity") : L"") + AppendAttribute(L"parallel", command.parameters.count(L"parallel") ? command.parameters.at(L"parallel") : L"") + AppendAttribute(L"target", command.parameters.count(L"target") ? command.parameters.at(L"target") : L"") + L"]\r\n";
             break;
         case ScriptCommand::Type::Transition:
-            output += L"[transition" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"style", command.parameters.count(L"style") ? command.parameters.at(L"style") : L"") + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + AppendAttribute(L"parallel", command.parameters.count(L"parallel") ? command.parameters.at(L"parallel") : L"") + L"]\r\n";
+            output += L"[transition" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"style", command.parameters.count(L"style") ? command.parameters.at(L"style") : L"") + AppendAttribute(L"color", command.parameters.count(L"color") ? command.parameters.at(L"color") : L"") + AppendAttribute(L"parallel", command.parameters.count(L"parallel") ? command.parameters.at(L"parallel") : L"") + AppendAttribute(L"target", command.parameters.count(L"target") ? command.parameters.at(L"target") : L"") + L"]\r\n";
             break;
         case ScriptCommand::Type::Zoom:
             output += L"[zoom" + AppendAttribute(L"time", command.parameters.count(L"time") ? command.parameters.at(L"time") : L"") + AppendAttribute(L"scale", command.parameters.count(L"scale") ? command.parameters.at(L"scale") : L"") + AppendAttribute(L"parallel", command.parameters.count(L"parallel") ? command.parameters.at(L"parallel") : L"") + L"]\r\n";
@@ -608,7 +617,7 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
 
                 if (!IsTagLine(nested))
                 {
-                    errorMessage = L"choice ブロック内はタグのみ対応。line=" + std::to_wstring(lineNumber);
+                    errorMessage = L"choice ブロックの閉じタグが見つかりません。line=" + std::to_wstring(lineNumber);
                     return false;
                 }
 
@@ -620,7 +629,7 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
                     const std::wstring target = GetAttributeValue(nestedBody, L"target");
                     if (text.empty() || target.empty())
                     {
-                        errorMessage = L"option には text と target が必要。line=" + std::to_wstring(lineNumber);
+                        errorMessage = L"option には text と target が必要です。line=" + std::to_wstring(lineNumber);
                         return false;
                     }
 
@@ -633,13 +642,13 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
                     break;
                 }
 
-                errorMessage = L"choice ブロック内の未対応タグ。line=" + std::to_wstring(lineNumber) + L" tag=[" + nestedBody + L"]";
+                errorMessage = L"choice ブロック内に未対応タグがあります。line=" + std::to_wstring(lineNumber) + L" tag=[" + nestedBody + L"]";
                 return false;
             }
 
             if (command.links.empty())
             {
-                errorMessage = L"choice に option がない。line=" + std::to_wstring(command.sourceLine);
+                errorMessage = L"choice に option がありません。line=" + std::to_wstring(command.sourceLine);
                 return false;
             }
 
@@ -736,6 +745,18 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
             continue;
         }
 
+        if (tagName == L"messageui")
+        {
+            ScriptCommand command = MakeCommand(ScriptCommand::Type::MessageStyle, lineNumber);
+            SetCommandParameter(command, L"color", GetAttributeValue(body, L"color"));
+            SetCommandParameter(command, L"border", GetAttributeValue(body, L"border"));
+            SetCommandParameter(command, L"opacity", GetAttributeValue(body, L"opacity"));
+            SetCommandParameter(command, L"padding", GetAttributeValue(body, L"padding"));
+            SetCommandParameter(command, L"image", GetAttributeValue(body, L"image"));
+            document.commands.push_back(std::move(command));
+            continue;
+        }
+
         if (tagName == L"textcolor")
         {
             ScriptCommand command = MakeCommand(ScriptCommand::Type::TextColor, lineNumber);
@@ -788,6 +809,9 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
             ScriptCommand command = MakeCommand(ScriptCommand::Type::Fade, lineNumber);
             SetCommandParameter(command, L"time", GetAttributeValue(body, L"time"));
             SetCommandParameter(command, L"color", GetAttributeValue(body, L"color"));
+            SetCommandParameter(command, L"opacity", GetAttributeValue(body, L"opacity"));
+            SetCommandParameter(command, L"parallel", GetAttributeValue(body, L"parallel"));
+            SetCommandParameter(command, L"target", GetAttributeValue(body, L"target"));
             document.commands.push_back(std::move(command));
             continue;
         }
@@ -799,6 +823,7 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
             SetCommandParameter(command, L"style", GetAttributeValue(body, L"style"));
             SetCommandParameter(command, L"color", GetAttributeValue(body, L"color"));
             SetCommandParameter(command, L"parallel", GetAttributeValue(body, L"parallel"));
+            SetCommandParameter(command, L"target", GetAttributeValue(body, L"target"));
             document.commands.push_back(std::move(command));
             continue;
         }

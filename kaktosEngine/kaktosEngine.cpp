@@ -68,12 +68,19 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         LocalFree(argv);
     }
 
-    g_runtime.LoadScenario(scenarioArg);
-
     if (!InitInstance(hInstance, nCmdShow))
     {
         g_runtime.Shutdown();
         return FALSE;
+    }
+
+    if (g_playerMode || !scenarioArg.empty())
+    {
+        g_runtime.LoadScenario(scenarioArg);
+    }
+    else
+    {
+        g_runtime.ShowProjectLauncher();
     }
 
     HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_KAKTOSENGINE));
@@ -348,6 +355,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         const int wmId = LOWORD(wParam);
         switch (wmId)
         {
+        case IDM_PROJECT_NEW:
+        case IDM_PROJECT_OPEN:
         case IDM_EDIT_RELOAD:
         case IDM_EDIT_UNDO:
         case IDM_EDIT_REDO:

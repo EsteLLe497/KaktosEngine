@@ -125,6 +125,7 @@
   <ItemGroup>
     <ClInclude Include="framework.h" />
     <ClInclude Include="kaktosEngine.h" />
+    <ClInclude Include="miniaudio.h" />
     <ClInclude Include="NovelRuntime.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="Scenario.h" />

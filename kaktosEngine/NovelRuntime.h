@@ -3,6 +3,8 @@
 #include "Scenario.h"
 
 #include <objidl.h>
+#include <wrl/client.h>
+#include <xaudio2.h>
 #include <gdiplus.h>
 #include <memory>
 #include <windows.h>
@@ -83,6 +85,13 @@ struct AssetCategoryItem
     RECT rect = {};
 };
 
+struct FontAssetItem
+{
+    std::wstring path;
+    std::wstring label;
+    std::wstring family;
+};
+
 struct InspectorEditTarget
 {
     size_t commandIndex = 0;
@@ -134,6 +143,22 @@ struct EditorSettings
     int voiceVolume = 100;
     std::wstring saveDirectory;
     bool autosaveEnabled = true;
+    bool defaultMessageWindowVisible = true;
+    COLORREF defaultMessageWindowColor = RGB(8, 10, 14);
+    COLORREF defaultMessageWindowBorderColor = RGB(122, 128, 138);
+    int defaultMessageWindowOpacity = 178;
+    int defaultMessageWindowPadding = 24;
+    std::wstring defaultMessageWindowImage;
+    bool defaultNameWindowVisible = true;
+    COLORREF defaultNameWindowColor = RGB(12, 18, 28);
+    COLORREF defaultNameWindowBorderColor = RGB(80, 132, 180);
+    int defaultNameWindowOpacity = 214;
+    int defaultNameWindowOffsetX = 0;
+    int defaultNameWindowOffsetY = 0;
+    int defaultNameWindowWidth = 220;
+    int defaultNameWindowHeight = 36;
+    int defaultNameWindowPadding = 12;
+    std::wstring defaultNameWindowImage;
 };
 
 struct SettingsActionTarget
@@ -182,6 +207,33 @@ struct ActiveChoiceItem
     std::wstring text;
     std::wstring target;
     bool enabled = true;
+};
+
+enum class AudioChannel
+{
+    Bgm,
+    Se,
+    Voice,
+    Preview,
+};
+
+struct AudioPlaybackState
+{
+    IXAudio2SourceVoice* voice = nullptr;
+    std::vector<BYTE> formatBytes;
+    std::vector<BYTE> audioBytes;
+    bool looping = false;
+    bool usesLegacyMci = false;
+    std::wstring legacyAlias;
+    std::wstring sourcePath;
+};
+
+struct ProjectLauncherRow
+{
+    std::wstring projectPath;
+    RECT rowRect = {};
+    RECT dataRect = {};
+    RECT deleteRect = {};
 };
 
 class NovelRuntime
@@ -234,6 +286,7 @@ public:
     void SetHostWindow(HWND hWnd);
     void NotifyPreviewWindowDestroyed();
     void RefreshPreviewWindow();
+    void ShowProjectLauncher();
 
     const std::wstring& GetWindowTitle() const;
 
@@ -255,6 +308,7 @@ private:
     void ApplyTextSpeedCommand(const ScriptCommand& command);
     void ApplyMessageFontCommand(const ScriptCommand& command);
     void ApplyMessageFontResetCommand();
+    void ApplyMessageStyleCommand(const ScriptCommand& command);
     void ApplyTextColorCommand(const ScriptCommand& command);
     void ApplyNameColorCommand(const ScriptCommand& command);
     void ApplyNameWindowCommand(const ScriptCommand& command);
@@ -267,12 +321,22 @@ private:
     void ApplyPanCommand(const ScriptCommand& command);
     void ApplyFlashCommand(const ScriptCommand& command);
     void ApplyTintCommand(const ScriptCommand& command);
+    bool InitializeAudioEngine();
+    void ShutdownAudioEngine();
+    bool DecodeAudioFile(const std::wstring& fullPath, std::vector<BYTE>& formatBytes, std::vector<BYTE>& audioBytes);
+    bool PlayAudioFile(AudioChannel channel, const std::wstring& fullPath, bool loop, int volumePercent);
+    void StopAudioChannel(AudioChannel channel);
+    void SetAudioChannelVolume(AudioChannel channel, int volumePercent);
+    AudioPlaybackState& GetAudioPlaybackState(AudioChannel channel);
+    const AudioPlaybackState& GetAudioPlaybackState(AudioChannel channel) const;
     void StopBgmPlayback();
     void ApplyIfJumpCommand(const ScriptCommand& command);
     bool EvaluateCondition(const ScriptCommand& command) const;
     CharacterSlot* GetCharacterSlot(const std::wstring& position);
     std::wstring GetCommandParameter(const ScriptCommand& command, const std::wstring& key) const;
     bool TryParseHexColor(const std::wstring& value, COLORREF& color) const;
+    std::wstring FormatHexColor(COLORREF color) const;
+    COLORREF ShowColorPresetMenu(POINT point, COLORREF currentColor) const;
     bool TryGetNumber(const std::wstring& value, long long& number) const;
     std::unique_ptr<Gdiplus::Image> TryLoadImage(const std::wstring& fullPath) const;
     void DrawWrappedText(HDC hdc, const RECT& bounds, const std::wstring& text, UINT format) const;
@@ -332,6 +396,19 @@ private:
     void ToggleSelectedCommandEnabled();
     bool SaveProject();
     bool SaveProjectAs();
+    bool CreateProjectFromDialog();
+    bool LoadProjectFromDialog();
+    bool LoadProjectFile(const std::wstring& projectPath);
+    std::wstring BuildDefaultProjectSettingsText(const std::wstring& scenarioPath) const;
+    std::wstring GetRecentProjectsPath() const;
+    void LoadRecentProjects();
+    void SaveRecentProjects() const;
+    void AddRecentProject(const std::wstring& projectPath);
+    void RemoveRecentProject(const std::wstring& projectPath);
+    std::wstring GetProjectRootFromProjectPath(const std::wstring& projectPath) const;
+    bool OpenProjectFolder(const std::wstring& projectPath);
+    bool DeleteProjectToRecycleBin(const std::wstring& projectPath);
+    bool HandleProjectLauncherClick(POINT point);
     bool ExportBuild();
     bool SaveRuntimeStateAs();
     bool LoadRuntimeStateFromDialog();
@@ -339,6 +416,9 @@ private:
     bool LoadRuntimeStateFromPath(const std::wstring& savePath);
     void ApplyLoadedCharacterState(CharacterSlot& slot, const std::wstring& slotName, const std::wstring& displayName, const std::wstring& imagePath);
     void LoadProjectSettings(const std::wstring& projectPath);
+    void ApplyEditorUiDefaults();
+    std::wstring MakeProjectRelativeAssetPath(const std::wstring& fullPath) const;
+    std::wstring FindDefaultTextboxImagePath() const;
     void RefreshSceneList();
     void RefreshAssetList();
     void ResetPlaybackState();
@@ -350,6 +430,8 @@ private:
     void ToggleAutoMode();
     void TogglePreviewFullscreen();
     void DrawSceneCreateDialog(HDC hdc, const RECT& clientRect);
+    void DrawProjectLauncher(HDC hdc, const RECT& clientRect);
+    void DrawProjectDialog(HDC hdc, const RECT& clientRect);
     void DrawCharacterManagerDialog(HDC hdc, const RECT& clientRect);
     void DrawVariableManagerDialog(HDC hdc, const RECT& clientRect);
     void DrawSettingsDialog(HDC hdc, const RECT& clientRect);
@@ -364,6 +446,8 @@ private:
     bool DeleteCurrentScene();
     void ShowCreateSceneDialog();
     void HideCreateSceneDialog();
+    void ShowProjectDialog();
+    void HideProjectDialog();
     void ShowCharacterManagerDialog();
     void HideCharacterManagerDialog();
     void ShowVariableManagerDialog();
@@ -382,6 +466,9 @@ private:
     void CancelInspectorEdit();
     bool HandleInspectorClick(POINT point);
     bool BrowseCommandAsset(size_t commandIndex, const std::wstring& key, bool audio);
+    void RefreshAvailableFonts();
+    std::wstring GetFontsDirectory() const;
+    std::wstring GetNextAvailableFont(const std::wstring& current) const;
     bool HandleEventActionClick(POINT point);
     void BeginCharacterFieldEdit(const std::wstring& title, const std::wstring& action, size_t characterIndex, size_t expressionIndex, const std::wstring& initialValue);
     void CommitCharacterFieldEdit();
@@ -392,7 +479,10 @@ private:
     const CharacterDefinition* FindCharacterDefinition(const std::wstring& id) const;
     CharacterDefinition* FindCharacterDefinition(const std::wstring& id);
     std::wstring GetCharacterDefinitionLabel(const CharacterDefinition& definition) const;
+    std::wstring GetEffectTargetLabel(const std::wstring& target) const;
     void SyncVariableDefinitions();
+    std::wstring ShowVariableSelectionMenu(POINT point, const std::wstring& currentName) const;
+    std::wstring ShowFontSelectionMenu(POINT point, const std::wstring& currentName) const;
     size_t GetVariableUsageCount(const std::wstring& name) const;
     void SyncDocumentMetadata();
     void PushUndoSnapshot();
@@ -416,6 +506,14 @@ private:
 
 private:
     ULONG_PTR gdiplusToken_ = 0;
+    bool comInitialized_ = false;
+    bool mediaFoundationInitialized_ = false;
+    Microsoft::WRL::ComPtr<IXAudio2> xaudio2_;
+    IXAudio2MasteringVoice* masteringVoice_ = nullptr;
+    AudioPlaybackState bgmPlayback_;
+    AudioPlaybackState sePlayback_;
+    AudioPlaybackState voicePlayback_;
+    AudioPlaybackState previewPlayback_;
     HWND hostWindow_ = nullptr;
     HWND previewWindow_ = nullptr;
     HWND eventSearchEdit_ = nullptr;
@@ -433,19 +531,36 @@ private:
     std::wstring scenarioPath_;
     std::wstring projectPath_;
     std::wstring currentBgmPath_;
+    std::wstring lastAudioDebugMessage_;
     std::wstring messageFontFace_ = L"Yu Gothic UI";
+    std::wstring messageWindowImagePath_;
+    std::wstring nameWindowImagePath_;
     std::wstring backgroundPath_;
     std::wstring backgroundDisplayName_;
+    std::unique_ptr<Gdiplus::Image> messageWindowImage_;
+    std::unique_ptr<Gdiplus::Image> nameWindowImage_;
     std::unique_ptr<Gdiplus::Image> backgroundImage_;
     COLORREF backgroundColor_ = RGB(28, 36, 48);
+    COLORREF messageWindowColor_ = RGB(8, 10, 14);
+    COLORREF messageWindowBorderColor_ = RGB(122, 128, 138);
     COLORREF messageTextColor_ = RGB(242, 244, 247);
     COLORREF nameTextColor_ = RGB(123, 203, 255);
+    COLORREF nameWindowColor_ = RGB(12, 18, 28);
+    COLORREF nameWindowBorderColor_ = RGB(80, 132, 180);
     bool backgroundVisible_ = true;
     bool messageWindowVisible_ = true;
     bool nameBoxVisible_ = true;
     bool verticalTextEnabled_ = false;
     bool textRevealActive_ = false;
     int textSpeedMs_ = 40;
+    int messageWindowOpacity_ = 178;
+    int messageWindowPadding_ = 24;
+    int nameWindowOpacity_ = 214;
+    int nameWindowOffsetX_ = 0;
+    int nameWindowOffsetY_ = 0;
+    int nameWindowWidth_ = 220;
+    int nameWindowHeight_ = 36;
+    int nameWindowPadding_ = 12;
     size_t textRevealIndex_ = 0;
     DWORD nextTextRevealTick_ = 0;
     int backgroundOffsetX_ = 0;
@@ -462,7 +577,10 @@ private:
     std::vector<AssetCategoryItem> assetCategories_;
     std::vector<SceneListItem> sceneItems_;
     std::vector<AssetListItem> assetItems_;
+    std::vector<FontAssetItem> availableFonts_;
+    std::vector<std::wstring> loadedPrivateFontPaths_;
     std::vector<VariableDefinition> variableDefinitions_;
+    std::vector<std::wstring> recentProjects_;
     std::vector<RECT> variableDefinitionRects_;
     std::vector<VariableManagerActionTarget> variableManagerActionTargets_;
     ScenarioDocument scenario_;
@@ -480,6 +598,7 @@ private:
     std::vector<RECT> eventExpandRects_;
     std::vector<size_t> eventExpandIndices_;
     std::vector<RECT> toolbarButtonRects_;
+    std::vector<ProjectLauncherRow> projectLauncherRows_;
     std::vector<InspectorEditTarget> inspectorEditTargets_;
     std::vector<InspectorActionTarget> inspectorActionTargets_;
     RECT eventAddTextRect_ = {};
@@ -494,6 +613,14 @@ private:
     RECT sceneDialogCreateRect_ = {};
     RECT sceneDialogCancelRect_ = {};
     RECT sceneDialogEditRect_ = {};
+    RECT projectDialogRect_ = {};
+    RECT projectDialogCreateRect_ = {};
+    RECT projectDialogOpenRect_ = {};
+    RECT projectDialogCancelRect_ = {};
+    RECT projectDialogEditRect_ = {};
+    RECT projectLauncherPanelRect_ = {};
+    RECT projectLauncherCreateRect_ = {};
+    RECT projectLauncherOpenRect_ = {};
     RECT characterDialogRect_ = {};
     RECT characterDialogAddRect_ = {};
     RECT characterDialogDeleteRect_ = {};
@@ -513,12 +640,16 @@ private:
     RECT variableFieldOkRect_ = {};
     RECT variableFieldCancelRect_ = {};
     RECT settingsDialogRect_ = {};
+    RECT settingsNavRect_ = {};
+    RECT settingsContentRect_ = {};
     RECT settingsDialogCloseRect_ = {};
     RECT settingsDialogRestoreRect_ = {};
     RECT materialAddRect_ = {};
     RECT materialPreviewRect_ = {};
     RECT materialPreviewPlayRect_ = {};
     RECT materialPreviewStopRect_ = {};
+    RECT materialPreviewVolumeDownRect_ = {};
+    RECT materialPreviewVolumeUpRect_ = {};
     RECT previewMenuButtonRect_ = {};
     RECT previewMenuPanelRect_ = {};
     RECT previewMenuSaveRect_ = {};
@@ -561,6 +692,8 @@ private:
     int componentScrollMax_ = 0;
     int inspectorScrollOffset_ = 0;
     int inspectorScrollMax_ = 0;
+    int settingsScrollOffset_ = 0;
+    int settingsScrollMax_ = 0;
     DragHandle activeDragHandle_ = DragHandle::None;
     size_t editingCommandIndex_ = 0;
     std::wstring editingKey_;
@@ -572,6 +705,7 @@ private:
     std::wstring selectedAssetPath_;
     std::wstring selectedAssetLabel_;
     std::wstring selectedAssetPreviewCategory_;
+    int assetPreviewVolume_ = 100;
     std::wstring selectedScenePath_;
     std::vector<std::wstring> backlogEntries_;
     std::vector<UiButtonDefinition> uiButtons_;
@@ -582,6 +716,7 @@ private:
     DWORD fadeEndTick_ = 0;
     COLORREF fadeColor_ = RGB(0, 0, 0);
     int fadeOpacity_ = 255;
+    std::wstring fadeTarget_ = L"stage";
     DWORD shakeEndTick_ = 0;
     int shakePower_ = 0;
     DWORD flashStartTick_ = 0;
@@ -629,6 +764,8 @@ private:
     bool characterAdjustMode_ = false;
     bool characterAdjustDragging_ = false;
     bool sceneDialogVisible_ = false;
+    bool projectDialogVisible_ = false;
+    bool projectLauncherVisible_ = false;
     bool characterManagerVisible_ = false;
     bool characterFieldDialogVisible_ = false;
     bool variableManagerVisible_ = false;
@@ -662,5 +799,7 @@ private:
     std::vector<CharacterDefinition> characterDefinitions_;
     std::vector<CharacterManagerActionTarget> characterManagerActionTargets_;
     std::vector<SettingsActionTarget> settingsActionTargets_;
+    std::vector<RECT> settingsCategoryRects_;
     std::vector<RECT> characterDefinitionRects_;
+    size_t selectedSettingsCategoryIndex_ = 0;
 };

@@ -29,6 +29,7 @@ struct ScriptCommand
         TextSpeed,
         MessageFont,
         MessageFontReset,
+        MessageStyle,
         TextColor,
         NameColor,
         NameWindow,

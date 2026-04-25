@@ -3,7 +3,13 @@
 #include "resource.h"
 
 #include <commdlg.h>
+#include <gdiplusheaders.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mmreg.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <algorithm>
 #include <cstdlib>
@@ -11,12 +17,47 @@
 #include <functional>
 #include <sstream>
 
+#define STB_VORBIS_HEADER_ONLY
+#include "stb_vorbis.c"
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+#undef STB_VORBIS_HEADER_ONLY
+#include "stb_vorbis.c"
+#undef L
+#undef C
+#undef R
+
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "msimg32.lib")
+#pragma comment(lib, "xaudio2.lib")
+#pragma comment(lib, "mfplat.lib")
+#pragma comment(lib, "mfreadwrite.lib")
+#pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "winmm.lib")
 
 namespace
 {
+    void DebugTrace(const std::wstring& message)
+    {
+        OutputDebugStringW((message + L"\n").c_str());
+    }
+
+    std::wstring NormalizeFullPath(const std::wstring& path)
+    {
+        if (path.empty())
+        {
+            return path;
+        }
+
+        WCHAR buffer[MAX_PATH * 4] = {};
+        const DWORD length = GetFullPathNameW(path.c_str(), static_cast<DWORD>(_countof(buffer)), buffer, nullptr);
+        if (length == 0 || length >= _countof(buffer))
+        {
+            return path;
+        }
+        return std::wstring(buffer, length);
+    }
+
     bool StartsWithText(const std::wstring& value, const std::wstring& prefix)
     {
         return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
@@ -49,6 +90,22 @@ namespace
     std::wstring GetChoiceParamKey(const wchar_t* prefix, size_t index)
     {
         return std::wstring(prefix) + std::to_wstring(index);
+    }
+
+    std::wstring GetNextVariableName(const std::vector<VariableDefinition>& definitions, const std::wstring& current)
+    {
+        if (definitions.empty())
+        {
+            return current;
+        }
+        for (size_t i = 0; i < definitions.size(); ++i)
+        {
+            if (definitions[i].name == current)
+            {
+                return definitions[(i + 1) % definitions.size()].name;
+            }
+        }
+        return definitions.front().name;
     }
 
     VariableType InferVariableType(const std::wstring& value)
@@ -145,19 +202,54 @@ namespace
         FrameRect(hdc, &thumbRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
     }
 
+    std::wstring GetLegacyAudioAlias(AudioChannel channel)
+    {
+        switch (channel)
+        {
+        case AudioChannel::Bgm: return L"kaktos_bgm";
+        case AudioChannel::Se: return L"kaktos_se";
+        case AudioChannel::Voice: return L"kaktos_voice";
+        default: return L"kaktos_asset_preview";
+        }
+    }
+
     bool TryOpenAudioAlias(const std::wstring& fullPath, const std::wstring& alias)
     {
         const std::wstring closeCommand = L"close " + alias;
         mciSendStringW(closeCommand.c_str(), nullptr, 0, nullptr);
 
-        const std::wstring openAutoCommand = L"open \"" + fullPath + L"\" alias " + alias;
-        if (mciSendStringW(openAutoCommand.c_str(), nullptr, 0, nullptr) == 0)
+        std::wstring lowerPath = fullPath;
+        if (!lowerPath.empty())
         {
-            return true;
+            CharLowerBuffW(&lowerPath[0], static_cast<DWORD>(lowerPath.size()));
         }
 
-        const std::wstring openMpegCommand = L"open \"" + fullPath + L"\" type mpegvideo alias " + alias;
-        return mciSendStringW(openMpegCommand.c_str(), nullptr, 0, nullptr) == 0;
+        std::vector<std::wstring> openCommands;
+        if (lowerPath.size() >= 4 && lowerPath.substr(lowerPath.size() - 4) == L".wav")
+        {
+            openCommands.push_back(L"open \"" + fullPath + L"\" type waveaudio alias " + alias);
+        }
+        else
+        {
+            openCommands.push_back(L"open \"" + fullPath + L"\" type mpegvideo alias " + alias);
+        }
+        openCommands.push_back(L"open \"" + fullPath + L"\" alias " + alias);
+
+        for (const std::wstring& openCommand : openCommands)
+        {
+            if (mciSendStringW(openCommand.c_str(), nullptr, 0, nullptr) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void ApplyAudioAliasVolume(const std::wstring& alias, int volumePercent)
+    {
+        volumePercent = (std::max)(0, (std::min)(100, volumePercent));
+        const std::wstring setVolumeCommand = L"setaudio " + alias + L" volume to " + std::to_wstring(volumePercent * 10);
+        mciSendStringW(setVolumeCommand.c_str(), nullptr, 0, nullptr);
     }
 
     bool EnsureDirectoryExists(const std::wstring& path)
@@ -215,6 +307,459 @@ namespace
     }
 }
 
+bool NovelRuntime::InitializeAudioEngine()
+{
+    if (xaudio2_ && masteringVoice_)
+    {
+        return true;
+    }
+
+    if (!comInitialized_)
+    {
+        const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        if (SUCCEEDED(comResult))
+        {
+            comInitialized_ = true;
+        }
+        else if (comResult != RPC_E_CHANGED_MODE)
+        {
+            statusText_ = L"COM 初期化に失敗しました";
+            return false;
+        }
+    }
+
+    if (!mediaFoundationInitialized_)
+    {
+        const HRESULT mfResult = MFStartup(MF_VERSION);
+        if (FAILED(mfResult))
+        {
+            statusText_ = L"Media Foundation の初期化に失敗しました";
+            return false;
+        }
+        mediaFoundationInitialized_ = true;
+    }
+
+    HRESULT hr = XAudio2Create(xaudio2_.ReleaseAndGetAddressOf(), 0, XAUDIO2_DEFAULT_PROCESSOR);
+    if (FAILED(hr) || !xaudio2_)
+    {
+        statusText_ = L"XAudio2 の初期化に失敗しました";
+        return false;
+    }
+
+    hr = xaudio2_->CreateMasteringVoice(&masteringVoice_);
+    if (FAILED(hr) || !masteringVoice_)
+    {
+        xaudio2_.Reset();
+        statusText_ = L"マスターボイスの作成に失敗しました";
+        return false;
+    }
+
+    return true;
+}
+
+void NovelRuntime::ShutdownAudioEngine()
+{
+    StopAudioChannel(AudioChannel::Preview);
+    StopAudioChannel(AudioChannel::Voice);
+    StopAudioChannel(AudioChannel::Se);
+    StopAudioChannel(AudioChannel::Bgm);
+
+    if (masteringVoice_)
+    {
+        masteringVoice_->DestroyVoice();
+        masteringVoice_ = nullptr;
+    }
+    xaudio2_.Reset();
+
+    if (mediaFoundationInitialized_)
+    {
+        MFShutdown();
+        mediaFoundationInitialized_ = false;
+    }
+    if (comInitialized_)
+    {
+        CoUninitialize();
+        comInitialized_ = false;
+    }
+}
+
+AudioPlaybackState& NovelRuntime::GetAudioPlaybackState(AudioChannel channel)
+{
+    switch (channel)
+    {
+    case AudioChannel::Bgm: return bgmPlayback_;
+    case AudioChannel::Se: return sePlayback_;
+    case AudioChannel::Voice: return voicePlayback_;
+    default: return previewPlayback_;
+    }
+}
+
+const AudioPlaybackState& NovelRuntime::GetAudioPlaybackState(AudioChannel channel) const
+{
+    switch (channel)
+    {
+    case AudioChannel::Bgm: return bgmPlayback_;
+    case AudioChannel::Se: return sePlayback_;
+    case AudioChannel::Voice: return voicePlayback_;
+    default: return previewPlayback_;
+    }
+}
+
+void NovelRuntime::StopAudioChannel(AudioChannel channel)
+{
+    AudioPlaybackState& state = GetAudioPlaybackState(channel);
+    if (state.voice)
+    {
+        state.voice->Stop(0);
+        state.voice->FlushSourceBuffers();
+        state.voice->DestroyVoice();
+        state.voice = nullptr;
+    }
+    if (state.usesLegacyMci && !state.legacyAlias.empty())
+    {
+        const std::wstring closeCommand = L"close " + state.legacyAlias;
+        mciSendStringW(closeCommand.c_str(), nullptr, 0, nullptr);
+    }
+    state.audioBytes.clear();
+    state.formatBytes.clear();
+    state.looping = false;
+    state.usesLegacyMci = false;
+    state.legacyAlias.clear();
+    state.sourcePath.clear();
+}
+
+void NovelRuntime::SetAudioChannelVolume(AudioChannel channel, int volumePercent)
+{
+    volumePercent = (std::max)(0, (std::min)(100, volumePercent));
+    AudioPlaybackState& state = GetAudioPlaybackState(channel);
+    if (state.voice)
+    {
+        state.voice->SetVolume(static_cast<float>(volumePercent) / 100.0f);
+    }
+    if (state.usesLegacyMci && !state.legacyAlias.empty())
+    {
+        ApplyAudioAliasVolume(state.legacyAlias, volumePercent);
+    }
+}
+
+bool NovelRuntime::DecodeAudioFile(const std::wstring& fullPath, std::vector<BYTE>& formatBytes, std::vector<BYTE>& audioBytes)
+{
+    formatBytes.clear();
+    audioBytes.clear();
+    bool decoded = false;
+
+    Microsoft::WRL::ComPtr<IMFSourceReader> reader;
+    HRESULT hr = MFCreateSourceReaderFromURL(fullPath.c_str(), nullptr, reader.GetAddressOf());
+    if (FAILED(hr) || !reader)
+    {
+        lastAudioDebugMessage_ = L"audio: MFCreateSourceReaderFromURL failed hr=" + std::to_wstring(static_cast<long long>(hr));
+        DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+    }
+    if (SUCCEEDED(hr) && reader)
+    {
+        Microsoft::WRL::ComPtr<IMFMediaType> outputType;
+        hr = MFCreateMediaType(outputType.GetAddressOf());
+        if (FAILED(hr) || !outputType)
+        {
+            lastAudioDebugMessage_ = L"audio: MFCreateMediaType failed hr=" + std::to_wstring(static_cast<long long>(hr));
+            DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+        }
+        if (SUCCEEDED(hr) && outputType)
+        {
+            outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            outputType->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+            hr = reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), nullptr, outputType.Get());
+            if (FAILED(hr))
+            {
+                lastAudioDebugMessage_ = L"audio: SetCurrentMediaType failed hr=" + std::to_wstring(static_cast<long long>(hr));
+                DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+            }
+            if (SUCCEEDED(hr))
+            {
+                Microsoft::WRL::ComPtr<IMFMediaType> nativeType;
+                hr = reader->GetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), nativeType.GetAddressOf());
+                if (FAILED(hr) || !nativeType)
+                {
+                    lastAudioDebugMessage_ = L"audio: GetCurrentMediaType failed hr=" + std::to_wstring(static_cast<long long>(hr));
+                    DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+                }
+                if (SUCCEEDED(hr) && nativeType)
+                {
+                    WAVEFORMATEX* waveFormat = nullptr;
+                    UINT32 waveFormatSize = 0;
+                    hr = MFCreateWaveFormatExFromMFMediaType(nativeType.Get(), &waveFormat, &waveFormatSize, MFWaveFormatExConvertFlag_Normal);
+                    if (SUCCEEDED(hr) && waveFormat && waveFormatSize > 0)
+                    {
+                        formatBytes.assign(reinterpret_cast<const BYTE*>(waveFormat), reinterpret_cast<const BYTE*>(waveFormat) + waveFormatSize);
+                        CoTaskMemFree(waveFormat);
+
+                        while (true)
+                        {
+                            DWORD streamFlags = 0;
+                            Microsoft::WRL::ComPtr<IMFSample> sample;
+                            hr = reader->ReadSample(
+                                static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM),
+                                0,
+                                nullptr,
+                                &streamFlags,
+                                nullptr,
+                                sample.GetAddressOf());
+                            if (FAILED(hr))
+                            {
+                                formatBytes.clear();
+                                audioBytes.clear();
+                                lastAudioDebugMessage_ = L"audio: ReadSample failed hr=" + std::to_wstring(static_cast<long long>(hr));
+                                DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+                                break;
+                            }
+                            if ((streamFlags & MF_SOURCE_READERF_ENDOFSTREAM) != 0)
+                            {
+                                break;
+                            }
+                            if (!sample)
+                            {
+                                continue;
+                            }
+
+                            Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
+                            hr = sample->ConvertToContiguousBuffer(buffer.GetAddressOf());
+                            if (FAILED(hr) || !buffer)
+                            {
+                                formatBytes.clear();
+                                audioBytes.clear();
+                                lastAudioDebugMessage_ = L"audio: ConvertToContiguousBuffer failed hr=" + std::to_wstring(static_cast<long long>(hr));
+                                DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+                                break;
+                            }
+
+                            BYTE* data = nullptr;
+                            DWORD maxLength = 0;
+                            DWORD currentLength = 0;
+                            hr = buffer->Lock(&data, &maxLength, &currentLength);
+                            if (FAILED(hr))
+                            {
+                                formatBytes.clear();
+                                audioBytes.clear();
+                                lastAudioDebugMessage_ = L"audio: IMFMediaBuffer::Lock failed hr=" + std::to_wstring(static_cast<long long>(hr));
+                                DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+                                break;
+                            }
+                            audioBytes.insert(audioBytes.end(), data, data + currentLength);
+                            buffer->Unlock();
+                        }
+
+                        decoded = !audioBytes.empty() && !formatBytes.empty();
+                    }
+                    else if (waveFormat)
+                    {
+                        CoTaskMemFree(waveFormat);
+                    }
+                    else
+                    {
+                        lastAudioDebugMessage_ = L"audio: MFCreateWaveFormatExFromMFMediaType failed hr=" + std::to_wstring(static_cast<long long>(hr));
+                        DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+                    }
+                }
+            }
+        }
+    }
+
+    if (decoded)
+    {
+        lastAudioDebugMessage_ = L"audio: MediaFoundation decode OK";
+        DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath + L" bytes=" + std::to_wstring(audioBytes.size()));
+        return true;
+    }
+
+    formatBytes.clear();
+    audioBytes.clear();
+
+    HANDLE fileHandle = CreateFileW(fullPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (fileHandle == INVALID_HANDLE_VALUE)
+    {
+        lastAudioDebugMessage_ = L"audio: CreateFileW failed code=" + std::to_wstring(static_cast<long long>(GetLastError()));
+        DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+        return false;
+    }
+
+    LARGE_INTEGER fileSize = {};
+    if (!GetFileSizeEx(fileHandle, &fileSize) || fileSize.QuadPart <= 0)
+    {
+        CloseHandle(fileHandle);
+        lastAudioDebugMessage_ = L"audio: GetFileSizeEx failed code=" + std::to_wstring(static_cast<long long>(GetLastError()));
+        DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+        return false;
+    }
+
+    std::vector<BYTE> compressedBytes(static_cast<size_t>(fileSize.QuadPart));
+    DWORD bytesRead = 0;
+    if (!ReadFile(fileHandle, compressedBytes.data(), static_cast<DWORD>(compressedBytes.size()), &bytesRead, nullptr) || bytesRead != compressedBytes.size())
+    {
+        CloseHandle(fileHandle);
+        lastAudioDebugMessage_ = L"audio: ReadFile failed code=" + std::to_wstring(static_cast<long long>(GetLastError()));
+        DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+        return false;
+    }
+    CloseHandle(fileHandle);
+
+    ma_decoder_config config = ma_decoder_config_init(ma_format_s16, 0, 0);
+    ma_decoder decoder;
+    const ma_result initResult = ma_decoder_init_memory(compressedBytes.data(), compressedBytes.size(), &config, &decoder);
+    if (initResult != MA_SUCCESS)
+    {
+        lastAudioDebugMessage_ = L"audio: miniaudio decoder init failed code=" + std::to_wstring(static_cast<long long>(initResult));
+        DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+        return false;
+    }
+
+    const ma_uint32 channels = decoder.outputChannels;
+    const ma_uint32 sampleRate = decoder.outputSampleRate;
+    if (channels == 0 || sampleRate == 0)
+    {
+        ma_decoder_uninit(&decoder);
+        lastAudioDebugMessage_ = L"audio: miniaudio invalid format";
+        DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+        return false;
+    }
+
+    constexpr ma_uint64 kChunkFrames = 4096;
+    std::vector<ma_int16> chunk(static_cast<size_t>(kChunkFrames * channels));
+    std::vector<ma_int16> pcmSamples;
+    while (true)
+    {
+        ma_uint64 framesRead = 0;
+        const ma_result readResult = ma_decoder_read_pcm_frames(&decoder, chunk.data(), kChunkFrames, &framesRead);
+        if (readResult != MA_SUCCESS)
+        {
+            pcmSamples.clear();
+            lastAudioDebugMessage_ = L"audio: miniaudio read failed code=" + std::to_wstring(static_cast<long long>(readResult));
+            DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+            break;
+        }
+        if (framesRead == 0)
+        {
+            break;
+        }
+        const size_t samplesRead = static_cast<size_t>(framesRead * channels);
+        pcmSamples.insert(pcmSamples.end(), chunk.begin(), chunk.begin() + samplesRead);
+    }
+    ma_decoder_uninit(&decoder);
+    if (pcmSamples.empty())
+    {
+        lastAudioDebugMessage_ = L"audio: miniaudio decoded 0 samples";
+        DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath);
+        return false;
+    }
+
+    const size_t bytesToCopy = pcmSamples.size() * sizeof(ma_int16);
+    audioBytes.resize(bytesToCopy);
+    memcpy(audioBytes.data(), pcmSamples.data(), bytesToCopy);
+
+    WAVEFORMATEX waveFormat = {};
+    waveFormat.wFormatTag = WAVE_FORMAT_PCM;
+    waveFormat.nChannels = static_cast<WORD>(channels);
+    waveFormat.nSamplesPerSec = sampleRate;
+    waveFormat.wBitsPerSample = 16;
+    waveFormat.nBlockAlign = static_cast<WORD>(waveFormat.nChannels * (waveFormat.wBitsPerSample / 8));
+    waveFormat.nAvgBytesPerSec = waveFormat.nSamplesPerSec * waveFormat.nBlockAlign;
+    waveFormat.cbSize = 0;
+
+    formatBytes.resize(sizeof(WAVEFORMATEX));
+    memcpy(formatBytes.data(), &waveFormat, sizeof(WAVEFORMATEX));
+    lastAudioDebugMessage_ = L"audio: miniaudio decode OK";
+    DebugTrace(lastAudioDebugMessage_ + L" path=" + fullPath + L" channels=" + std::to_wstring(channels) + L" rate=" + std::to_wstring(sampleRate) + L" bytes=" + std::to_wstring(audioBytes.size()));
+    return true;
+}
+
+bool NovelRuntime::PlayAudioFile(AudioChannel channel, const std::wstring& fullPath, bool loop, int volumePercent)
+{
+    const std::wstring resolvedPath = NormalizeFullPath(fullPath);
+
+    if (!InitializeAudioEngine())
+    {
+        const_cast<NovelRuntime*>(this)->lastAudioDebugMessage_ = L"audio: XAudio2/MediaFoundation 初期化失敗";
+        DebugTrace(lastAudioDebugMessage_);
+        return false;
+    }
+
+    AudioPlaybackState& state = GetAudioPlaybackState(channel);
+    StopAudioChannel(channel);
+    if (!DecodeAudioFile(resolvedPath, state.formatBytes, state.audioBytes))
+    {
+        const std::wstring alias = GetLegacyAudioAlias(channel);
+        if (!TryOpenAudioAlias(resolvedPath, alias))
+        {
+            lastAudioDebugMessage_ = L"audio: デコード失敗 / MCIフォールバック失敗 path=" + resolvedPath;
+            DebugTrace(lastAudioDebugMessage_);
+            return false;
+        }
+        ApplyAudioAliasVolume(alias, volumePercent);
+        const std::wstring playCommand = loop ? L"play " + alias + L" repeat" : L"play " + alias;
+        if (mciSendStringW(playCommand.c_str(), nullptr, 0, nullptr) != 0)
+        {
+            const std::wstring closeCommand = L"close " + alias;
+            mciSendStringW(closeCommand.c_str(), nullptr, 0, nullptr);
+            lastAudioDebugMessage_ = L"audio: MCI play 失敗 path=" + resolvedPath;
+            DebugTrace(lastAudioDebugMessage_);
+            return false;
+        }
+        state.usesLegacyMci = true;
+        state.legacyAlias = alias;
+        state.looping = loop;
+        state.sourcePath = resolvedPath;
+        lastAudioDebugMessage_ = L"audio: MCIフォールバック再生 path=" + resolvedPath;
+        DebugTrace(lastAudioDebugMessage_);
+        return true;
+    }
+
+    const WAVEFORMATEX* waveFormat = reinterpret_cast<const WAVEFORMATEX*>(state.formatBytes.data());
+    HRESULT hr = xaudio2_->CreateSourceVoice(&state.voice, waveFormat);
+    if (FAILED(hr) || !state.voice)
+    {
+        StopAudioChannel(channel);
+        lastAudioDebugMessage_ = L"audio: CreateSourceVoice 失敗 hr=" + std::to_wstring(static_cast<long long>(hr));
+        DebugTrace(lastAudioDebugMessage_);
+        return false;
+    }
+
+    XAUDIO2_BUFFER buffer = {};
+    buffer.AudioBytes = static_cast<UINT32>(state.audioBytes.size());
+    buffer.pAudioData = state.audioBytes.data();
+    buffer.Flags = XAUDIO2_END_OF_STREAM;
+    if (loop)
+    {
+        buffer.LoopCount = XAUDIO2_LOOP_INFINITE;
+    }
+
+    hr = state.voice->SubmitSourceBuffer(&buffer);
+    if (FAILED(hr))
+    {
+        StopAudioChannel(channel);
+        lastAudioDebugMessage_ = L"audio: SubmitSourceBuffer 失敗 hr=" + std::to_wstring(static_cast<long long>(hr));
+        DebugTrace(lastAudioDebugMessage_);
+        return false;
+    }
+
+    SetAudioChannelVolume(channel, volumePercent);
+    hr = state.voice->Start(0);
+    if (FAILED(hr))
+    {
+        StopAudioChannel(channel);
+        lastAudioDebugMessage_ = L"audio: Start 失敗 hr=" + std::to_wstring(static_cast<long long>(hr));
+        DebugTrace(lastAudioDebugMessage_);
+        return false;
+    }
+
+    state.looping = loop;
+    state.sourcePath = resolvedPath;
+    lastAudioDebugMessage_ = L"audio: XAudio2再生開始 path=" + resolvedPath +
+        L" channels=" + std::to_wstring(waveFormat->nChannels) +
+        L" rate=" + std::to_wstring(waveFormat->nSamplesPerSec) +
+        L" bytes=" + std::to_wstring(state.audioBytes.size());
+    DebugTrace(lastAudioDebugMessage_);
+    return true;
+}
+
 bool NovelRuntime::Initialize()
 {
     if (gdiplusToken_ != 0)
@@ -223,7 +768,13 @@ bool NovelRuntime::Initialize()
     }
 
     Gdiplus::GdiplusStartupInput startupInput;
-    return Gdiplus::GdiplusStartup(&gdiplusToken_, &startupInput, nullptr) == Gdiplus::Ok;
+    if (Gdiplus::GdiplusStartup(&gdiplusToken_, &startupInput, nullptr) != Gdiplus::Ok)
+    {
+        return false;
+    }
+    RefreshAvailableFonts();
+    LoadRecentProjects();
+    return InitializeAudioEngine();
 }
 
 void NovelRuntime::Shutdown()
@@ -240,8 +791,7 @@ void NovelRuntime::Shutdown()
         previewWindow_ = nullptr;
     }
 
-    StopBgmPlayback();
-    StopAssetPreviewAudio();
+    ShutdownAudioEngine();
     backgroundImage_.reset();
     leftCharacter_.image.reset();
     centerCharacter_.image.reset();
@@ -251,6 +801,13 @@ void NovelRuntime::Shutdown()
         item.iconImage.reset();
     }
     toolbarItems_.clear();
+
+    for (const std::wstring& path : loadedPrivateFontPaths_)
+    {
+        RemoveFontResourceExW(path.c_str(), FR_PRIVATE, nullptr);
+    }
+    loadedPrivateFontPaths_.clear();
+    availableFonts_.clear();
 
     if (gdiplusToken_ != 0)
     {
@@ -266,7 +823,7 @@ const std::wstring& NovelRuntime::GetWindowTitle() const
 
 void NovelRuntime::StopAssetPreviewAudio()
 {
-    mciSendStringW(L"close kaktos_asset_preview", nullptr, 0, nullptr);
+    StopAudioChannel(AudioChannel::Preview);
 }
 
 void NovelRuntime::StartAssetPreview(const AssetListItem& item)
@@ -287,9 +844,8 @@ void NovelRuntime::StartAssetPreview(const AssetListItem& item)
     if (item.category == L"bgm" || item.category == L"se")
     {
         StopAssetPreviewAudio();
-        if (TryOpenAudioAlias(item.path, L"kaktos_asset_preview"))
+        if (PlayAudioFile(AudioChannel::Preview, item.path, false, assetPreviewVolume_))
         {
-            mciSendStringW(L"play kaktos_asset_preview from 0", nullptr, 0, nullptr);
             statusText_ = item.label + L" をプレビュー中";
         }
         else
@@ -590,6 +1146,7 @@ RECT NovelRuntime::GetEventListRect(const RECT& previewRect) const
 void NovelRuntime::InitializeToolbarItems()
 {
     toolbarItems_.clear();
+    toolbarItems_.push_back(ToolbarItem{ L"project", L"プロジェクト", L"ui\\project.png", nullptr });
     toolbarItems_.push_back(ToolbarItem{ L"preview", L"\u30d7\u30ec\u30d3\u30e5\u30fc", L"ui\\preview.png", nullptr });
     toolbarItems_.push_back(ToolbarItem{ L"save", L"\u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u4fdd\u5b58", L"ui\\save.png", nullptr });
     toolbarItems_.push_back(ToolbarItem{ L"characters", L"\u30ad\u30e3\u30e9\u30af\u30bf\u30fc\u7ba1\u7406", L"ui\\material_character.png", nullptr });
@@ -598,11 +1155,11 @@ void NovelRuntime::InitializeToolbarItems()
 
     if (uiButtons_.empty())
     {
-        uiButtons_.push_back(UiButtonDefinition{ L"save", L"SAVE", L"ui\\save.png", -348, -52, 36, 36, true, nullptr });
-        uiButtons_.push_back(UiButtonDefinition{ L"load", L"LOAD", L"ui\\load.png", -296, -52, 36, 36, true, nullptr });
-        uiButtons_.push_back(UiButtonDefinition{ L"log", L"LOG", L"ui\\log.png", -244, -52, 36, 36, true, nullptr });
-        uiButtons_.push_back(UiButtonDefinition{ L"hide", L"HIDE", L"ui\\hide.png", -192, -52, 36, 36, true, nullptr });
-        uiButtons_.push_back(UiButtonDefinition{ L"menu", L"MENU", L"ui\\menu.png", -140, -52, 36, 36, true, nullptr });
+        uiButtons_.push_back(UiButtonDefinition{ L"save", L"SAVE", L"ui\\save.png", -348, -52, 36, 36, false, nullptr });
+        uiButtons_.push_back(UiButtonDefinition{ L"load", L"LOAD", L"ui\\load.png", -296, -52, 36, 36, false, nullptr });
+        uiButtons_.push_back(UiButtonDefinition{ L"log", L"LOG", L"ui\\log.png", -244, -52, 36, 36, false, nullptr });
+        uiButtons_.push_back(UiButtonDefinition{ L"hide", L"HIDE", L"ui\\hide.png", -192, -52, 36, 36, false, nullptr });
+        uiButtons_.push_back(UiButtonDefinition{ L"menu", L"MENU", L"ui\\menu_ui.png", -140, -52, 36, 36, true, nullptr });
     }
 }
 
@@ -665,6 +1222,70 @@ bool NovelRuntime::TryParseHexColor(const std::wstring& value, COLORREF& color) 
     return false;
 }
 
+std::wstring NovelRuntime::FormatHexColor(COLORREF color) const
+{
+    wchar_t buffer[16] = {};
+    swprintf_s(buffer, L"#%02X%02X%02X", GetRValue(color), GetGValue(color), GetBValue(color));
+    return buffer;
+}
+
+COLORREF NovelRuntime::ShowColorPresetMenu(POINT point, COLORREF currentColor) const
+{
+    if (!hostWindow_)
+    {
+        return currentColor;
+    }
+
+    struct PresetColor
+    {
+        const wchar_t* label;
+        COLORREF color;
+    };
+
+    const PresetColor presets[] =
+    {
+        { L"ダーク", RGB(8, 10, 14) },
+        { L"スレート", RGB(24, 32, 44) },
+        { L"ネイビー", RGB(18, 28, 52) },
+        { L"グレー", RGB(56, 60, 68) },
+        { L"シアン", RGB(80, 132, 180) },
+        { L"ブルー", RGB(52, 122, 188) },
+        { L"ゴールド", RGB(184, 150, 82) },
+        { L"レッド", RGB(132, 58, 66) },
+        { L"グリーン", RGB(76, 108, 76) },
+        { L"ホワイト", RGB(230, 234, 240) },
+    };
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu)
+    {
+        return currentColor;
+    }
+
+    const UINT kBaseId = 52000;
+    for (size_t i = 0; i < _countof(presets); ++i)
+    {
+        UINT flags = MF_STRING;
+        if (presets[i].color == currentColor)
+        {
+            flags |= MF_CHECKED;
+        }
+        const std::wstring label = std::wstring(presets[i].label) + L"  " + FormatHexColor(presets[i].color);
+        AppendMenuW(menu, flags, kBaseId + static_cast<UINT>(i), label.c_str());
+    }
+
+    POINT screenPoint = point;
+    ClientToScreen(hostWindow_, &screenPoint);
+    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, 0, hostWindow_, nullptr);
+    DestroyMenu(menu);
+
+    if (command >= kBaseId && command < kBaseId + _countof(presets))
+    {
+        return presets[command - kBaseId].color;
+    }
+    return currentColor;
+}
+
 bool NovelRuntime::TryGetNumber(const std::wstring& value, long long& number) const
 {
     if (value.empty())
@@ -691,6 +1312,91 @@ std::unique_ptr<Gdiplus::Image> NovelRuntime::TryLoadImage(const std::wstring& f
     }
 
     return image;
+}
+
+std::wstring NovelRuntime::GetFontsDirectory() const
+{
+    return CombinePath(GetAssetsRootDirectory(), L"fonts");
+}
+
+void NovelRuntime::RefreshAvailableFonts()
+{
+    for (const std::wstring& path : loadedPrivateFontPaths_)
+    {
+        RemoveFontResourceExW(path.c_str(), FR_PRIVATE, nullptr);
+    }
+    loadedPrivateFontPaths_.clear();
+    availableFonts_.clear();
+
+    if (gdiplusToken_ == 0)
+    {
+        return;
+    }
+
+    const std::wstring fontDirectory = GetFontsDirectory();
+    const std::vector<std::wstring> fontFiles = EnumerateFiles(fontDirectory, L"*.*");
+    for (const std::wstring& filePath : fontFiles)
+    {
+        std::wstring lower = filePath;
+        if (!lower.empty())
+        {
+            CharLowerBuffW(&lower[0], static_cast<DWORD>(lower.size()));
+        }
+        const bool supported =
+            (lower.size() >= 4 && (lower.substr(lower.size() - 4) == L".ttf" || lower.substr(lower.size() - 4) == L".otf")) ||
+            (lower.size() >= 4 && lower.substr(lower.size() - 4) == L".ttc");
+        if (!supported)
+        {
+            continue;
+        }
+
+        Gdiplus::PrivateFontCollection collection;
+        if (collection.AddFontFile(filePath.c_str()) != Gdiplus::Ok)
+        {
+            continue;
+        }
+
+        const INT familyCount = collection.GetFamilyCount();
+        if (familyCount <= 0)
+        {
+            continue;
+        }
+
+        std::vector<Gdiplus::FontFamily> families(static_cast<size_t>(familyCount));
+        INT found = 0;
+        if (collection.GetFamilies(familyCount, families.data(), &found) != Gdiplus::Ok || found <= 0)
+        {
+            continue;
+        }
+
+        WCHAR familyName[LF_FACESIZE] = {};
+        if (families[0].GetFamilyName(familyName) != Gdiplus::Ok || familyName[0] == L'\0')
+        {
+            continue;
+        }
+
+        AddFontResourceExW(filePath.c_str(), FR_PRIVATE, nullptr);
+        loadedPrivateFontPaths_.push_back(filePath);
+        availableFonts_.push_back(FontAssetItem{ filePath, GetFileNamePart(filePath), familyName });
+    }
+}
+
+std::wstring NovelRuntime::GetNextAvailableFont(const std::wstring& current) const
+{
+    if (availableFonts_.empty())
+    {
+        return current.empty() ? editorSettings_.defaultFont : current;
+    }
+
+    for (size_t i = 0; i < availableFonts_.size(); ++i)
+    {
+        if (availableFonts_[i].family == current)
+        {
+            return availableFonts_[(i + 1) % availableFonts_.size()].family;
+        }
+    }
+
+    return availableFonts_.front().family;
 }
 
 CharacterSlot* NovelRuntime::GetCharacterSlot(const std::wstring& position)
@@ -916,7 +1622,7 @@ void NovelRuntime::ApplyAddValueCommand(const ScriptCommand& command)
 
 void NovelRuntime::StopBgmPlayback()
 {
-    mciSendStringW(L"close kaktos_bgm", nullptr, 0, nullptr);
+    StopAudioChannel(AudioChannel::Bgm);
     currentBgmPath_.clear();
 }
 
@@ -936,31 +1642,21 @@ void NovelRuntime::ApplyBgmCommand(const ScriptCommand& command)
         fullPath = relativePath;
         attributes = GetFileAttributesW(fullPath.c_str());
     }
+    fullPath = NormalizeFullPath(fullPath);
     if (attributes == INVALID_FILE_ATTRIBUTES)
     {
         statusText_ = L"BGM \u304c\u898b\u3064\u304b\u308a\u307e\u305b\u3093: " + relativePath;
         return;
     }
 
-    StopBgmPlayback();
-    if (!TryOpenAudioAlias(fullPath, L"kaktos_bgm"))
-    {
-        statusText_ = L"BGM \u3092\u958b\u3051\u307e\u305b\u3093: " + relativePath;
-        return;
-    }
-
     int volume = ParseIntValue(GetCommandParameter(command, L"volume"), 100);
     volume = (std::max)(0, (std::min)(100, volume));
     volume = volume * editorSettings_.masterVolume * editorSettings_.bgmVolume / 10000;
-    const std::wstring setVolumeCommand = L"setaudio kaktos_bgm volume to " + std::to_wstring(volume * 10);
-    mciSendStringW(setVolumeCommand.c_str(), nullptr, 0, nullptr);
 
     const bool loop = GetCommandParameter(command, L"loop") != L"false";
-    const std::wstring playCommand = loop ? L"play kaktos_bgm repeat" : L"play kaktos_bgm";
-    if (mciSendStringW(playCommand.c_str(), nullptr, 0, nullptr) != 0)
+    if (!PlayAudioFile(AudioChannel::Bgm, fullPath, loop, volume))
     {
-        mciSendStringW(L"close kaktos_bgm", nullptr, 0, nullptr);
-        statusText_ = L"BGM \u306e\u518d\u751f\u306b\u5931\u6557\u3057\u307e\u3057\u305f: " + relativePath;
+        statusText_ = L"BGM \u306e\u518d\u751f\u306b\u5931\u6557\u3057\u307e\u3057\u305f: " + relativePath + L" / " + lastAudioDebugMessage_;
         return;
     }
 
@@ -982,26 +1678,16 @@ void NovelRuntime::ApplySeCommand(const ScriptCommand& command)
     {
         fullPath = relativePath;
     }
-
-    mciSendStringW(L"close kaktos_se", nullptr, 0, nullptr);
-    if (!TryOpenAudioAlias(fullPath, L"kaktos_se"))
-    {
-        statusText_ = L"SE \u3092\u958b\u3051\u307e\u305b\u3093: " + relativePath;
-        return;
-    }
+    fullPath = NormalizeFullPath(fullPath);
 
     int volume = ParseIntValue(GetCommandParameter(command, L"volume"), 100);
     volume = (std::max)(0, (std::min)(100, volume));
     volume = volume * editorSettings_.masterVolume * editorSettings_.seVolume / 10000;
-    const std::wstring setVolumeCommand = L"setaudio kaktos_se volume to " + std::to_wstring(volume * 10);
-    mciSendStringW(setVolumeCommand.c_str(), nullptr, 0, nullptr);
 
     const bool loop = ParseBoolValue(GetCommandParameter(command, L"loop"), false);
-    const std::wstring playCommand = loop ? L"play kaktos_se repeat" : L"play kaktos_se";
-    if (mciSendStringW(playCommand.c_str(), nullptr, 0, nullptr) != 0)
+    if (!PlayAudioFile(AudioChannel::Se, fullPath, loop, volume))
     {
-        mciSendStringW(L"close kaktos_se", nullptr, 0, nullptr);
-        statusText_ = L"SE \u306e\u518d\u751f\u306b\u5931\u6557\u3057\u307e\u3057\u305f: " + relativePath;
+        statusText_ = L"SE \u306e\u518d\u751f\u306b\u5931\u6557\u3057\u307e\u3057\u305f: " + relativePath + L" / " + lastAudioDebugMessage_;
         return;
     }
 
@@ -1022,26 +1708,16 @@ void NovelRuntime::ApplyVoiceCommand(const ScriptCommand& command)
     {
         fullPath = relativePath;
     }
-
-    mciSendStringW(L"close kaktos_voice", nullptr, 0, nullptr);
-    if (!TryOpenAudioAlias(fullPath, L"kaktos_voice"))
-    {
-        statusText_ = L"\u30dc\u30a4\u30b9\u3092\u958b\u3051\u307e\u305b\u3093: " + relativePath;
-        return;
-    }
+    fullPath = NormalizeFullPath(fullPath);
 
     int volume = ParseIntValue(GetCommandParameter(command, L"volume"), 100);
     volume = (std::max)(0, (std::min)(100, volume));
     volume = volume * editorSettings_.masterVolume * editorSettings_.voiceVolume / 10000;
-    const std::wstring setVolumeCommand = L"setaudio kaktos_voice volume to " + std::to_wstring(volume * 10);
-    mciSendStringW(setVolumeCommand.c_str(), nullptr, 0, nullptr);
 
     const bool loop = ParseBoolValue(GetCommandParameter(command, L"loop"), false);
-    const std::wstring playCommand = loop ? L"play kaktos_voice repeat" : L"play kaktos_voice";
-    if (mciSendStringW(playCommand.c_str(), nullptr, 0, nullptr) != 0)
+    if (!PlayAudioFile(AudioChannel::Voice, fullPath, loop, volume))
     {
-        mciSendStringW(L"close kaktos_voice", nullptr, 0, nullptr);
-        statusText_ = L"\u30dc\u30a4\u30b9\u306e\u518d\u751f\u306b\u5931\u6557\u3057\u307e\u3057\u305f: " + relativePath;
+        statusText_ = L"\u30dc\u30a4\u30b9\u306e\u518d\u751f\u306b\u5931\u6557\u3057\u307e\u3057\u305f: " + relativePath + L" / " + lastAudioDebugMessage_;
         return;
     }
 
@@ -1085,6 +1761,10 @@ void NovelRuntime::ApplyMessageFontCommand(const ScriptCommand& command)
     {
         messageFontFace_ = face;
     }
+    else if (!availableFonts_.empty())
+    {
+        messageFontFace_ = availableFonts_.front().family;
+    }
     statusText_ = L"フォントを更新しました: " + messageFontFace_;
 }
 
@@ -1092,6 +1772,59 @@ void NovelRuntime::ApplyMessageFontResetCommand()
 {
     messageFontFace_ = editorSettings_.defaultFont;
     statusText_ = L"フォントを初期化しました";
+}
+
+void NovelRuntime::ApplyMessageStyleCommand(const ScriptCommand& command)
+{
+    COLORREF color = messageWindowColor_;
+    if (TryParseHexColor(GetCommandParameter(command, L"color"), color))
+    {
+        messageWindowColor_ = color;
+    }
+
+    COLORREF borderColor = messageWindowBorderColor_;
+    if (TryParseHexColor(GetCommandParameter(command, L"border"), borderColor))
+    {
+        messageWindowBorderColor_ = borderColor;
+    }
+
+    const std::wstring opacityText = Trim(GetCommandParameter(command, L"opacity"));
+    if (!opacityText.empty())
+    {
+        int opacity = ParseIntValue(opacityText, messageWindowOpacity_);
+        if (opacity <= 100)
+        {
+            opacity = (opacity * 255) / 100;
+        }
+        messageWindowOpacity_ = (std::max)(0, (std::min)(255, opacity));
+    }
+
+    const std::wstring paddingText = Trim(GetCommandParameter(command, L"padding"));
+    if (!paddingText.empty())
+    {
+        messageWindowPadding_ = (std::max)(8, (std::min)(64, ParseIntValue(paddingText, messageWindowPadding_)));
+    }
+
+    const std::wstring imagePath = Trim(GetCommandParameter(command, L"image"));
+    messageWindowImagePath_.clear();
+    messageWindowImage_.reset();
+    if (!imagePath.empty())
+    {
+        std::wstring fullPath = CombinePath(scenarioBaseDir_, imagePath);
+        auto image = TryLoadImage(fullPath);
+        if (!image)
+        {
+            image = TryLoadImage(imagePath);
+            fullPath = imagePath;
+        }
+        if (image)
+        {
+            messageWindowImagePath_ = fullPath;
+            messageWindowImage_ = std::move(image);
+        }
+    }
+
+    statusText_ = L"メッセージUIを更新しました";
 }
 
 void NovelRuntime::ApplyTextColorCommand(const ScriptCommand& command)
@@ -1117,7 +1850,83 @@ void NovelRuntime::ApplyNameColorCommand(const ScriptCommand& command)
 void NovelRuntime::ApplyNameWindowCommand(const ScriptCommand& command)
 {
     nameBoxVisible_ = ParseBoolValue(GetCommandParameter(command, L"visible"), true);
-    statusText_ = nameBoxVisible_ ? L"名前欄を表示しました" : L"名前欄を非表示にしました";
+
+    const std::wstring xText = Trim(GetCommandParameter(command, L"x"));
+    if (!xText.empty())
+    {
+        nameWindowOffsetX_ = ParseIntValue(xText, nameWindowOffsetX_);
+    }
+
+    const std::wstring yText = Trim(GetCommandParameter(command, L"y"));
+    if (!yText.empty())
+    {
+        nameWindowOffsetY_ = ParseIntValue(yText, nameWindowOffsetY_);
+    }
+
+    const std::wstring widthText = Trim(GetCommandParameter(command, L"width"));
+    if (!widthText.empty())
+    {
+        nameWindowWidth_ = (std::max)(120, ParseIntValue(widthText, nameWindowWidth_));
+    }
+
+    const std::wstring heightText = Trim(GetCommandParameter(command, L"height"));
+    if (!heightText.empty())
+    {
+        nameWindowHeight_ = (std::max)(28, ParseIntValue(heightText, nameWindowHeight_));
+    }
+
+    const std::wstring paddingText = Trim(GetCommandParameter(command, L"padding"));
+    if (!paddingText.empty())
+    {
+        nameWindowPadding_ = (std::max)(4, ParseIntValue(paddingText, nameWindowPadding_));
+    }
+
+    COLORREF color = nameWindowColor_;
+    if (TryParseHexColor(GetCommandParameter(command, L"color"), color))
+    {
+        nameWindowColor_ = color;
+    }
+
+    COLORREF borderColor = nameWindowBorderColor_;
+    if (TryParseHexColor(GetCommandParameter(command, L"border"), borderColor))
+    {
+        nameWindowBorderColor_ = borderColor;
+    }
+
+    const std::wstring opacityText = Trim(GetCommandParameter(command, L"opacity"));
+    if (!opacityText.empty())
+    {
+        int opacity = ParseIntValue(opacityText, nameWindowOpacity_);
+        if (opacity <= 100)
+        {
+            opacity = (opacity * 255) / 100;
+        }
+        nameWindowOpacity_ = (std::max)(0, (std::min)(255, opacity));
+    }
+
+    const std::wstring imagePath = Trim(GetCommandParameter(command, L"image"));
+    if (!imagePath.empty() || !GetCommandParameter(command, L"image").empty())
+    {
+        nameWindowImagePath_.clear();
+        nameWindowImage_.reset();
+        if (!imagePath.empty())
+        {
+            std::wstring fullPath = CombinePath(scenarioBaseDir_, imagePath);
+            auto image = TryLoadImage(fullPath);
+            if (!image)
+            {
+                image = TryLoadImage(imagePath);
+                fullPath = imagePath;
+            }
+            if (image)
+            {
+                nameWindowImagePath_ = fullPath;
+                nameWindowImage_ = std::move(image);
+            }
+        }
+    }
+
+    statusText_ = nameBoxVisible_ ? L"名前欄を更新しました" : L"名前欄を非表示にしました";
 }
 
 void NovelRuntime::ApplyVerticalTextCommand(const ScriptCommand& command)
@@ -1159,6 +1968,8 @@ void NovelRuntime::ApplyFadeCommand(const ScriptCommand& command)
     {
         fadeColor_ = color;
     }
+    const std::wstring target = Trim(GetCommandParameter(command, L"target"));
+    fadeTarget_ = (target == L"message" || target == L"all") ? target : L"stage";
     statusText_ = L"フェード: " + std::to_wstring(duration) + L"ms";
     if (duration > 0 && !ParseBoolValue(GetCommandParameter(command, L"parallel"), false))
     {
@@ -1410,6 +2221,13 @@ void NovelRuntime::LoadUiButtonIcons()
         if (candidates.empty() && !button.id.empty())
         {
             const std::wstring uiDir = CombinePath(assetsRoot, L"ui");
+            if (button.id == L"menu")
+            {
+                candidates.push_back(CombinePath(uiDir, L"menu_ui.png"));
+                candidates.push_back(CombinePath(uiDir, L"menu_ui.jpg"));
+                candidates.push_back(CombinePath(uiDir, L"menu_ui.jpeg"));
+                candidates.push_back(CombinePath(uiDir, L"menu_ui.bmp"));
+            }
             candidates.push_back(CombinePath(uiDir, button.id + L".png"));
             candidates.push_back(CombinePath(uiDir, button.id + L".jpg"));
             candidates.push_back(CombinePath(uiDir, button.id + L".jpeg"));
@@ -1496,12 +2314,11 @@ void NovelRuntime::LoadScenario(const std::wstring& requestedPath)
     inspectorCancelRect_ = {};
     selectedCommandIndex_ = 0;
     selectedChoiceLinkIndex_ = 0;
-    messageWindowVisible_ = true;
-    nameBoxVisible_ = true;
     verticalTextEnabled_ = false;
     textSpeedMs_ = editorSettings_.defaultTextSpeed;
     messageTextColor_ = RGB(242, 244, 247);
     nameTextColor_ = RGB(123, 203, 255);
+    ApplyEditorUiDefaults();
     selectedAssetPath_.clear();
     selectedAssetLabel_.clear();
     selectedAssetPreviewCategory_.clear();
@@ -1700,6 +2517,9 @@ void NovelRuntime::Advance()
         case ScriptCommand::Type::MessageFontReset:
             ApplyMessageFontResetCommand();
             break;
+        case ScriptCommand::Type::MessageStyle:
+            ApplyMessageStyleCommand(command);
+            break;
         case ScriptCommand::Type::TextColor:
             ApplyTextColorCommand(command);
             break;
@@ -1790,6 +2610,30 @@ void NovelRuntime::Advance()
 
 bool NovelRuntime::HandleClick(POINT point)
 {
+    if (projectDialogVisible_)
+    {
+        if (PtInRect(&projectDialogCreateRect_, point))
+        {
+            return CreateProjectFromDialog();
+        }
+        if (PtInRect(&projectDialogOpenRect_, point))
+        {
+            return LoadProjectFromDialog();
+        }
+        if (PtInRect(&projectDialogCancelRect_, point) || !PtInRect(&projectDialogRect_, point))
+        {
+            HideProjectDialog();
+            statusText_ = L"プロジェクト操作を閉じました";
+            return true;
+        }
+        return true;
+    }
+
+    if (projectLauncherVisible_)
+    {
+        return HandleProjectLauncherClick(point);
+    }
+
     if (variableManagerVisible_)
     {
         if (variableFieldDialogVisible_)
@@ -1951,22 +2795,24 @@ bool NovelRuntime::HandleClick(POINT point)
                 SaveProject();
                 return true;
             }
+            if (StartsWithText(target.action, L"settings_tab:"))
+            {
+                const size_t index = static_cast<size_t>(_wtoi(target.action.substr(13).c_str()));
+                selectedSettingsCategoryIndex_ = index;
+                settingsScrollOffset_ = 0;
+                return true;
+            }
             if (target.action == L"cycle_font")
             {
-                const wchar_t* fonts[] = { L"Yu Gothic UI", L"Meiryo", L"MS UI Gothic" };
-                size_t current = 0;
-                for (size_t i = 0; i < _countof(fonts); ++i)
+                RefreshAvailableFonts();
+                const std::wstring selectedFont = ShowFontSelectionMenu(point, editorSettings_.defaultFont);
+                if (!selectedFont.empty() && selectedFont != editorSettings_.defaultFont)
                 {
-                    if (editorSettings_.defaultFont == fonts[i])
-                    {
-                        current = i;
-                        break;
-                    }
+                    editorSettings_.defaultFont = selectedFont;
+                    statusText_ = L"既定メッセージフォントを更新しました: " + editorSettings_.defaultFont;
+                    SaveProject();
+                    RefreshPreviewIfActive();
                 }
-                editorSettings_.defaultFont = fonts[(current + 1) % _countof(fonts)];
-                messageFontFace_ = editorSettings_.defaultFont;
-                SaveProject();
-                RefreshPreviewIfActive();
                 return true;
             }
             auto adjustVolume = [&](int& value, int delta, const std::wstring& text)
@@ -1974,6 +2820,12 @@ bool NovelRuntime::HandleClick(POINT point)
                 value = (std::max)(0, (std::min)(100, value + delta));
                 statusText_ = text + L": " + std::to_wstring(value);
                 SaveProject();
+            };
+            auto applyUiDefaults = [&]()
+            {
+                ApplyEditorUiDefaults();
+                SaveProject();
+                RefreshPreviewIfActive();
             };
             if (target.action == L"text_speed_minus") { editorSettings_.defaultTextSpeed = (std::max)(0, editorSettings_.defaultTextSpeed - 10); textSpeedMs_ = editorSettings_.defaultTextSpeed; SaveProject(); RefreshPreviewIfActive(); return true; }
             if (target.action == L"text_speed_plus") { editorSettings_.defaultTextSpeed = (std::min)(500, editorSettings_.defaultTextSpeed + 10); textSpeedMs_ = editorSettings_.defaultTextSpeed; SaveProject(); RefreshPreviewIfActive(); return true; }
@@ -2003,6 +2855,93 @@ bool NovelRuntime::HandleClick(POINT point)
                     SaveAutosaveSnapshot();
                 }
                 SaveProject();
+                return true;
+            }
+            if (target.action == L"msg_toggle")
+            {
+                editorSettings_.defaultMessageWindowVisible = !editorSettings_.defaultMessageWindowVisible;
+                statusText_ = editorSettings_.defaultMessageWindowVisible ? L"既定メッセージ枠を表示します" : L"既定メッセージ枠を非表示にしました";
+                applyUiDefaults();
+                return true;
+            }
+            if (target.action == L"msg_opacity_minus") { editorSettings_.defaultMessageWindowOpacity = (std::max)(0, editorSettings_.defaultMessageWindowOpacity - 16); applyUiDefaults(); return true; }
+            if (target.action == L"msg_opacity_plus") { editorSettings_.defaultMessageWindowOpacity = (std::min)(255, editorSettings_.defaultMessageWindowOpacity + 16); applyUiDefaults(); return true; }
+            if (target.action == L"msg_padding_minus") { editorSettings_.defaultMessageWindowPadding = (std::max)(8, editorSettings_.defaultMessageWindowPadding - 2); applyUiDefaults(); return true; }
+            if (target.action == L"msg_padding_plus") { editorSettings_.defaultMessageWindowPadding = (std::min)(64, editorSettings_.defaultMessageWindowPadding + 2); applyUiDefaults(); return true; }
+            if (target.action == L"name_toggle")
+            {
+                editorSettings_.defaultNameWindowVisible = !editorSettings_.defaultNameWindowVisible;
+                statusText_ = editorSettings_.defaultNameWindowVisible ? L"既定名前欄を表示します" : L"既定名前欄を非表示にしました";
+                applyUiDefaults();
+                return true;
+            }
+            if (target.action == L"name_x_minus") { editorSettings_.defaultNameWindowOffsetX -= 8; applyUiDefaults(); return true; }
+            if (target.action == L"name_x_plus") { editorSettings_.defaultNameWindowOffsetX += 8; applyUiDefaults(); return true; }
+            if (target.action == L"name_y_minus") { editorSettings_.defaultNameWindowOffsetY -= 8; applyUiDefaults(); return true; }
+            if (target.action == L"name_y_plus") { editorSettings_.defaultNameWindowOffsetY += 8; applyUiDefaults(); return true; }
+            if (target.action == L"name_width_minus") { editorSettings_.defaultNameWindowWidth = (std::max)(120, editorSettings_.defaultNameWindowWidth - 20); applyUiDefaults(); return true; }
+            if (target.action == L"name_width_plus") { editorSettings_.defaultNameWindowWidth = (std::min)(640, editorSettings_.defaultNameWindowWidth + 20); applyUiDefaults(); return true; }
+            if (target.action == L"name_height_minus") { editorSettings_.defaultNameWindowHeight = (std::max)(28, editorSettings_.defaultNameWindowHeight - 4); applyUiDefaults(); return true; }
+            if (target.action == L"name_height_plus") { editorSettings_.defaultNameWindowHeight = (std::min)(160, editorSettings_.defaultNameWindowHeight + 4); applyUiDefaults(); return true; }
+            if (target.action == L"name_opacity_minus") { editorSettings_.defaultNameWindowOpacity = (std::max)(0, editorSettings_.defaultNameWindowOpacity - 16); applyUiDefaults(); return true; }
+            if (target.action == L"name_opacity_plus") { editorSettings_.defaultNameWindowOpacity = (std::min)(255, editorSettings_.defaultNameWindowOpacity + 16); applyUiDefaults(); return true; }
+            if (target.action == L"msg_browse_image" || target.action == L"name_browse_image")
+            {
+                OPENFILENAMEW ofn = {};
+                WCHAR fileBuffer[MAX_PATH] = {};
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hostWindow_;
+                ofn.lpstrFilter = L"Image Files (*.png;*.jpg;*.jpeg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0All Files (*.*)\0*.*\0";
+                ofn.lpstrFile = fileBuffer;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                if (GetOpenFileNameW(&ofn))
+                {
+                    if (target.action == L"msg_browse_image")
+                    {
+                        editorSettings_.defaultMessageWindowImage = MakeProjectRelativeAssetPath(fileBuffer);
+                        statusText_ = L"既定メッセージ画像を更新しました";
+                    }
+                    else
+                    {
+                        editorSettings_.defaultNameWindowImage = MakeProjectRelativeAssetPath(fileBuffer);
+                        statusText_ = L"既定名前欄画像を更新しました";
+                    }
+                    applyUiDefaults();
+                }
+                return true;
+            }
+            if (target.action == L"msg_color" || target.action == L"msg_border" || target.action == L"name_color_setting" || target.action == L"name_border_setting")
+            {
+                COLORREF currentColor = RGB(255, 255, 255);
+                if (target.action == L"msg_color") currentColor = editorSettings_.defaultMessageWindowColor;
+                else if (target.action == L"msg_border") currentColor = editorSettings_.defaultMessageWindowBorderColor;
+                else if (target.action == L"name_color_setting") currentColor = editorSettings_.defaultNameWindowColor;
+                else if (target.action == L"name_border_setting") currentColor = editorSettings_.defaultNameWindowBorderColor;
+
+                const COLORREF selectedColor = ShowColorPresetMenu(point, currentColor);
+                if (selectedColor != currentColor)
+                {
+                    if (target.action == L"msg_color") editorSettings_.defaultMessageWindowColor = selectedColor;
+                    else if (target.action == L"msg_border") editorSettings_.defaultMessageWindowBorderColor = selectedColor;
+                    else if (target.action == L"name_color_setting") editorSettings_.defaultNameWindowColor = selectedColor;
+                    else if (target.action == L"name_border_setting") editorSettings_.defaultNameWindowBorderColor = selectedColor;
+                    applyUiDefaults();
+                }
+                return true;
+            }
+            if (target.action == L"msg_clear_image")
+            {
+                editorSettings_.defaultMessageWindowImage.clear();
+                statusText_ = L"既定メッセージ画像を解除しました";
+                applyUiDefaults();
+                return true;
+            }
+            if (target.action == L"name_clear_image")
+            {
+                editorSettings_.defaultNameWindowImage.clear();
+                statusText_ = L"既定名前欄画像を解除しました";
+                applyUiDefaults();
                 return true;
             }
             if (StartsWithText(target.action, L"ui_toggle:") || StartsWithText(target.action, L"ui_left:") || StartsWithText(target.action, L"ui_right:") || StartsWithText(target.action, L"ui_up:") || StartsWithText(target.action, L"ui_down:"))
@@ -2342,30 +3281,24 @@ bool NovelRuntime::HandleClick(POINT point)
 
 bool NovelRuntime::HandleDoubleClick(POINT point)
 {
+    if (projectLauncherVisible_)
+    {
+        return HandleClick(point);
+    }
     if (sceneDialogVisible_)
     {
         return true;
     }
-
-    if (leftPanelTab_ == LeftPanelTab::Scenario)
-    {
-        for (const SceneListItem& item : sceneItems_)
-        {
-            if (PtInRect(&item.rect, point))
-            {
-                LoadScenario(item.path);
-                RefreshSceneList();
-                statusText_ = L"シナリオを開きました";
-                return true;
-            }
-        }
-    }
-
     return HandleClick(point);
 }
 
 bool NovelRuntime::HandleRightClick(POINT clientPoint, POINT screenPoint)
 {
+    if (projectLauncherVisible_)
+    {
+        return true;
+    }
+
     static constexpr UINT kMenuPreviewFromScene = 61001;
     static constexpr UINT kMenuPreviewFromHere = 61002;
 
@@ -2440,6 +3373,11 @@ bool NovelRuntime::HandleRightClick(POINT clientPoint, POINT screenPoint)
 
 bool NovelRuntime::HandleFileDrop(POINT clientPoint, const std::vector<std::wstring>& paths)
 {
+    if (projectLauncherVisible_)
+    {
+        return false;
+    }
+
     if (paths.empty())
     {
         return false;
@@ -2502,6 +3440,11 @@ NovelRuntime::DragHandle NovelRuntime::HitTestDragHandle(POINT point) const
 
 bool NovelRuntime::HandleMouseDown(POINT point)
 {
+    if (projectLauncherVisible_)
+    {
+        return true;
+    }
+
     if (leftPanelTab_ == LeftPanelTab::Materials)
     {
         for (size_t i = 0; i < assetItems_.size(); ++i)
@@ -2563,6 +3506,10 @@ bool NovelRuntime::HandleMouseDown(POINT point)
 bool NovelRuntime::HandleMouseMove(POINT point)
 {
     lastMousePoint_ = point;
+    if (projectLauncherVisible_)
+    {
+        return false;
+    }
 
     if (assetDragActive_)
     {
@@ -2717,6 +3664,15 @@ bool NovelRuntime::HandleMouseMove(POINT point)
 
 bool NovelRuntime::HandleMouseUp(POINT point)
 {
+    if (projectLauncherVisible_)
+    {
+        assetDragActive_ = false;
+        paletteDragActive_ = false;
+        eventReorderDragActive_ = false;
+        activeDragHandle_ = DragHandle::None;
+        return false;
+    }
+
     if (assetDragActive_)
     {
         dragPoint_ = point;
@@ -2840,6 +3796,18 @@ bool NovelRuntime::HandleMouseUp(POINT point)
 
 bool NovelRuntime::HandleMouseWheel(short delta, POINT point)
 {
+    if (projectLauncherVisible_)
+    {
+        return false;
+    }
+
+    if (settingsDialogVisible_ && PtInRect(&settingsDialogRect_, point))
+    {
+        const int step = delta > 0 ? -48 : 48;
+        settingsScrollOffset_ = (std::max)(0, (std::min)(settingsScrollOffset_ + step, settingsScrollMax_));
+        return true;
+    }
+
     const RECT leftPanelRect = GetLeftPanelRect(lastClientRect_);
     if (leftPanelTab_ == LeftPanelTab::Components && PtInRect(&leftPanelRect, point))
     {
@@ -2984,6 +3952,12 @@ ScriptCommand NovelRuntime::CreateDefaultCommand(ScriptCommand::Type type) const
         break;
     case ScriptCommand::Type::MessageFontReset:
         break;
+    case ScriptCommand::Type::MessageStyle:
+        command.parameters[L"color"] = L"#080a0e";
+        command.parameters[L"border"] = L"#7a808a";
+        command.parameters[L"opacity"] = L"70";
+        command.parameters[L"padding"] = L"24";
+        break;
     case ScriptCommand::Type::Choice:
         command.parameters[L"prompt"] = L"\u65b0\u3057\u3044\u9078\u629e\u80a2";
         command.links.push_back({ L"\u9078\u629e\u80a21", L"start" });
@@ -3040,6 +4014,15 @@ ScriptCommand NovelRuntime::CreateDefaultCommand(ScriptCommand::Type type) const
         break;
     case ScriptCommand::Type::NameWindow:
         command.parameters[L"visible"] = L"true";
+        command.parameters[L"x"] = L"0";
+        command.parameters[L"y"] = L"0";
+        command.parameters[L"width"] = L"220";
+        command.parameters[L"height"] = L"36";
+        command.parameters[L"padding"] = L"12";
+        command.parameters[L"opacity"] = L"84";
+        command.parameters[L"color"] = L"#0c121c";
+        command.parameters[L"border"] = L"#5084b4";
+        command.parameters[L"image"] = L"";
         break;
     case ScriptCommand::Type::VerticalText:
         command.parameters[L"enabled"] = L"true";
@@ -3252,6 +4235,11 @@ bool NovelRuntime::ExecuteEditorCommand(UINT commandId)
 {
     switch (commandId)
     {
+    case IDM_PROJECT_NEW:
+        ShowProjectDialog();
+        return true;
+    case IDM_PROJECT_OPEN:
+        return LoadProjectFromDialog();
     case IDM_EDIT_RELOAD:
         LoadScenario(scenarioPath_);
         statusText_ = L"シナリオを再読み込みしました";
@@ -3515,6 +4503,14 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
         {
             return BrowseCommandAsset(target.commandIndex, L"storage", false);
         }
+        if (target.action == L"browse_message_image")
+        {
+            return BrowseCommandAsset(target.commandIndex, L"image", false);
+        }
+        if (target.action == L"browse_name_image")
+        {
+            return BrowseCommandAsset(target.commandIndex, L"image", false);
+        }
         if (target.action == L"clear_image")
         {
             PushUndoSnapshot();
@@ -3532,9 +4528,44 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             RefreshPreviewIfActive();
             return true;
         }
+        if (target.action == L"clear_message_image")
+        {
+            PushUndoSnapshot();
+            command.parameters[L"image"].clear();
+            SyncDocumentMetadata();
+            ApplyMessageStyleCommand(command);
+            statusText_ = L"メッセージ画像を解除しました";
+            RefreshPreviewIfActive();
+            return true;
+        }
+        if (target.action == L"clear_name_image")
+        {
+            PushUndoSnapshot();
+            command.parameters[L"image"].clear();
+            SyncDocumentMetadata();
+            ApplyNameWindowCommand(command);
+            statusText_ = L"名前欄画像を解除しました";
+            RefreshPreviewIfActive();
+            return true;
+        }
         if (target.action == L"browse_audio")
         {
             return BrowseCommandAsset(target.commandIndex, L"storage", true);
+        }
+        if (target.action == L"cycle_message_font")
+        {
+            RefreshAvailableFonts();
+            const std::wstring currentFont = GetCommandParameter(command, L"face");
+            const std::wstring selectedFont = ShowFontSelectionMenu(point, currentFont);
+            if (!selectedFont.empty() && selectedFont != currentFont)
+            {
+                PushUndoSnapshot();
+                command.parameters[L"face"] = selectedFont;
+                SyncDocumentMetadata();
+                ApplyMessageFontCommand(command);
+                RefreshPreviewIfActive();
+            }
+            return true;
         }
         if (target.action == L"toggle_visible")
         {
@@ -3551,6 +4582,16 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             command.parameters[L"loop"] = ParseBoolValue(GetCommandParameter(command, L"loop"), command.type == ScriptCommand::Type::Bgm) ? L"false" : L"true";
             SyncDocumentMetadata();
             statusText_ = L"\u30eb\u30fc\u30d7\u8a2d\u5b9a\u3092\u66f4\u65b0\u3057\u307e\u3057\u305f";
+            RefreshPreviewIfActive();
+            return true;
+        }
+        if (target.action == L"fade_cycle_target" && (command.type == ScriptCommand::Type::Fade || command.type == ScriptCommand::Type::Transition))
+        {
+            PushUndoSnapshot();
+            const std::wstring current = GetCommandParameter(command, L"target");
+            command.parameters[L"target"] = current == L"stage" ? L"message" : (current == L"message" ? L"all" : L"stage");
+            SyncDocumentMetadata();
+            statusText_ = L"フェード対象を更新しました";
             RefreshPreviewIfActive();
             return true;
         }
@@ -3591,12 +4632,12 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             }
             else if (command.type == ScriptCommand::Type::Se)
             {
-                mciSendStringW(L"close kaktos_se", nullptr, 0, nullptr);
+                StopAudioChannel(AudioChannel::Se);
                 statusText_ = L"SE \u3092\u505c\u6b62\u3057\u307e\u3057\u305f";
             }
             else if (command.type == ScriptCommand::Type::Voice)
             {
-                mciSendStringW(L"close kaktos_voice", nullptr, 0, nullptr);
+                StopAudioChannel(AudioChannel::Voice);
                 statusText_ = L"\u30dc\u30a4\u30b9\u3092\u505c\u6b62\u3057\u307e\u3057\u305f";
             }
             return true;
@@ -3651,10 +4692,10 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
         if (target.action == L"choice_add" && command.type == ScriptCommand::Type::Choice)
         {
             PushUndoSnapshot();
-            command.links.push_back({ L"譁ｰ縺励＞驕ｸ謚櫁い", L"start" });
+            command.links.push_back({ L"新しい選択肢", L"start" });
             selectedChoiceLinkIndex_ = command.links.size() - 1;
             SyncDocumentMetadata();
-            statusText_ = L"驕ｸ謚櫁い縺ｮ譫昴ｒ霑ｽ蜉縺励∪縺励◆";
+            statusText_ = L"選択肢の枝を追加しました";
             RefreshPreviewIfActive();
             return true;
         }
@@ -3697,7 +4738,7 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
                 selectedChoiceLinkIndex_ = command.links.empty() ? 0 : command.links.size() - 1;
             }
             SyncDocumentMetadata();
-            statusText_ = L"驕ｸ謚櫁い縺ｮ譫昴ｒ蜑企勁縺励∪縺励◆";
+            statusText_ = L"選択肢の枝を削除しました";
             RefreshPreviewIfActive();
             return true;
         }
@@ -3722,13 +4763,48 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             RefreshPreviewIfActive();
             return true;
         }
+        if (target.action == L"choice_cycle_var" && command.type == ScriptCommand::Type::Choice && target.linkIndex < command.links.size())
+        {
+            SyncVariableDefinitions();
+            if (!variableDefinitions_.empty())
+            {
+                const std::wstring key = GetChoiceParamKey(L"__choice_cond_name_", target.linkIndex);
+                const std::wstring selectedName = ShowVariableSelectionMenu(point, GetCommandParameter(command, key));
+                if (selectedName != GetCommandParameter(command, key))
+                {
+                    PushUndoSnapshot();
+                    command.parameters[key] = selectedName;
+                    SyncDocumentMetadata();
+                    statusText_ = L"選択肢条件の変数を更新しました";
+                    RefreshPreviewIfActive();
+                }
+            }
+            return true;
+        }
         if (target.action == L"if_cycle_op" && command.type == ScriptCommand::Type::IfJump)
         {
             PushUndoSnapshot();
             command.parameters[L"op"] = NextIfOperator(GetCommandParameter(command, L"op"));
             SyncDocumentMetadata();
-            statusText_ = L"譚｡莉ｶ貍皮ｮ怜ｭ舌ｒ蛻・ｊ譖ｿ縺医∪縺励◆";
+            statusText_ = L"条件分岐の演算子を切り替えました";
             RefreshPreviewIfActive();
+            return true;
+        }
+        if (target.action == L"if_cycle_var" && command.type == ScriptCommand::Type::IfJump)
+        {
+            SyncVariableDefinitions();
+            if (!variableDefinitions_.empty())
+            {
+                const std::wstring selectedName = ShowVariableSelectionMenu(point, GetCommandParameter(command, L"name"));
+                if (selectedName != GetCommandParameter(command, L"name"))
+                {
+                    PushUndoSnapshot();
+                    command.parameters[L"name"] = selectedName;
+                    SyncDocumentMetadata();
+                    statusText_ = L"条件分岐の変数を更新しました";
+                    RefreshPreviewIfActive();
+                }
+            }
             return true;
         }
     }
@@ -4404,14 +5480,14 @@ void NovelRuntime::UpdateChildControls()
     }
     EnsureChildControls();
 
-    if (sceneDialogVisible_ || characterManagerVisible_ || variableManagerVisible_ || settingsDialogVisible_)
+    if (projectLauncherVisible_ || projectDialogVisible_ || sceneDialogVisible_ || characterManagerVisible_ || variableManagerVisible_ || settingsDialogVisible_)
     {
         if (eventSearchEdit_) ShowWindow(eventSearchEdit_, SW_HIDE);
         if (inspectorEdit_) ShowWindow(inspectorEdit_, SW_HIDE);
         if (eventTextEdit_) ShowWindow(eventTextEdit_, SW_HIDE);
     }
 
-    if (eventSearchEdit_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_)
+    if (eventSearchEdit_ && !projectLauncherVisible_ && !projectDialogVisible_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_)
     {
         if (leftPanelTab_ == LeftPanelTab::Materials && showComponents_)
         {
@@ -4458,7 +5534,7 @@ void NovelRuntime::UpdateChildControls()
         }
     }
 
-    if (inspectorEdit_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_)
+    if (inspectorEdit_ && !projectLauncherVisible_ && !projectDialogVisible_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_)
     {
         if (inspectorEditing_ && HasVisibleArea(currentInspectorRect_))
         {
@@ -4484,7 +5560,7 @@ void NovelRuntime::UpdateChildControls()
         }
     }
 
-    if (eventTextEdit_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_)
+    if (eventTextEdit_ && !projectLauncherVisible_ && !projectDialogVisible_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_)
     {
         if (expandedTextCommandIndex_ < scenario_.commands.size() && HasVisibleArea(eventTextEditRect_))
         {
@@ -4507,7 +5583,16 @@ void NovelRuntime::UpdateChildControls()
 
     if (sceneNameEdit_)
     {
-        if (sceneDialogVisible_)
+        if (projectDialogVisible_)
+        {
+            SetWindowPos(sceneNameEdit_, nullptr, projectDialogEditRect_.left, projectDialogEditRect_.top, projectDialogEditRect_.right - projectDialogEditRect_.left, projectDialogEditRect_.bottom - projectDialogEditRect_.top, SWP_NOZORDER | SWP_SHOWWINDOW);
+            if (GetFocus() != sceneNameEdit_)
+            {
+                SetFocus(sceneNameEdit_);
+                SendMessageW(sceneNameEdit_, EM_SETSEL, 0, -1);
+            }
+        }
+        else if (sceneDialogVisible_)
         {
             SetWindowPos(sceneNameEdit_, nullptr, sceneDialogEditRect_.left, sceneDialogEditRect_.top, sceneDialogEditRect_.right - sceneDialogEditRect_.left, sceneDialogEditRect_.bottom - sceneDialogEditRect_.top, SWP_NOZORDER | SWP_SHOWWINDOW);
             if (GetFocus() != sceneNameEdit_)
@@ -4658,6 +5743,22 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
         else if (key == L"settings_voice_volume") editorSettings_.voiceVolume = (std::max)(0, (std::min)(100, _wtoi(value.c_str())));
         else if (key == L"settings_save_directory") editorSettings_.saveDirectory = UnescapeSaveValue(value);
         else if (key == L"settings_autosave_enabled") editorSettings_.autosaveEnabled = value != L"0";
+        else if (key == L"settings_message_visible") editorSettings_.defaultMessageWindowVisible = value != L"0";
+        else if (key == L"settings_message_color") editorSettings_.defaultMessageWindowColor = static_cast<COLORREF>(_wtoi(value.c_str()));
+        else if (key == L"settings_message_border") editorSettings_.defaultMessageWindowBorderColor = static_cast<COLORREF>(_wtoi(value.c_str()));
+        else if (key == L"settings_message_opacity") editorSettings_.defaultMessageWindowOpacity = ClampByteValue(_wtoi(value.c_str()));
+        else if (key == L"settings_message_padding") editorSettings_.defaultMessageWindowPadding = (std::max)(8, _wtoi(value.c_str()));
+        else if (key == L"settings_message_image") editorSettings_.defaultMessageWindowImage = UnescapeSaveValue(value);
+        else if (key == L"settings_name_visible") editorSettings_.defaultNameWindowVisible = value != L"0";
+        else if (key == L"settings_name_color") editorSettings_.defaultNameWindowColor = static_cast<COLORREF>(_wtoi(value.c_str()));
+        else if (key == L"settings_name_border") editorSettings_.defaultNameWindowBorderColor = static_cast<COLORREF>(_wtoi(value.c_str()));
+        else if (key == L"settings_name_opacity") editorSettings_.defaultNameWindowOpacity = ClampByteValue(_wtoi(value.c_str()));
+        else if (key == L"settings_name_x") editorSettings_.defaultNameWindowOffsetX = _wtoi(value.c_str());
+        else if (key == L"settings_name_y") editorSettings_.defaultNameWindowOffsetY = _wtoi(value.c_str());
+        else if (key == L"settings_name_width") editorSettings_.defaultNameWindowWidth = (std::max)(120, _wtoi(value.c_str()));
+        else if (key == L"settings_name_height") editorSettings_.defaultNameWindowHeight = (std::max)(28, _wtoi(value.c_str()));
+        else if (key == L"settings_name_padding") editorSettings_.defaultNameWindowPadding = (std::max)(4, _wtoi(value.c_str()));
+        else if (key == L"settings_name_image") editorSettings_.defaultNameWindowImage = UnescapeSaveValue(value);
         else if (StartsWithText(key, L"variable_def."))
         {
             const size_t firstDot = key.find(L'.');
@@ -4769,6 +5870,7 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
         variableDefinitions_.end());
 
     SyncVariableDefinitions();
+    ApplyEditorUiDefaults();
 
     showEventList_ = true;
     if (hostWindow_ && !playerMode_)
@@ -4852,6 +5954,22 @@ std::wstring NovelRuntime::SerializeProjectSettings() const
     projectText += L"settings_voice_volume=" + std::to_wstring(editorSettings_.voiceVolume) + L"\r\n";
     projectText += L"settings_save_directory=" + EscapeSaveValue(editorSettings_.saveDirectory) + L"\r\n";
     projectText += L"settings_autosave_enabled=" + std::wstring(editorSettings_.autosaveEnabled ? L"1" : L"0") + L"\r\n";
+    projectText += L"settings_message_visible=" + std::wstring(editorSettings_.defaultMessageWindowVisible ? L"1" : L"0") + L"\r\n";
+    projectText += L"settings_message_color=" + std::to_wstring(static_cast<unsigned int>(editorSettings_.defaultMessageWindowColor)) + L"\r\n";
+    projectText += L"settings_message_border=" + std::to_wstring(static_cast<unsigned int>(editorSettings_.defaultMessageWindowBorderColor)) + L"\r\n";
+    projectText += L"settings_message_opacity=" + std::to_wstring(editorSettings_.defaultMessageWindowOpacity) + L"\r\n";
+    projectText += L"settings_message_padding=" + std::to_wstring(editorSettings_.defaultMessageWindowPadding) + L"\r\n";
+    projectText += L"settings_message_image=" + EscapeSaveValue(editorSettings_.defaultMessageWindowImage) + L"\r\n";
+    projectText += L"settings_name_visible=" + std::wstring(editorSettings_.defaultNameWindowVisible ? L"1" : L"0") + L"\r\n";
+    projectText += L"settings_name_color=" + std::to_wstring(static_cast<unsigned int>(editorSettings_.defaultNameWindowColor)) + L"\r\n";
+    projectText += L"settings_name_border=" + std::to_wstring(static_cast<unsigned int>(editorSettings_.defaultNameWindowBorderColor)) + L"\r\n";
+    projectText += L"settings_name_opacity=" + std::to_wstring(editorSettings_.defaultNameWindowOpacity) + L"\r\n";
+    projectText += L"settings_name_x=" + std::to_wstring(editorSettings_.defaultNameWindowOffsetX) + L"\r\n";
+    projectText += L"settings_name_y=" + std::to_wstring(editorSettings_.defaultNameWindowOffsetY) + L"\r\n";
+    projectText += L"settings_name_width=" + std::to_wstring(editorSettings_.defaultNameWindowWidth) + L"\r\n";
+    projectText += L"settings_name_height=" + std::to_wstring(editorSettings_.defaultNameWindowHeight) + L"\r\n";
+    projectText += L"settings_name_padding=" + std::to_wstring(editorSettings_.defaultNameWindowPadding) + L"\r\n";
+    projectText += L"settings_name_image=" + EscapeSaveValue(editorSettings_.defaultNameWindowImage) + L"\r\n";
     for (size_t i = 0; i < uiButtons_.size(); ++i)
     {
         const UiButtonDefinition& button = uiButtons_[i];
@@ -4893,6 +6011,414 @@ bool NovelRuntime::SaveProjectAs()
     RefreshSceneList();
     RefreshAssetList();
     return SaveProject();
+}
+
+std::wstring NovelRuntime::BuildDefaultProjectSettingsText(const std::wstring& scenarioPath) const
+{
+    std::wstring text;
+    text += L"scenario_path=" + EscapeSaveValue(scenarioPath) + L"\r\n";
+    text += L"left_panel_width=280\r\n";
+    text += L"right_panel_width=320\r\n";
+    text += L"graph_height=162\r\n";
+    text += L"event_list_height=208\r\n";
+    text += L"show_components=1\r\n";
+    text += L"show_inspector=1\r\n";
+    text += L"show_flow_graph=0\r\n";
+    text += L"show_preview_panel=0\r\n";
+    text += L"show_event_list=1\r\n";
+    text += L"settings_window_width=1280\r\n";
+    text += L"settings_window_height=720\r\n";
+    text += L"settings_default_font=" + EscapeSaveValue(editorSettings_.defaultFont) + L"\r\n";
+    text += L"settings_default_text_speed=40\r\n";
+    text += L"settings_master_volume=100\r\n";
+    text += L"settings_bgm_volume=100\r\n";
+    text += L"settings_se_volume=100\r\n";
+    text += L"settings_voice_volume=100\r\n";
+    text += L"settings_save_directory=\r\n";
+    text += L"settings_autosave_enabled=1\r\n";
+    text += L"settings_message_visible=1\r\n";
+    text += L"settings_message_color=" + std::to_wstring(static_cast<unsigned int>(RGB(8, 10, 14))) + L"\r\n";
+    text += L"settings_message_border=" + std::to_wstring(static_cast<unsigned int>(RGB(122, 128, 138))) + L"\r\n";
+    text += L"settings_message_opacity=178\r\n";
+    text += L"settings_message_padding=24\r\n";
+    text += L"settings_message_image=\r\n";
+    text += L"settings_name_visible=1\r\n";
+    text += L"settings_name_color=" + std::to_wstring(static_cast<unsigned int>(RGB(12, 18, 28))) + L"\r\n";
+    text += L"settings_name_border=" + std::to_wstring(static_cast<unsigned int>(RGB(80, 132, 180))) + L"\r\n";
+    text += L"settings_name_opacity=214\r\n";
+    text += L"settings_name_x=0\r\n";
+    text += L"settings_name_y=0\r\n";
+    text += L"settings_name_width=220\r\n";
+    text += L"settings_name_height=36\r\n";
+    text += L"settings_name_padding=12\r\n";
+    text += L"settings_name_image=\r\n";
+    text += L"ui_button.0.id=save\r\nui_button.0.label=SAVE\r\nui_button.0.icon=ui\\\\save.png\r\nui_button.0.x=-348\r\nui_button.0.y=-52\r\nui_button.0.width=36\r\nui_button.0.height=36\r\nui_button.0.visible=0\r\n";
+    text += L"ui_button.1.id=load\r\nui_button.1.label=LOAD\r\nui_button.1.icon=ui\\\\load.png\r\nui_button.1.x=-296\r\nui_button.1.y=-52\r\nui_button.1.width=36\r\nui_button.1.height=36\r\nui_button.1.visible=0\r\n";
+    text += L"ui_button.2.id=log\r\nui_button.2.label=LOG\r\nui_button.2.icon=ui\\\\log.png\r\nui_button.2.x=-244\r\nui_button.2.y=-52\r\nui_button.2.width=36\r\nui_button.2.height=36\r\nui_button.2.visible=0\r\n";
+    text += L"ui_button.3.id=hide\r\nui_button.3.label=HIDE\r\nui_button.3.icon=ui\\\\hide.png\r\nui_button.3.x=-192\r\nui_button.3.y=-52\r\nui_button.3.width=36\r\nui_button.3.height=36\r\nui_button.3.visible=0\r\n";
+    text += L"ui_button.4.id=menu\r\nui_button.4.label=MENU\r\nui_button.4.icon=ui\\\\menu_ui.png\r\nui_button.4.x=-140\r\nui_button.4.y=-52\r\nui_button.4.width=36\r\nui_button.4.height=36\r\nui_button.4.visible=1\r\n";
+    return text;
+}
+
+std::wstring NovelRuntime::GetRecentProjectsPath() const
+{
+    WCHAR appDataPath[MAX_PATH] = {};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath)))
+    {
+        return L"recent_projects.txt";
+    }
+
+    const std::wstring settingsDir = CombinePath(appDataPath, L"KaktosEngine");
+    EnsureDirectoryExists(settingsDir);
+    return CombinePath(settingsDir, L"recent_projects.txt");
+}
+
+void NovelRuntime::LoadRecentProjects()
+{
+    recentProjects_.clear();
+    std::wstring content;
+    if (!TryReadTextFile(GetRecentProjectsPath(), content))
+    {
+        return;
+    }
+
+    std::wistringstream input(content);
+    std::wstring line;
+    while (std::getline(input, line))
+    {
+        if (!line.empty() && line.back() == L'\r')
+        {
+            line.pop_back();
+        }
+        line = Trim(line);
+        if (line.empty())
+        {
+            continue;
+        }
+        const std::wstring normalized = NormalizeFullPath(line);
+        if (std::none_of(recentProjects_.begin(), recentProjects_.end(), [&](const std::wstring& existing)
+            {
+                return _wcsicmp(existing.c_str(), normalized.c_str()) == 0;
+            }))
+        {
+            recentProjects_.push_back(normalized);
+        }
+    }
+}
+
+void NovelRuntime::SaveRecentProjects() const
+{
+    std::wstring content;
+    for (const std::wstring& path : recentProjects_)
+    {
+        if (!path.empty())
+        {
+            content += path + L"\r\n";
+        }
+    }
+    TryWriteTextFile(GetRecentProjectsPath(), content);
+}
+
+void NovelRuntime::AddRecentProject(const std::wstring& projectPath)
+{
+    const std::wstring normalized = NormalizeFullPath(projectPath);
+    if (normalized.empty())
+    {
+        return;
+    }
+
+    recentProjects_.erase(std::remove_if(recentProjects_.begin(), recentProjects_.end(), [&](const std::wstring& existing)
+        {
+            return _wcsicmp(existing.c_str(), normalized.c_str()) == 0;
+        }), recentProjects_.end());
+    recentProjects_.insert(recentProjects_.begin(), normalized);
+    if (recentProjects_.size() > 20)
+    {
+        recentProjects_.resize(20);
+    }
+    SaveRecentProjects();
+}
+
+void NovelRuntime::RemoveRecentProject(const std::wstring& projectPath)
+{
+    const std::wstring normalized = NormalizeFullPath(projectPath);
+    recentProjects_.erase(std::remove_if(recentProjects_.begin(), recentProjects_.end(), [&](const std::wstring& existing)
+        {
+            return _wcsicmp(existing.c_str(), normalized.c_str()) == 0;
+        }), recentProjects_.end());
+    SaveRecentProjects();
+}
+
+std::wstring NovelRuntime::GetProjectRootFromProjectPath(const std::wstring& projectPath) const
+{
+    const std::wstring projectDir = GetDirectoryPath(projectPath);
+    if (_wcsicmp(GetFileNamePart(projectDir).c_str(), L"assets") == 0)
+    {
+        const std::wstring root = GetDirectoryPath(projectDir);
+        if (!root.empty())
+        {
+            return root;
+        }
+    }
+    return projectDir;
+}
+
+bool NovelRuntime::OpenProjectFolder(const std::wstring& projectPath)
+{
+    const std::wstring root = GetProjectRootFromProjectPath(projectPath);
+    const DWORD attributes = GetFileAttributesW(root.c_str());
+    if (root.empty() || attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        statusText_ = L"プロジェクトフォルダが見つかりません";
+        return true;
+    }
+
+    ShellExecuteW(hostWindow_, L"open", root.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    statusText_ = L"プロジェクトフォルダを開きました";
+    return true;
+}
+
+bool NovelRuntime::DeleteProjectToRecycleBin(const std::wstring& projectPath)
+{
+    const std::wstring root = GetProjectRootFromProjectPath(projectPath);
+    if (root.empty())
+    {
+        RemoveRecentProject(projectPath);
+        return true;
+    }
+
+    if (MessageBoxW(hostWindow_, (L"プロジェクトをゴミ箱へ移動しますか?\n" + root).c_str(), L"プロジェクト削除", MB_ICONWARNING | MB_YESNO) != IDYES)
+    {
+        return true;
+    }
+
+    std::wstring doubleNullPath = root;
+    doubleNullPath.push_back(L'\0');
+    doubleNullPath.push_back(L'\0');
+
+    SHFILEOPSTRUCTW fileOp = {};
+    fileOp.hwnd = hostWindow_;
+    fileOp.wFunc = FO_DELETE;
+    fileOp.pFrom = doubleNullPath.c_str();
+    fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI;
+    const int result = SHFileOperationW(&fileOp);
+    if (result == 0 && !fileOp.fAnyOperationsAborted)
+    {
+        RemoveRecentProject(projectPath);
+        if (_wcsicmp(projectPath_.c_str(), projectPath.c_str()) == 0)
+        {
+            scenarioPath_.clear();
+            projectPath_.clear();
+            scenarioBaseDir_.clear();
+            scenario_ = ScenarioDocument{};
+            currentText_.clear();
+            displayedText_.clear();
+            reachedEnd_ = true;
+            ShowProjectLauncher();
+        }
+        statusText_ = L"プロジェクトをゴミ箱へ移動しました";
+    }
+    else
+    {
+        statusText_ = L"プロジェクト削除に失敗しました";
+    }
+    return true;
+}
+
+bool NovelRuntime::HandleProjectLauncherClick(POINT point)
+{
+    if (PtInRect(&projectLauncherCreateRect_, point))
+    {
+        ShowProjectDialog();
+        return true;
+    }
+    if (PtInRect(&projectLauncherOpenRect_, point))
+    {
+        return LoadProjectFromDialog();
+    }
+
+    for (const ProjectLauncherRow& row : projectLauncherRows_)
+    {
+        if (PtInRect(&row.dataRect, point))
+        {
+            return OpenProjectFolder(row.projectPath);
+        }
+        if (PtInRect(&row.deleteRect, point))
+        {
+            return DeleteProjectToRecycleBin(row.projectPath);
+        }
+        if (PtInRect(&row.rowRect, point))
+        {
+            return LoadProjectFile(row.projectPath);
+        }
+    }
+
+    return true;
+}
+
+bool NovelRuntime::CreateProjectFromDialog()
+{
+    if (!sceneNameEdit_)
+    {
+        return false;
+    }
+
+    const int length = GetWindowTextLengthW(sceneNameEdit_);
+    std::wstring projectName(static_cast<size_t>(length) + 1, L'\0');
+    GetWindowTextW(sceneNameEdit_, &projectName[0], length + 1);
+    projectName.resize(length);
+    projectName = Trim(projectName);
+    projectName.erase(std::remove_if(projectName.begin(), projectName.end(), [](wchar_t ch)
+    {
+        return ch == L'\\' || ch == L'/' || ch == L':' || ch == L'*' || ch == L'?' || ch == L'"' || ch == L'<' || ch == L'>' || ch == L'|' || ch < 32;
+    }), projectName.end());
+
+    if (projectName.empty())
+    {
+        statusText_ = L"プロジェクト名を入力してください";
+        SetFocus(sceneNameEdit_);
+        return true;
+    }
+
+    std::wstring initialPath = GetDirectoryPath(GetAssetsRootDirectory());
+    const std::wstring parentDirectory = BrowseForFolder(L"プロジェクト作成先を選択", initialPath);
+    if (parentDirectory.empty())
+    {
+        statusText_ = L"プロジェクト作成をキャンセルしました";
+        return true;
+    }
+
+    const std::wstring projectRoot = CombinePath(parentDirectory, projectName);
+    const std::wstring assetsRoot = CombinePath(projectRoot, L"assets");
+    const std::wstring scenarioDir = CombinePath(assetsRoot, L"scenario");
+    if (!EnsureDirectoryExists(projectRoot) || !EnsureDirectoryExists(assetsRoot) || !EnsureDirectoryExists(scenarioDir))
+    {
+        statusText_ = L"プロジェクトフォルダ作成に失敗しました";
+        return true;
+    }
+
+    const wchar_t* subdirs[] = { L"background", L"bgm", L"character", L"fonts", L"picture", L"save", L"se", L"textbox", L"ui" };
+    for (const wchar_t* subdir : subdirs)
+    {
+        EnsureDirectoryExists(CombinePath(assetsRoot, subdir));
+    }
+
+    const std::wstring templateAssets = GetAssetsRootDirectory();
+    const std::wstring templateUi = CombinePath(templateAssets, L"ui");
+    const std::wstring templateTextbox = CombinePath(templateAssets, L"textbox");
+    const std::wstring templateFonts = CombinePath(templateAssets, L"fonts");
+    if (GetFileAttributesW(templateUi.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        CopyDirectoryTree(templateUi, CombinePath(assetsRoot, L"ui"));
+    }
+    if (GetFileAttributesW(templateTextbox.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        CopyDirectoryTree(templateTextbox, CombinePath(assetsRoot, L"textbox"));
+    }
+    if (GetFileAttributesW(templateFonts.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        CopyDirectoryTree(templateFonts, CombinePath(assetsRoot, L"fonts"));
+    }
+
+    const std::wstring scenarioPath = CombinePath(scenarioDir, L"main.ks");
+    const std::wstring projectPath = CombinePath(assetsRoot, L"project.kproj");
+    const std::wstring title = projectName.empty() ? L"Kaktos Engine" : projectName;
+    const std::wstring scenarioText = L"[title name=\"" + title + L"\"]\r\n[text value=\"New Text\"]\r\n";
+    if (!TryWriteTextFile(scenarioPath, scenarioText) || !TryWriteTextFile(projectPath, BuildDefaultProjectSettingsText(L"scenario\\main.ks")))
+    {
+        statusText_ = L"プロジェクトファイル作成に失敗しました";
+        return true;
+    }
+
+    HideProjectDialog();
+    autosaveRestoreChecked_ = true;
+    if (LoadProjectFile(projectPath))
+    {
+        statusText_ = L"プロジェクトを作成しました: " + projectName;
+    }
+    return true;
+}
+
+bool NovelRuntime::LoadProjectFromDialog()
+{
+    WCHAR fileBuffer[MAX_PATH] = {};
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hostWindow_;
+    ofn.lpstrFilter = L"Kaktos Project (*.kproj)\0*.kproj\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = fileBuffer;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    ofn.lpstrDefExt = L"kproj";
+    if (!GetOpenFileNameW(&ofn))
+    {
+        statusText_ = L"プロジェクト読み込みをキャンセルしました";
+        return true;
+    }
+
+    HideProjectDialog();
+    autosaveRestoreChecked_ = true;
+    return LoadProjectFile(fileBuffer);
+}
+
+bool NovelRuntime::LoadProjectFile(const std::wstring& projectPath)
+{
+    std::wstring content;
+    if (!TryReadTextFile(projectPath, content))
+    {
+        statusText_ = L"プロジェクトを読み込めませんでした";
+        return false;
+    }
+
+    std::wstring scenarioValue;
+    std::wistringstream input(content);
+    std::wstring line;
+    while (std::getline(input, line))
+    {
+        if (!line.empty() && line.back() == L'\r')
+        {
+            line.pop_back();
+        }
+        const size_t split = line.find(L'=');
+        if (split == std::wstring::npos)
+        {
+            continue;
+        }
+        if (Trim(line.substr(0, split)) == L"scenario_path")
+        {
+            scenarioValue = UnescapeSaveValue(Trim(line.substr(split + 1)));
+            break;
+        }
+    }
+
+    if (scenarioValue.empty())
+    {
+        scenarioValue = L"scenario\\main.ks";
+    }
+
+    std::wstring scenarioPath = scenarioValue;
+    if (scenarioPath.find(L":") == std::wstring::npos && !(scenarioPath.size() >= 2 && scenarioPath[0] == L'\\' && scenarioPath[1] == L'\\'))
+    {
+        scenarioPath = CombinePath(GetDirectoryPath(projectPath), scenarioPath);
+    }
+
+    if (GetFileAttributesW(scenarioPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+    {
+        statusText_ = L"プロジェクトのシナリオが見つかりません: " + scenarioPath;
+        return false;
+    }
+
+    LoadScenario(scenarioPath);
+    projectPath_ = projectPath;
+    LoadProjectSettings(projectPath_);
+    RefreshSceneList();
+    RefreshAssetList();
+    LoadToolbarIcons();
+    LoadUiButtonIcons();
+    AddRecentProject(projectPath);
+    projectLauncherVisible_ = false;
+    statusText_ = L"プロジェクトを読み込みました: " + GetFileNamePart(projectPath);
+    return true;
 }
 
 bool NovelRuntime::ExportBuild()
@@ -5143,12 +6669,106 @@ bool NovelRuntime::RestoreAutosaveSnapshot(bool notifyOnMissing)
     return true;
 }
 
+void NovelRuntime::ApplyEditorUiDefaults()
+{
+    messageWindowVisible_ = editorSettings_.defaultMessageWindowVisible;
+    messageWindowColor_ = editorSettings_.defaultMessageWindowColor;
+    messageWindowBorderColor_ = editorSettings_.defaultMessageWindowBorderColor;
+    messageWindowOpacity_ = editorSettings_.defaultMessageWindowOpacity;
+    messageWindowPadding_ = editorSettings_.defaultMessageWindowPadding;
+    messageWindowImagePath_ = editorSettings_.defaultMessageWindowImage.empty() ? FindDefaultTextboxImagePath() : editorSettings_.defaultMessageWindowImage;
+    messageWindowImage_.reset();
+    if (!messageWindowImagePath_.empty())
+    {
+        messageWindowImage_ = TryLoadImage(messageWindowImagePath_);
+        if (!messageWindowImage_)
+        {
+            messageWindowImage_ = TryLoadImage(CombinePath(scenarioBaseDir_, messageWindowImagePath_));
+        }
+    }
+
+    nameBoxVisible_ = editorSettings_.defaultNameWindowVisible;
+    nameWindowColor_ = editorSettings_.defaultNameWindowColor;
+    nameWindowBorderColor_ = editorSettings_.defaultNameWindowBorderColor;
+    nameWindowOpacity_ = editorSettings_.defaultNameWindowOpacity;
+    nameWindowOffsetX_ = editorSettings_.defaultNameWindowOffsetX;
+    nameWindowOffsetY_ = editorSettings_.defaultNameWindowOffsetY;
+    nameWindowWidth_ = editorSettings_.defaultNameWindowWidth;
+    nameWindowHeight_ = editorSettings_.defaultNameWindowHeight;
+    nameWindowPadding_ = editorSettings_.defaultNameWindowPadding;
+    nameWindowImagePath_ = editorSettings_.defaultNameWindowImage;
+    nameWindowImage_.reset();
+    if (!nameWindowImagePath_.empty())
+    {
+        nameWindowImage_ = TryLoadImage(nameWindowImagePath_);
+        if (!nameWindowImage_)
+        {
+            nameWindowImage_ = TryLoadImage(CombinePath(scenarioBaseDir_, nameWindowImagePath_));
+        }
+    }
+}
+
+std::wstring NovelRuntime::MakeProjectRelativeAssetPath(const std::wstring& fullPath) const
+{
+    if (fullPath.empty())
+    {
+        return fullPath;
+    }
+
+    std::wstring normalized = fullPath;
+    std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+    std::wstring assetsRoot = GetAssetsRootDirectory();
+    std::replace(assetsRoot.begin(), assetsRoot.end(), L'/', L'\\');
+    if (StartsWithText(normalized, assetsRoot + L"\\"))
+    {
+        return normalized.substr(assetsRoot.size() + 1);
+    }
+    return fullPath;
+}
+
+std::wstring NovelRuntime::FindDefaultTextboxImagePath() const
+{
+    const std::wstring textboxDir = CombinePath(GetAssetsRootDirectory(), L"textbox");
+    WIN32_FIND_DATAW findData = {};
+    HANDLE handle = FindFirstFileW((textboxDir + L"\\*").c_str(), &findData);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return L"";
+    }
+
+    std::wstring firstMatch;
+    do
+    {
+        if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            continue;
+        }
+
+        std::wstring name = findData.cFileName;
+        std::wstring lower = name;
+        CharLowerBuffW(&lower[0], static_cast<DWORD>(lower.size()));
+        const auto hasExt = [&](const wchar_t* ext)
+        {
+            const size_t extLen = wcslen(ext);
+            return lower.size() >= extLen && lower.compare(lower.size() - extLen, extLen, ext) == 0;
+        };
+        if (hasExt(L".png") || hasExt(L".jpg") || hasExt(L".jpeg") || hasExt(L".bmp"))
+        {
+            firstMatch = L"textbox\\" + name;
+            break;
+        }
+    } while (FindNextFileW(handle, &findData));
+    FindClose(handle);
+
+    return firstMatch;
+}
+
 std::wstring NovelRuntime::BrowseForFolder(const std::wstring& title, const std::wstring& initialPath) const
 {
     BROWSEINFOW bi = {};
     bi.hwndOwner = hostWindow_;
     bi.lpszTitle = title.c_str();
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_USENEWUI;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
     PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
     if (!pidl)
     {
@@ -5171,6 +6791,16 @@ bool NovelRuntime::SaveRuntimeStateToPath(const std::wstring& savePath)
     saveText += L"scenario_path=" + EscapeSaveValue(scenarioPath_) + L"\r\n";
     saveText += L"story_title=" + EscapeSaveValue(storyTitle_) + L"\r\n";
     saveText += L"speaker=" + EscapeSaveValue(speakerName_) + L"\r\n";
+    saveText += L"name_visible=" + std::to_wstring(nameBoxVisible_ ? 1 : 0) + L"\r\n";
+    saveText += L"name_x=" + std::to_wstring(nameWindowOffsetX_) + L"\r\n";
+    saveText += L"name_y=" + std::to_wstring(nameWindowOffsetY_) + L"\r\n";
+    saveText += L"name_width=" + std::to_wstring(nameWindowWidth_) + L"\r\n";
+    saveText += L"name_height=" + std::to_wstring(nameWindowHeight_) + L"\r\n";
+    saveText += L"name_padding=" + std::to_wstring(nameWindowPadding_) + L"\r\n";
+    saveText += L"name_opacity=" + std::to_wstring(nameWindowOpacity_) + L"\r\n";
+    saveText += L"name_color=" + std::to_wstring(static_cast<unsigned int>(nameWindowColor_)) + L"\r\n";
+    saveText += L"name_border=" + std::to_wstring(static_cast<unsigned int>(nameWindowBorderColor_)) + L"\r\n";
+    saveText += L"name_image=" + EscapeSaveValue(nameWindowImagePath_) + L"\r\n";
     saveText += L"current_text=" + EscapeSaveValue(currentText_) + L"\r\n";
     saveText += L"displayed_text=" + EscapeSaveValue(displayedText_) + L"\r\n";
     saveText += L"status_text=" + EscapeSaveValue(statusText_) + L"\r\n";
@@ -5314,6 +6944,31 @@ bool NovelRuntime::LoadRuntimeStateFromPath(const std::wstring& savePath)
 
     storyTitle_ = getValue(L"story_title").empty() ? storyTitle_ : getValue(L"story_title");
     speakerName_ = getValue(L"speaker");
+    nameBoxVisible_ = getValue(L"name_visible").empty() ? nameBoxVisible_ : (getValue(L"name_visible") != L"0");
+    nameWindowOffsetX_ = ParseIntValue(getValue(L"name_x"), nameWindowOffsetX_);
+    nameWindowOffsetY_ = ParseIntValue(getValue(L"name_y"), nameWindowOffsetY_);
+    nameWindowWidth_ = (std::max)(120, ParseIntValue(getValue(L"name_width"), nameWindowWidth_));
+    nameWindowHeight_ = (std::max)(28, ParseIntValue(getValue(L"name_height"), nameWindowHeight_));
+    nameWindowPadding_ = (std::max)(4, ParseIntValue(getValue(L"name_padding"), nameWindowPadding_));
+    nameWindowOpacity_ = ClampByteValue(ParseIntValue(getValue(L"name_opacity"), nameWindowOpacity_));
+    if (!getValue(L"name_color").empty())
+    {
+        nameWindowColor_ = static_cast<COLORREF>(_wtoi(getValue(L"name_color").c_str()));
+    }
+    if (!getValue(L"name_border").empty())
+    {
+        nameWindowBorderColor_ = static_cast<COLORREF>(_wtoi(getValue(L"name_border").c_str()));
+    }
+    nameWindowImagePath_ = getValue(L"name_image");
+    nameWindowImage_.reset();
+    if (!nameWindowImagePath_.empty())
+    {
+        nameWindowImage_ = TryLoadImage(nameWindowImagePath_);
+        if (!nameWindowImage_)
+        {
+            nameWindowImage_ = TryLoadImage(CombinePath(scenarioBaseDir_, nameWindowImagePath_));
+        }
+    }
     currentText_ = getValue(L"current_text");
     displayedText_ = getValue(L"displayed_text");
     statusText_ = getValue(L"status_text");
@@ -5551,6 +7206,7 @@ void NovelRuntime::RefreshSceneList()
 
 void NovelRuntime::RefreshAssetList()
 {
+    RefreshAvailableFonts();
     assetItems_.clear();
     const std::wstring baseAssetsDir = GetAssetsRootDirectory();
     const struct
@@ -5852,8 +7508,9 @@ bool NovelRuntime::ApplyAssetToCommand(size_t commandIndex, const AssetListItem&
 void NovelRuntime::ResetPlaybackState()
 {
     StopBgmPlayback();
-    mciSendStringW(L"close kaktos_se", nullptr, 0, nullptr);
-    mciSendStringW(L"close kaktos_voice", nullptr, 0, nullptr);
+    StopAudioChannel(AudioChannel::Se);
+    StopAudioChannel(AudioChannel::Voice);
+    StopAudioChannel(AudioChannel::Preview);
     currentBgmPath_.clear();
     backgroundPath_.clear();
     backgroundDisplayName_.clear();
@@ -5872,7 +7529,7 @@ void NovelRuntime::ResetPlaybackState()
     displayedText_.clear();
     messageTextColor_ = RGB(242, 244, 247);
     nameTextColor_ = RGB(123, 203, 255);
-    nameBoxVisible_ = true;
+    ApplyEditorUiDefaults();
     verticalTextEnabled_ = false;
     textRevealActive_ = false;
     textRevealIndex_ = 0;
@@ -5893,6 +7550,7 @@ void NovelRuntime::ResetPlaybackState()
     fadeStartTick_ = 0;
     fadeEndTick_ = 0;
     fadeOpacity_ = 255;
+    fadeTarget_ = L"stage";
     shakeEndTick_ = 0;
     shakePower_ = 0;
     flashStartTick_ = 0;
@@ -5970,6 +7628,9 @@ void NovelRuntime::PrimePreviewState(size_t startIndex)
             break;
         case ScriptCommand::Type::MessageFontReset:
             ApplyMessageFontResetCommand();
+            break;
+        case ScriptCommand::Type::MessageStyle:
+            ApplyMessageStyleCommand(command);
             break;
         case ScriptCommand::Type::TextColor:
             ApplyTextColorCommand(command);
@@ -6137,6 +7798,52 @@ void NovelRuntime::ShowCreateSceneDialog()
 void NovelRuntime::HideCreateSceneDialog()
 {
     sceneDialogVisible_ = false;
+    if (sceneNameEdit_)
+    {
+        ShowWindow(sceneNameEdit_, SW_HIDE);
+    }
+    if (hostWindow_)
+    {
+        InvalidateRect(hostWindow_, nullptr, TRUE);
+    }
+}
+
+void NovelRuntime::ShowProjectLauncher()
+{
+    LoadRecentProjects();
+    projectLauncherVisible_ = true;
+    projectDialogVisible_ = false;
+    sceneDialogVisible_ = false;
+    characterManagerVisible_ = false;
+    variableManagerVisible_ = false;
+    settingsDialogVisible_ = false;
+    inspectorEditing_ = false;
+    if (sceneNameEdit_)
+    {
+        ShowWindow(sceneNameEdit_, SW_HIDE);
+    }
+    if (hostWindow_)
+    {
+        InvalidateRect(hostWindow_, nullptr, TRUE);
+    }
+}
+
+void NovelRuntime::ShowProjectDialog()
+{
+    projectDialogVisible_ = true;
+    if (sceneNameEdit_)
+    {
+        SetWindowTextW(sceneNameEdit_, L"NewProject");
+    }
+    if (hostWindow_)
+    {
+        InvalidateRect(hostWindow_, nullptr, TRUE);
+    }
+}
+
+void NovelRuntime::HideProjectDialog()
+{
+    projectDialogVisible_ = false;
     if (sceneNameEdit_)
     {
         ShowWindow(sceneNameEdit_, SW_HIDE);
@@ -6328,6 +8035,19 @@ std::wstring NovelRuntime::GetCharacterDefinitionLabel(const CharacterDefinition
     return definition.id;
 }
 
+std::wstring NovelRuntime::GetEffectTargetLabel(const std::wstring& target) const
+{
+    if (target == L"message")
+    {
+        return L"メッセージ";
+    }
+    if (target == L"all")
+    {
+        return L"全体";
+    }
+    return L"ステージ";
+}
+
 std::wstring NovelRuntime::GetVariableTypeLabel(VariableType type) const
 {
     switch (type)
@@ -6420,6 +8140,79 @@ size_t NovelRuntime::GetVariableUsageCount(const std::wstring& name) const
         }
     }
     return count;
+}
+
+std::wstring NovelRuntime::ShowVariableSelectionMenu(POINT point, const std::wstring& currentName) const
+{
+    if (!hostWindow_ || variableDefinitions_.empty())
+    {
+        return currentName;
+    }
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu)
+    {
+        return currentName;
+    }
+
+    const UINT kBaseId = 50000;
+    for (size_t i = 0; i < variableDefinitions_.size(); ++i)
+    {
+        UINT flags = MF_STRING;
+        if (variableDefinitions_[i].name == currentName)
+        {
+            flags |= MF_CHECKED;
+        }
+        AppendMenuW(menu, flags, kBaseId + static_cast<UINT>(i), variableDefinitions_[i].name.c_str());
+    }
+
+    POINT screenPoint = point;
+    ClientToScreen(hostWindow_, &screenPoint);
+    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, 0, hostWindow_, nullptr);
+    DestroyMenu(menu);
+
+    if (command >= kBaseId && command < kBaseId + variableDefinitions_.size())
+    {
+        return variableDefinitions_[command - kBaseId].name;
+    }
+    return currentName;
+}
+
+std::wstring NovelRuntime::ShowFontSelectionMenu(POINT point, const std::wstring& currentName) const
+{
+    if (!hostWindow_ || availableFonts_.empty())
+    {
+        return currentName;
+    }
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu)
+    {
+        return currentName;
+    }
+
+    const UINT kBaseId = 51000;
+    for (size_t i = 0; i < availableFonts_.size(); ++i)
+    {
+        UINT flags = MF_STRING;
+        if (availableFonts_[i].family == currentName)
+        {
+            flags |= MF_CHECKED;
+        }
+        const std::wstring label = availableFonts_[i].family + L"  [" + availableFonts_[i].label + L"]";
+        AppendMenuW(menu, flags, kBaseId + static_cast<UINT>(i), label.c_str());
+    }
+
+    POINT screenPoint = point;
+    ClientToScreen(hostWindow_, &screenPoint);
+    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, 0, hostWindow_, nullptr);
+    DestroyMenu(menu);
+
+    if (command >= kBaseId && command < kBaseId + availableFonts_.size())
+    {
+        return availableFonts_[command - kBaseId].family;
+    }
+    return currentName;
 }
 
 void NovelRuntime::ShowVariableManagerDialog()
@@ -6835,6 +8628,20 @@ bool NovelRuntime::HandleAssetClick(POINT point)
 
     if (!selectedAssetPath_.empty() && (selectedAssetPreviewCategory_ == L"bgm" || selectedAssetPreviewCategory_ == L"se"))
     {
+        if (PtInRect(&materialPreviewVolumeDownRect_, point))
+        {
+            assetPreviewVolume_ = (std::max)(0, assetPreviewVolume_ - 5);
+            SetAudioChannelVolume(AudioChannel::Preview, assetPreviewVolume_);
+            statusText_ = L"素材プレビュー音量: " + std::to_wstring(assetPreviewVolume_) + L"%";
+            return true;
+        }
+        if (PtInRect(&materialPreviewVolumeUpRect_, point))
+        {
+            assetPreviewVolume_ = (std::min)(100, assetPreviewVolume_ + 5);
+            SetAudioChannelVolume(AudioChannel::Preview, assetPreviewVolume_);
+            statusText_ = L"素材プレビュー音量: " + std::to_wstring(assetPreviewVolume_) + L"%";
+            return true;
+        }
         if (PtInRect(&materialPreviewPlayRect_, point))
         {
             AssetListItem previewItem{ selectedAssetPreviewCategory_, selectedAssetPath_, selectedAssetLabel_, {} };
@@ -6946,6 +8753,30 @@ bool NovelRuntime::IsViewMenuChecked(UINT commandId) const
 
 bool NovelRuntime::HandleKeyDown(WPARAM key)
 {
+    if (projectDialogVisible_)
+    {
+        if (key == VK_ESCAPE)
+        {
+            HideProjectDialog();
+            statusText_ = L"プロジェクト操作を閉じました";
+            return true;
+        }
+        if (key == VK_RETURN)
+        {
+            return CreateProjectFromDialog();
+        }
+        return false;
+    }
+
+    if (projectLauncherVisible_)
+    {
+        if (key == VK_RETURN)
+        {
+            return LoadProjectFromDialog();
+        }
+        return true;
+    }
+
     if (playerMode_ || previewVisible_)
     {
         if (key == VK_ESCAPE)
@@ -7259,12 +9090,6 @@ void NovelRuntime::DrawCharacterSlot(HDC hdc, const RECT& stageRect, CharacterSl
         DrawTextW(hdc, slot.displayName.c_str(), -1, &labelRect, DT_CENTER | DT_TOP | DT_WORDBREAK);
     }
 
-    RECT plateRect = { characterRect.left + 24, characterRect.bottom - 52, characterRect.right - 24, characterRect.bottom - 12 };
-    HBRUSH plateBrush = CreateSolidBrush(RGB(10, 12, 16));
-    FillRect(hdc, &plateRect, plateBrush);
-    DeleteObject(plateBrush);
-    SetTextColor(hdc, RGB(255, 240, 190));
-    DrawTextW(hdc, slot.displayName.c_str(), -1, &plateRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
 void NovelRuntime::DrawChoices(HDC hdc, const RECT& messageRect)
@@ -7310,6 +9135,11 @@ bool NovelRuntime::HandleToolbarClick(POINT point)
         }
 
         const ToolbarItem& item = toolbarItems_[i];
+        if (item.id == L"project")
+        {
+            ShowProjectDialog();
+            return true;
+        }
         if (item.id == L"preview")
         {
             TogglePreviewWindow();
@@ -7457,45 +9287,93 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
     DrawCharacterSlot(hdc, stageRect, centerCharacter_, stageRect.left + stageWidth / 2 + stageOffsetX_);
     DrawCharacterSlot(hdc, stageRect, rightCharacter_, stageRect.left + (stageWidth * 3) / 4 + stageOffsetX_);
 
-    SetTextColor(hdc, RGB(220, 228, 236));
-    RECT titleRect = { stageRect.left + 12, stageRect.top + 12, stageRect.right - 12, stageRect.top + 52 };
-    DrawWrappedText(hdc, titleRect, storyTitle_, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    if (!backgroundDisplayName_.empty())
-    {
-        RECT bgNameRect = { stageRect.left + 12, stageRect.top + 48, stageRect.right - 12, stageRect.top + 78 };
-        SetTextColor(hdc, RGB(154, 190, 220));
-        DrawWrappedText(hdc, bgNameRect, L"\u80cc\u666f: " + backgroundDisplayName_, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    }
-
     if (messageWindowVisible_)
     {
-        HBRUSH messageBrush = CreateSolidBrush(RGB(8, 10, 14));
-        HDC messageDc = CreateCompatibleDC(hdc);
-        HBITMAP messageBitmap = CreateCompatibleBitmap(hdc, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top);
-        HGDIOBJ originalMessageBitmap = SelectObject(messageDc, messageBitmap);
-        RECT localMessageRect = { 0, 0, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top };
-        FillRect(messageDc, &localMessageRect, messageBrush);
-        BLENDFUNCTION messageBlend = { AC_SRC_OVER, 0, 178, 0 };
-        AlphaBlend(hdc, messageRect.left, messageRect.top, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top, messageDc, 0, 0, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top, messageBlend);
-        SelectObject(messageDc, originalMessageBitmap);
-        DeleteObject(messageBitmap);
-        DeleteDC(messageDc);
-        DeleteObject(messageBrush);
-        FrameRect(hdc, &messageRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+        if (messageWindowImage_)
+        {
+            Gdiplus::Graphics messageGraphics(hdc);
+            messageGraphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            messageGraphics.DrawImage(messageWindowImage_.get(), Gdiplus::Rect(messageRect.left, messageRect.top, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top));
+        }
+        else
+        {
+            HBRUSH messageBrush = CreateSolidBrush(messageWindowColor_);
+            HDC messageDc = CreateCompatibleDC(hdc);
+            HBITMAP messageBitmap = CreateCompatibleBitmap(hdc, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top);
+            HGDIOBJ originalMessageBitmap = SelectObject(messageDc, messageBitmap);
+            RECT localMessageRect = { 0, 0, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top };
+            FillRect(messageDc, &localMessageRect, messageBrush);
+            BLENDFUNCTION messageBlend = { AC_SRC_OVER, 0, static_cast<BYTE>(messageWindowOpacity_), 0 };
+            AlphaBlend(hdc, messageRect.left, messageRect.top, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top, messageDc, 0, 0, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top, messageBlend);
+            SelectObject(messageDc, originalMessageBitmap);
+            DeleteObject(messageBitmap);
+            DeleteDC(messageDc);
+            DeleteObject(messageBrush);
+            HBRUSH borderBrush = CreateSolidBrush(messageWindowBorderColor_);
+            FrameRect(hdc, &messageRect, borderBrush);
+            DeleteObject(borderBrush);
+        }
 
         DrawChoices(hdc, messageRect);
 
+        const int messagePadding = (std::max)(8, messageWindowPadding_);
+        int bodyTop = messageRect.top + messagePadding;
         if (nameBoxVisible_ && !speakerName_.empty())
         {
+            RECT nameRect = {
+                messageRect.left + messagePadding + nameWindowOffsetX_,
+                messageRect.top + messagePadding + nameWindowOffsetY_,
+                messageRect.left + messagePadding + nameWindowOffsetX_ + (std::max)(120, nameWindowWidth_),
+                messageRect.top + messagePadding + nameWindowOffsetY_ + (std::max)(28, nameWindowHeight_)
+            };
+            if (nameRect.right > messageRect.right - messagePadding)
+            {
+                nameRect.right = messageRect.right - messagePadding;
+            }
+            if (nameRect.bottom > messageRect.bottom - messagePadding)
+            {
+                nameRect.bottom = messageRect.bottom - messagePadding;
+            }
+
+            RECT namePaintRect = nameRect;
+            if (nameWindowImage_)
+            {
+                Gdiplus::Graphics nameGraphics(hdc);
+                nameGraphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                nameGraphics.DrawImage(nameWindowImage_.get(), Gdiplus::Rect(namePaintRect.left, namePaintRect.top, namePaintRect.right - namePaintRect.left, namePaintRect.bottom - namePaintRect.top));
+            }
+            else
+            {
+                HDC nameDc = CreateCompatibleDC(hdc);
+                HBITMAP nameBitmap = CreateCompatibleBitmap(hdc, namePaintRect.right - namePaintRect.left, namePaintRect.bottom - namePaintRect.top);
+                HBITMAP originalNameBitmap = static_cast<HBITMAP>(SelectObject(nameDc, nameBitmap));
+                RECT localNameRect = { 0, 0, namePaintRect.right - namePaintRect.left, namePaintRect.bottom - namePaintRect.top };
+                HBRUSH nameBrush = CreateSolidBrush(nameWindowColor_);
+                FillRect(nameDc, &localNameRect, nameBrush);
+                BLENDFUNCTION nameBlend = { AC_SRC_OVER, 0, static_cast<BYTE>(nameWindowOpacity_), 0 };
+                AlphaBlend(hdc, namePaintRect.left, namePaintRect.top, namePaintRect.right - namePaintRect.left, namePaintRect.bottom - namePaintRect.top,
+                    nameDc, 0, 0, localNameRect.right, localNameRect.bottom, nameBlend);
+                SelectObject(nameDc, originalNameBitmap);
+                DeleteObject(nameBitmap);
+                DeleteDC(nameDc);
+                DeleteObject(nameBrush);
+
+                HBRUSH nameBorderBrush = CreateSolidBrush(nameWindowBorderColor_);
+                FrameRect(hdc, &namePaintRect, nameBorderBrush);
+                DeleteObject(nameBorderBrush);
+            }
+
             SelectObject(hdc, speakerFont);
-            RECT nameRect = { messageRect.left + 24, messageRect.top + 18, messageRect.right - 24, messageRect.top + 56 };
+            const int namePadding = (std::max)(4, nameWindowPadding_);
+            RECT nameTextRect = { namePaintRect.left + namePadding, namePaintRect.top, namePaintRect.right - namePadding, namePaintRect.bottom };
             SetTextColor(hdc, nameTextColor_);
-            DrawWrappedText(hdc, nameRect, speakerName_, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            DrawWrappedText(hdc, nameTextRect, speakerName_, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            bodyTop = (std::max)(bodyTop, static_cast<int>(namePaintRect.bottom) + 10);
         }
 
         SelectObject(hdc, bodyFont);
         SetTextColor(hdc, messageTextColor_);
-        RECT bodyRect = { messageRect.left + 24, messageRect.top + (nameBoxVisible_ ? 64 : 24), messageRect.right - 24, messageRect.bottom - 42 };
+        RECT bodyRect = { messageRect.left + messagePadding, bodyTop, messageRect.right - messagePadding, messageRect.bottom - messagePadding };
         const std::wstring visibleText = textRevealActive_ ? displayedText_ : (displayedText_.empty() ? currentText_ : displayedText_);
         if (verticalTextEnabled_)
         {
@@ -7506,23 +9384,6 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
             DrawWrappedText(hdc, bodyRect, visibleText, DT_LEFT | DT_WORDBREAK);
         }
 
-        SelectObject(hdc, hintFont);
-        SetTextColor(hdc, RGB(160, 170, 180));
-        RECT hintRect = { messageRect.left + 24, messageRect.bottom - 30, messageRect.right - 24, messageRect.bottom - 10 };
-        std::wstring hintText = waitingForChoice_ ? L"\u30af\u30ea\u30c3\u30af\u307e\u305f\u306f 1-9 \u30ad\u30fc\u3067\u9078\u629e" : (reachedEnd_ ? L"\u30b9\u30af\u30ea\u30d7\u30c8\u7d42\u7aef" : (textRevealActive_ ? L"\u30af\u30ea\u30c3\u30af / Enter / Space \u3067\u5168\u6587\u8868\u793a" : L"\u30af\u30ea\u30c3\u30af / Enter / Space \u3067\u9032\u884c"));
-        if (!waitingForChoice_ && !reachedEnd_)
-        {
-            hintText += L" / " + std::to_wstring(textSpeedMs_) + L"ms";
-        }
-        if (previewSkipMode_)
-        {
-            hintText += L" / Skip";
-        }
-        else if (previewAutoMode_)
-        {
-            hintText += L" / Auto";
-        }
-        DrawWrappedText(hdc, hintRect, hintText, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     }
 
     if (standalone)
@@ -7679,27 +9540,25 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
         }
     }
 
-    if (!statusText_.empty())
-    {
-        RECT statusRect = { stageRect.left + 12, stageRect.bottom - 42, stageRect.right - 12, stageRect.bottom - 12 };
-        DrawWrappedText(hdc, statusRect, statusText_, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    }
-
-    auto drawOverlayAlpha = [&](COLORREF color, int alpha)
+    auto drawOverlayAlpha = [&](const RECT& targetRect, COLORREF color, int alpha)
     {
         if (alpha <= 0)
         {
             return;
         }
+        if (targetRect.right <= targetRect.left || targetRect.bottom <= targetRect.top)
+        {
+            return;
+        }
         HDC overlayDc = CreateCompatibleDC(hdc);
-        HBITMAP overlayBitmap = CreateCompatibleBitmap(hdc, stageRect.right - stageRect.left, stageRect.bottom - stageRect.top);
+        HBITMAP overlayBitmap = CreateCompatibleBitmap(hdc, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top);
         HGDIOBJ oldBitmap = SelectObject(overlayDc, overlayBitmap);
-        RECT overlayRect = { 0, 0, stageRect.right - stageRect.left, stageRect.bottom - stageRect.top };
+        RECT overlayRect = { 0, 0, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top };
         HBRUSH overlayBrush = CreateSolidBrush(color);
         FillRect(overlayDc, &overlayRect, overlayBrush);
         DeleteObject(overlayBrush);
         BLENDFUNCTION overlayBlend = { AC_SRC_OVER, 0, static_cast<BYTE>((std::max)(0, (std::min)(255, alpha))), 0 };
-        AlphaBlend(hdc, stageRect.left, stageRect.top, stageRect.right - stageRect.left, stageRect.bottom - stageRect.top, overlayDc, 0, 0, stageRect.right - stageRect.left, stageRect.bottom - stageRect.top, overlayBlend);
+        AlphaBlend(hdc, targetRect.left, targetRect.top, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top, overlayDc, 0, 0, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top, overlayBlend);
         SelectObject(overlayDc, oldBitmap);
         DeleteObject(overlayBitmap);
         DeleteDC(overlayDc);
@@ -7707,21 +9566,30 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
 
     if (tintOpacity_ > 0)
     {
-        drawOverlayAlpha(tintColor_, tintOpacity_);
+        drawOverlayAlpha(stageRect, tintColor_, tintOpacity_);
     }
 
     if (fadeEndTick_ != 0 && fadeEndTick_ > fadeStartTick_)
     {
         const DWORD now = GetTickCount();
         const double progress = static_cast<double>((std::min)(now, fadeEndTick_) - fadeStartTick_) / static_cast<double>((std::max<DWORD>)(1, fadeEndTick_ - fadeStartTick_));
-        drawOverlayAlpha(fadeColor_, static_cast<int>((1.0 - progress) * fadeOpacity_));
+        RECT fadeRect = stageRect;
+        if (fadeTarget_ == L"message" && HasVisibleArea(messageRect))
+        {
+            fadeRect = messageRect;
+        }
+        else if (fadeTarget_ == L"all")
+        {
+            fadeRect = clientRect;
+        }
+        drawOverlayAlpha(fadeRect, fadeColor_, static_cast<int>((1.0 - progress) * fadeOpacity_));
     }
 
     if (flashEndTick_ != 0 && flashEndTick_ > flashStartTick_)
     {
         const DWORD now = GetTickCount();
         const double progress = static_cast<double>((std::min)(now, flashEndTick_) - flashStartTick_) / static_cast<double>((std::max<DWORD>)(1, flashEndTick_ - flashStartTick_));
-        drawOverlayAlpha(flashColor_, static_cast<int>((1.0 - progress) * flashOpacity_));
+        drawOverlayAlpha(stageRect, flashColor_, static_cast<int>((1.0 - progress) * flashOpacity_));
     }
 
     SelectObject(hdc, originalFont);
@@ -7854,6 +9722,17 @@ void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
     FillRect(hdc, &clientRect, backgroundBrush);
     DeleteObject(backgroundBrush);
 
+    if (projectLauncherVisible_)
+    {
+        DrawProjectLauncher(hdc, clientRect);
+        if (projectDialogVisible_)
+        {
+            DrawProjectDialog(hdc, clientRect);
+        }
+        UpdateChildControls();
+        return;
+    }
+
     const RECT leftPanelRect = GetLeftPanelRect(clientRect);
     const RECT rightPanelRect = GetRightPanelRect(clientRect);
     const RECT previewRect = GetPreviewRect(clientRect);
@@ -7952,6 +9831,10 @@ void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
     {
         DrawSceneCreateDialog(hdc, clientRect);
     }
+    if (projectDialogVisible_)
+    {
+        DrawProjectDialog(hdc, clientRect);
+    }
     if (characterManagerVisible_)
     {
         DrawCharacterManagerDialog(hdc, clientRect);
@@ -8016,6 +9899,205 @@ void NovelRuntime::DrawSceneCreateDialog(HDC hdc, const RECT& clientRect)
     DrawWrappedText(hdc, sceneDialogCancelRect_, L"キャンセル", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     SetTextColor(hdc, RGB(255, 255, 255));
     DrawWrappedText(hdc, sceneDialogCreateRect_, L"作成", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+}
+
+void NovelRuntime::DrawProjectLauncher(HDC hdc, const RECT& clientRect)
+{
+    projectLauncherRows_.clear();
+    projectLauncherPanelRect_ = {};
+    projectLauncherCreateRect_ = {};
+    projectLauncherOpenRect_ = {};
+
+    HBRUSH backgroundBrush = CreateSolidBrush(RGB(18, 20, 24));
+    FillRect(hdc, &clientRect, backgroundBrush);
+    DeleteObject(backgroundBrush);
+
+    const int clientWidth = clientRect.right - clientRect.left;
+    const int clientHeight = clientRect.bottom - clientRect.top;
+    const int panelWidth = (std::min)(clientWidth - 64, 920);
+    const int panelHeight = (std::min)(clientHeight - 70, 620);
+    projectLauncherPanelRect_ =
+    {
+        clientRect.left + (clientWidth - panelWidth) / 2,
+        clientRect.top + 44,
+        clientRect.left + (clientWidth + panelWidth) / 2,
+        clientRect.top + 44 + panelHeight
+    };
+
+    HBRUSH shadowBrush = CreateSolidBrush(RGB(7, 9, 12));
+    RECT shadowRect = { projectLauncherPanelRect_.left + 8, projectLauncherPanelRect_.top + 8, projectLauncherPanelRect_.right + 8, projectLauncherPanelRect_.bottom + 8 };
+    FillRect(hdc, &shadowRect, shadowBrush);
+    DeleteObject(shadowBrush);
+
+    HBRUSH panelBrush = CreateSolidBrush(RGB(30, 35, 43));
+    FillRect(hdc, &projectLauncherPanelRect_, panelBrush);
+    DeleteObject(panelBrush);
+    HBRUSH borderBrush = CreateSolidBrush(RGB(72, 84, 98));
+    FrameRect(hdc, &projectLauncherPanelRect_, borderBrush);
+    DeleteObject(borderBrush);
+
+    SetBkMode(hdc, TRANSPARENT);
+    RECT titleRect = { projectLauncherPanelRect_.left + 28, projectLauncherPanelRect_.top + 24, projectLauncherPanelRect_.right - 320, projectLauncherPanelRect_.top + 62 };
+    SetTextColor(hdc, RGB(232, 238, 246));
+    DrawWrappedText(hdc, titleRect, L"プロジェクト一覧", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    RECT logoRect = { projectLauncherPanelRect_.right - 320, projectLauncherPanelRect_.top + 20, projectLauncherPanelRect_.right - 30, projectLauncherPanelRect_.top + 74 };
+    SetTextColor(hdc, RGB(96, 190, 244));
+    DrawWrappedText(hdc, logoRect, L"Kaktos Engine", DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+
+    projectLauncherCreateRect_ = { projectLauncherPanelRect_.left + 28, projectLauncherPanelRect_.top + 92, projectLauncherPanelRect_.left + 218, projectLauncherPanelRect_.top + 128 };
+    projectLauncherOpenRect_ = { projectLauncherPanelRect_.left + 230, projectLauncherPanelRect_.top + 92, projectLauncherPanelRect_.left + 390, projectLauncherPanelRect_.top + 128 };
+
+    auto drawButton = [&](const RECT& rect, const std::wstring& label, COLORREF fill)
+    {
+        HBRUSH brush = CreateSolidBrush(fill);
+        FillRect(hdc, &rect, brush);
+        DeleteObject(brush);
+        HBRUSH frameBrush = CreateSolidBrush(RGB(90, 116, 136));
+        FrameRect(hdc, &rect, frameBrush);
+        DeleteObject(frameBrush);
+        SetTextColor(hdc, RGB(246, 250, 255));
+        DrawWrappedText(hdc, rect, label, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    };
+
+    drawButton(projectLauncherCreateRect_, L"+ 新規プロジェクト作成", RGB(42, 142, 202));
+    drawButton(projectLauncherOpenRect_, L"プロジェクトを開く", RGB(52, 62, 74));
+
+    const int tableLeft = projectLauncherPanelRect_.left + 28;
+    const int tableRight = projectLauncherPanelRect_.right - 28;
+    const int tableTop = projectLauncherPanelRect_.top + 150;
+    const int headerHeight = 36;
+    RECT headerRect = { tableLeft, tableTop, tableRight, tableTop + headerHeight };
+    HBRUSH headerBrush = CreateSolidBrush(RGB(64, 68, 64));
+    FillRect(hdc, &headerRect, headerBrush);
+    DeleteObject(headerBrush);
+
+    const int dataLeft = tableRight - 138;
+    const int deleteLeft = tableRight - 64;
+    const int typeLeft = tableLeft + ((tableRight - tableLeft) * 52) / 100;
+
+    SetTextColor(hdc, RGB(248, 250, 252));
+    DrawWrappedText(hdc, RECT{ tableLeft + 14, headerRect.top, typeLeft - 8, headerRect.bottom }, L"プロジェクト", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    DrawWrappedText(hdc, RECT{ typeLeft, headerRect.top, dataLeft - 8, headerRect.bottom }, L"種類", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    DrawWrappedText(hdc, RECT{ dataLeft, headerRect.top, deleteLeft - 8, headerRect.bottom }, L"データ", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawWrappedText(hdc, RECT{ deleteLeft, headerRect.top, tableRight, headerRect.bottom }, L"削除", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    const int rowHeight = 42;
+    int y = headerRect.bottom;
+    if (recentProjects_.empty())
+    {
+        RECT emptyRect = { tableLeft + 14, y + 18, tableRight - 14, y + 58 };
+        SetTextColor(hdc, RGB(154, 166, 180));
+        DrawWrappedText(hdc, emptyRect, L"最近使ったプロジェクトはまだありません。新規作成またはプロジェクトを開くから開始してください。", DT_LEFT | DT_WORDBREAK | DT_VCENTER);
+    }
+
+    for (const std::wstring& projectPath : recentProjects_)
+    {
+        if (y + rowHeight > projectLauncherPanelRect_.bottom - 28)
+        {
+            break;
+        }
+
+        ProjectLauncherRow row;
+        row.projectPath = projectPath;
+        row.rowRect = { tableLeft, y, tableRight, y + rowHeight };
+        row.dataRect = { dataLeft + 16, y + 8, dataLeft + 46, y + 34 };
+        row.deleteRect = { deleteLeft + 18, y + 8, deleteLeft + 48, y + 34 };
+
+        const bool exists = GetFileAttributesW(projectPath.c_str()) != INVALID_FILE_ATTRIBUTES;
+        HBRUSH rowBrush = CreateSolidBrush(projectLauncherRows_.size() % 2 == 0 ? RGB(34, 40, 48) : RGB(30, 36, 44));
+        FillRect(hdc, &row.rowRect, rowBrush);
+        DeleteObject(rowBrush);
+        HBRUSH lineBrush = CreateSolidBrush(RGB(68, 76, 86));
+        FrameRect(hdc, &row.rowRect, lineBrush);
+        DeleteObject(lineBrush);
+
+        const std::wstring projectRoot = GetProjectRootFromProjectPath(projectPath);
+        const std::wstring displayName = projectRoot.empty() ? GetFileStemPart(projectPath) : GetFileNamePart(projectRoot);
+        SetTextColor(hdc, exists ? RGB(90, 190, 244) : RGB(128, 138, 148));
+        DrawWrappedText(hdc, RECT{ tableLeft + 14, y, typeLeft - 8, y + rowHeight }, displayName.empty() ? GetFileNamePart(projectPath) : displayName, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SetTextColor(hdc, exists ? RGB(214, 220, 228) : RGB(128, 138, 148));
+        DrawWrappedText(hdc, RECT{ typeLeft, y, dataLeft - 8, y + rowHeight }, L"Kaktos Engine Project", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SetTextColor(hdc, exists ? RGB(92, 192, 242) : RGB(128, 138, 148));
+        DrawWrappedText(hdc, row.dataRect, L"□", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        SetTextColor(hdc, RGB(242, 102, 118));
+        DrawWrappedText(hdc, row.deleteRect, L"×", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+        projectLauncherRows_.push_back(row);
+        y += rowHeight;
+    }
+}
+
+void NovelRuntime::DrawProjectDialog(HDC hdc, const RECT& clientRect)
+{
+    const int dialogWidth = 760;
+    const int dialogHeight = 240;
+    projectDialogRect_ =
+    {
+        clientRect.left + ((clientRect.right - clientRect.left) - dialogWidth) / 2,
+        clientRect.top + 78,
+        clientRect.left + ((clientRect.right - clientRect.left) + dialogWidth) / 2,
+        clientRect.top + 78 + dialogHeight
+    };
+
+    HBRUSH overlayBrush = CreateSolidBrush(RGB(18, 22, 28));
+    FillRect(hdc, &clientRect, overlayBrush);
+    DeleteObject(overlayBrush);
+
+    HBRUSH dialogBrush = CreateSolidBrush(RGB(34, 40, 48));
+    FillRect(hdc, &projectDialogRect_, dialogBrush);
+    DeleteObject(dialogBrush);
+    HBRUSH borderBrush = CreateSolidBrush(RGB(82, 92, 104));
+    FrameRect(hdc, &projectDialogRect_, borderBrush);
+    DeleteObject(borderBrush);
+
+    RECT headerRect = { projectDialogRect_.left, projectDialogRect_.top, projectDialogRect_.right, projectDialogRect_.top + 40 };
+    HBRUSH headerBrush = CreateSolidBrush(RGB(58, 56, 52));
+    FillRect(hdc, &headerRect, headerBrush);
+    DeleteObject(headerBrush);
+
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(246, 248, 250));
+    RECT titleRect = { headerRect.left + 14, headerRect.top, headerRect.right - 14, headerRect.bottom };
+    DrawWrappedText(hdc, titleRect, L"プロジェクト", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    RECT descriptionRect = { projectDialogRect_.left + 28, projectDialogRect_.top + 58, projectDialogRect_.right - 28, projectDialogRect_.top + 88 };
+    SetTextColor(hdc, RGB(202, 210, 220));
+    DrawWrappedText(hdc, descriptionRect, L"新しいプロジェクトを作成するか、既存の .kproj を読み込みます。", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    RECT labelRect = { projectDialogRect_.left + 36, projectDialogRect_.top + 112, projectDialogRect_.left + 190, projectDialogRect_.top + 142 };
+    SetTextColor(hdc, RGB(226, 232, 240));
+    DrawWrappedText(hdc, labelRect, L"新規プロジェクト名", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    projectDialogEditRect_ = { projectDialogRect_.left + 196, projectDialogRect_.top + 108, projectDialogRect_.right - 34, projectDialogRect_.top + 142 };
+    RECT editFrameRect = { projectDialogEditRect_.left - 1, projectDialogEditRect_.top - 1, projectDialogEditRect_.right + 1, projectDialogEditRect_.bottom + 1 };
+    HBRUSH editFrameBrush = CreateSolidBrush(RGB(86, 150, 220));
+    FrameRect(hdc, &editFrameRect, editFrameBrush);
+    DeleteObject(editFrameBrush);
+
+    projectDialogOpenRect_ = { projectDialogRect_.left + 196, projectDialogRect_.bottom - 62, projectDialogRect_.left + 316, projectDialogRect_.bottom - 24 };
+    projectDialogCancelRect_ = { projectDialogRect_.left + 330, projectDialogRect_.bottom - 62, projectDialogRect_.left + 450, projectDialogRect_.bottom - 24 };
+    projectDialogCreateRect_ = { projectDialogRect_.right - 154, projectDialogRect_.bottom - 62, projectDialogRect_.right - 34, projectDialogRect_.bottom - 24 };
+
+    auto drawButton = [&](const RECT& rect, const std::wstring& label, COLORREF fill, COLORREF text)
+    {
+        HBRUSH brush = CreateSolidBrush(fill);
+        FillRect(hdc, &rect, brush);
+        DeleteObject(brush);
+        HBRUSH frameBrush = CreateSolidBrush(RGB(100, 112, 126));
+        FrameRect(hdc, &rect, frameBrush);
+        DeleteObject(frameBrush);
+        SetTextColor(hdc, text);
+        DrawWrappedText(hdc, rect, label, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    };
+
+    drawButton(projectDialogOpenRect_, L"読み込み", RGB(48, 56, 66), RGB(236, 242, 248));
+    drawButton(projectDialogCancelRect_, L"閉じる", RGB(48, 56, 66), RGB(236, 242, 248));
+    drawButton(projectDialogCreateRect_, L"作成", RGB(50, 150, 210), RGB(255, 255, 255));
+
+    RECT noteRect = { projectDialogRect_.left + 36, projectDialogRect_.bottom - 98, projectDialogRect_.right - 34, projectDialogRect_.bottom - 72 };
+    SetTextColor(hdc, RGB(160, 170, 182));
+    DrawWrappedText(hdc, noteRect, L"作成時に assets / scenario / ui / textbox / fonts などの基本フォルダを自動で用意します。", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 }
 
 void NovelRuntime::DrawCharacterManagerDialog(HDC hdc, const RECT& clientRect)
@@ -8368,7 +10450,8 @@ void NovelRuntime::DrawVariableManagerDialog(HDC hdc, const RECT& clientRect)
 void NovelRuntime::DrawSettingsDialog(HDC hdc, const RECT& clientRect)
 {
     settingsActionTargets_.clear();
-    settingsDialogRect_ = { clientRect.left + 80, clientRect.top + 48, clientRect.right - 80, clientRect.top + 700 };
+    settingsCategoryRects_.clear();
+    settingsDialogRect_ = { clientRect.left + 80, clientRect.top + 48, clientRect.right - 80, clientRect.bottom - 36 };
     HBRUSH overlayBrush = CreateSolidBrush(RGB(24, 28, 34));
     FillRect(hdc, &clientRect, overlayBrush);
     DeleteObject(overlayBrush);
@@ -8386,9 +10469,26 @@ void NovelRuntime::DrawSettingsDialog(HDC hdc, const RECT& clientRect)
     DeleteObject(headerBrush);
     RECT titleRect = { headerRect.left + 12, headerRect.top, headerRect.right - 52, headerRect.bottom };
     SetTextColor(hdc, RGB(255, 255, 255));
-    DrawWrappedText(hdc, titleRect, L"設定", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    DrawWrappedText(hdc, titleRect, L"ゲームセッティング", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     settingsDialogCloseRect_ = { headerRect.right - 30, headerRect.top + 8, headerRect.right - 10, headerRect.top + 28 };
     DrawWrappedText(hdc, settingsDialogCloseRect_, L"×", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    settingsNavRect_ = { settingsDialogRect_.left + 20, headerRect.bottom + 12, settingsDialogRect_.left + 168, settingsDialogRect_.bottom - 14 };
+    settingsContentRect_ = { settingsNavRect_.right + 12, headerRect.bottom + 12, settingsDialogRect_.right - 20, settingsDialogRect_.bottom - 14 };
+
+    HBRUSH navBrush = CreateSolidBrush(RGB(34, 38, 44));
+    FillRect(hdc, &settingsNavRect_, navBrush);
+    DeleteObject(navBrush);
+    HBRUSH navBorderBrush = CreateSolidBrush(RGB(82, 88, 96));
+    FrameRect(hdc, &settingsNavRect_, navBorderBrush);
+    DeleteObject(navBorderBrush);
+
+    HBRUSH contentBrush = CreateSolidBrush(RGB(40, 44, 50));
+    FillRect(hdc, &settingsContentRect_, contentBrush);
+    DeleteObject(contentBrush);
+    HBRUSH contentBorderBrush = CreateSolidBrush(RGB(82, 88, 96));
+    FrameRect(hdc, &settingsContentRect_, contentBorderBrush);
+    DeleteObject(contentBorderBrush);
 
     auto drawButton = [&](const RECT& rect, const std::wstring& label, COLORREF fill, const std::wstring& action)
     {
@@ -8406,110 +10506,288 @@ void NovelRuntime::DrawSettingsDialog(HDC hdc, const RECT& clientRect)
         }
     };
 
-    int cursorY = settingsDialogRect_.top + 58;
+    const std::vector<std::wstring> settingsCategories =
+    {
+        L"ゲーム全体", L"画面", L"フォントスタイル", L"キャラクター", L"メッセージウィンドウ",
+        L"メニュー", L"カーソル", L"キーボード・マウス", L"既読管理", L"オーディオ",
+        L"バックログ", L"UIテーマ一括変換", L"CGモード", L"回想モード", L"Kaktos Engine"
+    };
+    const int categoryRowHeight = 28;
+    for (size_t i = 0; i < settingsCategories.size(); ++i)
+    {
+        RECT rowRect = { settingsNavRect_.left + 8, settingsNavRect_.top + 8 + static_cast<int>(i) * categoryRowHeight, settingsNavRect_.right - 8, settingsNavRect_.top + 8 + static_cast<int>(i + 1) * categoryRowHeight - 2 };
+        settingsCategoryRects_.push_back(rowRect);
+        if (i == selectedSettingsCategoryIndex_)
+        {
+            HBRUSH activeBrush = CreateSolidBrush(RGB(52, 122, 188));
+            FillRect(hdc, &rowRect, activeBrush);
+            DeleteObject(activeBrush);
+        }
+        SetTextColor(hdc, i == selectedSettingsCategoryIndex_ ? RGB(255, 255, 255) : RGB(214, 218, 224));
+        DrawWrappedText(hdc, rowRect, settingsCategories[i], DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        settingsActionTargets_.push_back(SettingsActionTarget{ L"settings_tab:" + std::to_wstring(i), rowRect });
+    }
+
+    const int scrollBarWidth = 12;
+    const RECT contentInnerRect = { settingsContentRect_.left + 12, settingsContentRect_.top + 12, settingsContentRect_.right - 20, settingsContentRect_.bottom - 12 };
+    const RECT scrollTrackRect = { settingsContentRect_.right - scrollBarWidth - 4, settingsContentRect_.top + 8, settingsContentRect_.right - 4, settingsContentRect_.bottom - 8 };
+    const int contentStartY = contentInnerRect.top - settingsScrollOffset_;
+    int cursorY = contentStartY;
     auto drawRow = [&](const std::wstring& label, const std::wstring& value, const std::wstring& mainAction, bool hasPlusMinus)
     {
-        RECT labelRect = { settingsDialogRect_.left + 20, cursorY, settingsDialogRect_.left + 200, cursorY + 26 };
-        RECT valueRect = { settingsDialogRect_.left + 210, cursorY, settingsDialogRect_.right - 190, cursorY + 26 };
+        RECT labelRect = { contentInnerRect.left, cursorY, contentInnerRect.left + 160, cursorY + 26 };
+        RECT valueRect = { contentInnerRect.left + 170, cursorY, contentInnerRect.right - 170, cursorY + 26 };
         SetTextColor(hdc, RGB(205, 214, 222));
         DrawWrappedText(hdc, labelRect, label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         SetTextColor(hdc, RGB(238, 242, 246));
         DrawWrappedText(hdc, valueRect, value, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         if (hasPlusMinus)
         {
-            RECT minusRect = { settingsDialogRect_.right - 150, cursorY - 2, settingsDialogRect_.right - 112, cursorY + 24 };
-            RECT plusRect = { settingsDialogRect_.right - 104, cursorY - 2, settingsDialogRect_.right - 66, cursorY + 24 };
+            RECT minusRect = { contentInnerRect.right - 140, cursorY - 2, contentInnerRect.right - 102, cursorY + 24 };
+            RECT plusRect = { contentInnerRect.right - 94, cursorY - 2, contentInnerRect.right - 56, cursorY + 24 };
             drawButton(minusRect, L"-", RGB(78, 92, 108), mainAction + L"_minus");
             drawButton(plusRect, L"+", RGB(78, 92, 108), mainAction + L"_plus");
         }
         else
         {
-            RECT buttonRect = { settingsDialogRect_.right - 150, cursorY - 2, settingsDialogRect_.right - 20, cursorY + 24 };
+            RECT buttonRect = { contentInnerRect.right - 140, cursorY - 2, contentInnerRect.right, cursorY + 24 };
             drawButton(buttonRect, L"変更", RGB(70, 118, 178), mainAction);
         }
         cursorY += 38;
     };
-
-    drawRow(L"画面サイズ", std::to_wstring(editorSettings_.windowWidth) + L" x " + std::to_wstring(editorSettings_.windowHeight), L"cycle_window", false);
-    drawRow(L"フォント", editorSettings_.defaultFont, L"cycle_font", false);
-    drawRow(L"既定テキスト速度", std::to_wstring(editorSettings_.defaultTextSpeed) + L" ms", L"text_speed", true);
-    drawRow(L"マスター音量", std::to_wstring(editorSettings_.masterVolume) + L"%", L"master", true);
-    drawRow(L"BGM音量", std::to_wstring(editorSettings_.bgmVolume) + L"%", L"bgm", true);
-    drawRow(L"SE音量", std::to_wstring(editorSettings_.seVolume) + L"%", L"se", true);
-    drawRow(L"ボイス音量", std::to_wstring(editorSettings_.voiceVolume) + L"%", L"voice", true);
-    drawRow(L"保存先", editorSettings_.saveDirectory.empty() ? GetAssetsRootDirectory() : editorSettings_.saveDirectory, L"browse_save_dir", false);
-
-    RECT autosaveLabelRect = { settingsDialogRect_.left + 20, cursorY, settingsDialogRect_.left + 200, cursorY + 26 };
-    RECT autosaveValueRect = { settingsDialogRect_.left + 210, cursorY, settingsDialogRect_.right - 190, cursorY + 26 };
-    SetTextColor(hdc, RGB(205, 214, 222));
-    DrawWrappedText(hdc, autosaveLabelRect, L"オートセーブ", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    SetTextColor(hdc, RGB(238, 242, 246));
-    DrawWrappedText(hdc, autosaveValueRect, editorSettings_.autosaveEnabled ? L"有効" : L"無効", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    RECT toggleRect = { settingsDialogRect_.right - 150, cursorY - 2, settingsDialogRect_.right - 20, cursorY + 24 };
-    drawButton(toggleRect, editorSettings_.autosaveEnabled ? L"無効にする" : L"有効にする", RGB(92, 112, 72), L"toggle_autosave");
-    cursorY += 48;
-
-    RECT sectionRect = { settingsDialogRect_.left + 20, cursorY, settingsDialogRect_.right - 20, cursorY + 24 };
-    SetTextColor(hdc, RGB(150, 196, 244));
-    DrawWrappedText(hdc, sectionRect, L"プレイヤーUIボタン", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    cursorY += 32;
-
-    for (size_t i = 0; i < uiButtons_.size(); ++i)
+    auto drawToggleRow = [&](const std::wstring& label, const std::wstring& value, const std::wstring& action, const std::wstring& buttonLabel)
     {
-        const UiButtonDefinition& button = uiButtons_[i];
-        RECT labelRect = { settingsDialogRect_.left + 20, cursorY, settingsDialogRect_.left + 180, cursorY + 24 };
-        RECT stateRect = { settingsDialogRect_.left + 186, cursorY, settingsDialogRect_.left + 300, cursorY + 24 };
-        RECT posRect = { settingsDialogRect_.left + 306, cursorY, settingsDialogRect_.right - 360, cursorY + 24 };
+        RECT labelRect = { contentInnerRect.left, cursorY, contentInnerRect.left + 160, cursorY + 26 };
+        RECT valueRect = { contentInnerRect.left + 170, cursorY, contentInnerRect.right - 170, cursorY + 26 };
         SetTextColor(hdc, RGB(205, 214, 222));
-        DrawWrappedText(hdc, labelRect, button.label.empty() ? button.id : button.label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        DrawWrappedText(hdc, labelRect, label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         SetTextColor(hdc, RGB(238, 242, 246));
-        DrawWrappedText(hdc, stateRect, button.visible ? L"表示" : L"非表示", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-        DrawWrappedText(hdc, posRect, L"X: " + std::to_wstring(button.x) + L" / Y: " + std::to_wstring(button.y), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-
-        RECT toggleButtonRect = { settingsDialogRect_.right - 344, cursorY - 2, settingsDialogRect_.right - 266, cursorY + 24 };
-        RECT browseButtonRect = { settingsDialogRect_.right - 258, cursorY - 2, settingsDialogRect_.right - 180, cursorY + 24 };
-        RECT clearButtonRect = { settingsDialogRect_.right - 172, cursorY - 2, settingsDialogRect_.right - 118, cursorY + 24 };
-        RECT leftButtonRect = { settingsDialogRect_.right - 114, cursorY - 2, settingsDialogRect_.right - 88, cursorY + 24 };
-        RECT rightButtonRect = { settingsDialogRect_.right - 84, cursorY - 2, settingsDialogRect_.right - 58, cursorY + 24 };
-        RECT upButtonRect = { settingsDialogRect_.right - 54, cursorY - 2, settingsDialogRect_.right - 28, cursorY + 24 };
-        RECT downButtonRect = { settingsDialogRect_.right - 24, cursorY - 2, settingsDialogRect_.right - 2, cursorY + 24 };
-        drawButton(toggleButtonRect, button.visible ? L"隠す" : L"表示", RGB(78, 92, 108), L"ui_toggle:" + std::to_wstring(i));
-        drawButton(browseButtonRect, L"画像参照", RGB(70, 118, 178), L"ui_browse_icon:" + std::to_wstring(i));
-        drawButton(clearButtonRect, L"解除", RGB(92, 80, 88), L"ui_clear_icon:" + std::to_wstring(i));
-        drawButton(leftButtonRect, L"←", RGB(70, 118, 178), L"ui_left:" + std::to_wstring(i));
-        drawButton(rightButtonRect, L"→", RGB(70, 118, 178), L"ui_right:" + std::to_wstring(i));
-        drawButton(upButtonRect, L"↑", RGB(92, 112, 72), L"ui_up:" + std::to_wstring(i));
-        drawButton(downButtonRect, L"↓", RGB(92, 112, 72), L"ui_down:" + std::to_wstring(i));
-        cursorY += 28;
-
-        RECT iconRect = { settingsDialogRect_.left + 48, cursorY, settingsDialogRect_.left + 88, cursorY + 40 };
-        HBRUSH iconBackBrush = CreateSolidBrush(RGB(26, 32, 38));
-        FillRect(hdc, &iconRect, iconBackBrush);
-        DeleteObject(iconBackBrush);
-        HBRUSH iconBorderBrush = CreateSolidBrush(RGB(74, 82, 92));
-        FrameRect(hdc, &iconRect, iconBorderBrush);
-        DeleteObject(iconBorderBrush);
-        if (button.iconImage)
-        {
-            Gdiplus::Graphics graphics(hdc);
-            graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-            graphics.DrawImage(button.iconImage.get(), Gdiplus::Rect(iconRect.left + 4, iconRect.top + 4, (iconRect.right - iconRect.left) - 8, (iconRect.bottom - iconRect.top) - 8));
-        }
-        else
-        {
-            RECT noIconRect = { iconRect.left + 4, iconRect.top + 4, iconRect.right - 4, iconRect.bottom - 4 };
-            SetTextColor(hdc, RGB(136, 146, 156));
-            DrawWrappedText(hdc, noIconRect, L"なし", DT_CENTER | DT_VCENTER | DT_WORDBREAK);
-        }
-
-        RECT pathRect = { settingsDialogRect_.left + 98, cursorY + 4, settingsDialogRect_.right - 20, cursorY + 36 };
+        DrawWrappedText(hdc, valueRect, value, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        RECT buttonRect = { contentInnerRect.right - 140, cursorY - 2, contentInnerRect.right, cursorY + 24 };
+        drawButton(buttonRect, buttonLabel, RGB(70, 118, 178), action);
+        cursorY += 38;
+    };
+    auto drawPathRow = [&](const std::wstring& label, const std::wstring& value, const std::wstring& browseAction, const std::wstring& clearAction)
+    {
+        RECT labelRect = { contentInnerRect.left, cursorY, contentInnerRect.left + 160, cursorY + 26 };
+        RECT valueRect = { contentInnerRect.left + 170, cursorY, contentInnerRect.right - 250, cursorY + 40 };
+        SetTextColor(hdc, RGB(205, 214, 222));
+        DrawWrappedText(hdc, labelRect, label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         SetTextColor(hdc, RGB(176, 184, 194));
-        DrawWrappedText(hdc, pathRect, button.iconPath.empty() ? L"(画像未設定)" : button.iconPath, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
-        cursorY += 50;
+        DrawWrappedText(hdc, valueRect, value.empty() ? L"(画像未設定)" : value, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+        RECT browseRect = { contentInnerRect.right - 140, cursorY - 2, contentInnerRect.right - 70, cursorY + 24 };
+        RECT clearRect = { contentInnerRect.right - 64, cursorY - 2, contentInnerRect.right, cursorY + 24 };
+        drawButton(browseRect, L"参照", RGB(70, 118, 178), browseAction);
+        drawButton(clearRect, L"解除", RGB(92, 80, 88), clearAction);
+        cursorY += 48;
+    };
+    auto drawColorRow = [&](const std::wstring& label, COLORREF color, const std::wstring& action)
+    {
+        RECT labelRect = { contentInnerRect.left, cursorY, contentInnerRect.left + 160, cursorY + 26 };
+        RECT valueRect = { contentInnerRect.left + 170, cursorY, contentInnerRect.right - 170, cursorY + 26 };
+        RECT swatchRect = { valueRect.left, cursorY + 3, valueRect.left + 26, cursorY + 23 };
+        RECT textRect = { swatchRect.right + 8, cursorY, valueRect.right, cursorY + 26 };
+        SetTextColor(hdc, RGB(205, 214, 222));
+        DrawWrappedText(hdc, labelRect, label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        HBRUSH swatchBrush = CreateSolidBrush(color);
+        FillRect(hdc, &swatchRect, swatchBrush);
+        DeleteObject(swatchBrush);
+        HBRUSH swatchBorderBrush = CreateSolidBrush(RGB(98, 106, 118));
+        FrameRect(hdc, &swatchRect, swatchBorderBrush);
+        DeleteObject(swatchBorderBrush);
+        SetTextColor(hdc, RGB(238, 242, 246));
+        DrawWrappedText(hdc, textRect, FormatHexColor(color), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        RECT buttonRect = { contentInnerRect.right - 140, cursorY - 2, contentInnerRect.right, cursorY + 24 };
+        drawButton(buttonRect, L"色選択", RGB(70, 118, 178), action);
+        cursorY += 38;
+    };
+    const int savedDc = SaveDC(hdc);
+    IntersectClipRect(hdc, settingsContentRect_.left + 1, settingsContentRect_.top + 1, settingsContentRect_.right - 1, settingsContentRect_.bottom - 1);
+
+    auto drawSectionTitle = [&](const std::wstring& label)
+    {
+        RECT rect = { contentInnerRect.left, cursorY, contentInnerRect.right, cursorY + 28 };
+        SetTextColor(hdc, RGB(196, 222, 248));
+        DrawWrappedText(hdc, rect, label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        cursorY += 34;
+    };
+
+    auto drawPlaceholder = [&](const std::wstring& title, const std::vector<std::wstring>& lines)
+    {
+        drawSectionTitle(title);
+        for (const std::wstring& line : lines)
+        {
+            RECT rect = { contentInnerRect.left, cursorY, contentInnerRect.right, cursorY + 24 };
+            SetTextColor(hdc, RGB(186, 192, 198));
+            DrawWrappedText(hdc, rect, line, DT_LEFT | DT_WORDBREAK);
+            cursorY += 28;
+        }
+    };
+
+    if (selectedSettingsCategoryIndex_ == 0)
+    {
+        drawRow(L"ゲームタイトル", storyTitle_, L"", false);
+        drawRow(L"保存先", editorSettings_.saveDirectory.empty() ? GetAssetsRootDirectory() : editorSettings_.saveDirectory, L"browse_save_dir", false);
+
+        RECT autosaveLabelRect = { contentInnerRect.left, cursorY, contentInnerRect.left + 160, cursorY + 26 };
+        RECT autosaveValueRect = { contentInnerRect.left + 170, cursorY, contentInnerRect.right - 170, cursorY + 26 };
+        SetTextColor(hdc, RGB(205, 214, 222));
+        DrawWrappedText(hdc, autosaveLabelRect, L"オートセーブ", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SetTextColor(hdc, RGB(238, 242, 246));
+        DrawWrappedText(hdc, autosaveValueRect, editorSettings_.autosaveEnabled ? L"有効" : L"無効", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        RECT toggleRect = { contentInnerRect.right - 140, cursorY - 2, contentInnerRect.right, cursorY + 24 };
+        drawButton(toggleRect, editorSettings_.autosaveEnabled ? L"無効にする" : L"有効にする", RGB(92, 112, 72), L"toggle_autosave");
+        cursorY += 48;
+
+        drawSectionTitle(L"プレイヤーUIボタン");
+        for (size_t i = 0; i < uiButtons_.size(); ++i)
+        {
+            const UiButtonDefinition& button = uiButtons_[i];
+            RECT labelRect = { contentInnerRect.left, cursorY, contentInnerRect.left + 150, cursorY + 24 };
+            RECT stateRect = { contentInnerRect.left + 156, cursorY, contentInnerRect.left + 260, cursorY + 24 };
+            RECT posRect = { contentInnerRect.left + 266, cursorY, contentInnerRect.right - 340, cursorY + 24 };
+            SetTextColor(hdc, RGB(205, 214, 222));
+            DrawWrappedText(hdc, labelRect, button.label.empty() ? button.id : button.label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            DrawWrappedText(hdc, stateRect, button.visible ? L"表示" : L"非表示", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            DrawWrappedText(hdc, posRect, L"X: " + std::to_wstring(button.x) + L" / Y: " + std::to_wstring(button.y), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+            RECT toggleButtonRect = { contentInnerRect.right - 334, cursorY - 2, contentInnerRect.right - 256, cursorY + 24 };
+            RECT browseButtonRect = { contentInnerRect.right - 248, cursorY - 2, contentInnerRect.right - 170, cursorY + 24 };
+            RECT clearButtonRect = { contentInnerRect.right - 162, cursorY - 2, contentInnerRect.right - 108, cursorY + 24 };
+            RECT leftButtonRect = { contentInnerRect.right - 104, cursorY - 2, contentInnerRect.right - 78, cursorY + 24 };
+            RECT rightButtonRect = { contentInnerRect.right - 74, cursorY - 2, contentInnerRect.right - 48, cursorY + 24 };
+            RECT upButtonRect = { contentInnerRect.right - 44, cursorY - 2, contentInnerRect.right - 18, cursorY + 24 };
+            RECT downButtonRect = { contentInnerRect.right - 14, cursorY - 2, contentInnerRect.right + 12, cursorY + 24 };
+            drawButton(toggleButtonRect, button.visible ? L"隠す" : L"表示", RGB(78, 92, 108), L"ui_toggle:" + std::to_wstring(i));
+            drawButton(browseButtonRect, L"画像参照", RGB(70, 118, 178), L"ui_browse_icon:" + std::to_wstring(i));
+            drawButton(clearButtonRect, L"解除", RGB(92, 80, 88), L"ui_clear_icon:" + std::to_wstring(i));
+            drawButton(leftButtonRect, L"←", RGB(70, 118, 178), L"ui_left:" + std::to_wstring(i));
+            drawButton(rightButtonRect, L"→", RGB(70, 118, 178), L"ui_right:" + std::to_wstring(i));
+            drawButton(upButtonRect, L"↑", RGB(92, 112, 72), L"ui_up:" + std::to_wstring(i));
+            drawButton(downButtonRect, L"↓", RGB(92, 112, 72), L"ui_down:" + std::to_wstring(i));
+            cursorY += 28;
+
+            RECT iconRect = { contentInnerRect.left + 28, cursorY, contentInnerRect.left + 68, cursorY + 40 };
+            HBRUSH iconBackBrush = CreateSolidBrush(RGB(26, 32, 38));
+            FillRect(hdc, &iconRect, iconBackBrush);
+            DeleteObject(iconBackBrush);
+            HBRUSH iconBorderBrush = CreateSolidBrush(RGB(74, 82, 92));
+            FrameRect(hdc, &iconRect, iconBorderBrush);
+            DeleteObject(iconBorderBrush);
+            if (button.iconImage)
+            {
+                Gdiplus::Graphics graphics(hdc);
+                graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                graphics.DrawImage(button.iconImage.get(), Gdiplus::Rect(iconRect.left + 4, iconRect.top + 4, (iconRect.right - iconRect.left) - 8, (iconRect.bottom - iconRect.top) - 8));
+            }
+            else
+            {
+                RECT noIconRect = { iconRect.left + 4, iconRect.top + 4, iconRect.right - 4, iconRect.bottom - 4 };
+                SetTextColor(hdc, RGB(136, 146, 156));
+                DrawWrappedText(hdc, noIconRect, L"なし", DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+            }
+
+            RECT pathRect = { contentInnerRect.left + 78, cursorY + 4, contentInnerRect.right, cursorY + 36 };
+            SetTextColor(hdc, RGB(176, 184, 194));
+            DrawWrappedText(hdc, pathRect, button.iconPath.empty() ? L"(画像未設定)" : button.iconPath, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+            cursorY += 50;
+        }
+
+        settingsDialogRestoreRect_ = { contentInnerRect.left, cursorY, contentInnerRect.left + 220, cursorY + 30 };
+        drawButton(settingsDialogRestoreRect_, L"オートセーブから復元", RGB(84, 104, 132), L"");
+        cursorY += 40;
+    }
+    else if (selectedSettingsCategoryIndex_ == 1)
+    {
+        drawSectionTitle(L"画面");
+        drawRow(L"画面サイズ", std::to_wstring(editorSettings_.windowWidth) + L" x " + std::to_wstring(editorSettings_.windowHeight), L"cycle_window", false);
+        drawPlaceholder(L"今後追加", { L"ビューウィンドウ比率、起動時フルスクリーン、既定拡大率をここへ追加予定です。" });
+    }
+    else if (selectedSettingsCategoryIndex_ == 2)
+    {
+        drawSectionTitle(L"フォントスタイル");
+        drawRow(L"既定メッセージフォント", editorSettings_.defaultFont, L"cycle_font", false);
+        {
+            RECT sampleFrame = { contentInnerRect.left + 170, cursorY - 6, contentInnerRect.right, cursorY + 44 };
+            HBRUSH sampleBrush = CreateSolidBrush(RGB(28, 34, 42));
+            FillRect(hdc, &sampleFrame, sampleBrush);
+            DeleteObject(sampleBrush);
+            HBRUSH sampleBorder = CreateSolidBrush(RGB(74, 82, 92));
+            FrameRect(hdc, &sampleFrame, sampleBorder);
+            DeleteObject(sampleBorder);
+
+            const wchar_t* sampleFontFace = editorSettings_.defaultFont.empty() ? L"Yu Gothic UI" : editorSettings_.defaultFont.c_str();
+            HFONT sampleFont = CreateFontW(22, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, sampleFontFace);
+            HFONT oldSampleFont = static_cast<HFONT>(SelectObject(hdc, sampleFont));
+            RECT sampleTextRect = { sampleFrame.left + 14, sampleFrame.top + 10, sampleFrame.right - 14, sampleFrame.bottom - 10 };
+            SetTextColor(hdc, RGB(244, 246, 250));
+            DrawWrappedText(hdc, sampleTextRect, L"見本 Aa あア 亜 Sample 0123", DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            SelectObject(hdc, oldSampleFont);
+            DeleteObject(sampleFont);
+            cursorY += 56;
+        }
+        drawRow(L"既定テキスト速度", std::to_wstring(editorSettings_.defaultTextSpeed) + L" ms", L"text_speed", true);
+        drawPlaceholder(L"今後追加", { L"名前欄フォント、UI用フォント、文字サイズセットをここへ追加予定です。" });
+    }
+    else if (selectedSettingsCategoryIndex_ == 4)
+    {
+        drawSectionTitle(L"メッセージウィンドウ");
+        drawToggleRow(L"枠表示", editorSettings_.defaultMessageWindowVisible ? L"表示" : L"非表示", L"msg_toggle", editorSettings_.defaultMessageWindowVisible ? L"隠す" : L"表示");
+        drawColorRow(L"背景色", editorSettings_.defaultMessageWindowColor, L"msg_color");
+        drawColorRow(L"枠線色", editorSettings_.defaultMessageWindowBorderColor, L"msg_border");
+        drawRow(L"枠透明度", std::to_wstring((editorSettings_.defaultMessageWindowOpacity * 100) / 255) + L"%", L"msg_opacity", true);
+        drawRow(L"本文余白", std::to_wstring(editorSettings_.defaultMessageWindowPadding) + L" px", L"msg_padding", true);
+        drawPathRow(L"枠画像", editorSettings_.defaultMessageWindowImage, L"msg_browse_image", L"msg_clear_image");
+        drawSectionTitle(L"名前欄");
+        drawToggleRow(L"名前欄表示", editorSettings_.defaultNameWindowVisible ? L"表示" : L"非表示", L"name_toggle", editorSettings_.defaultNameWindowVisible ? L"隠す" : L"表示");
+        drawColorRow(L"名前欄色", editorSettings_.defaultNameWindowColor, L"name_color_setting");
+        drawColorRow(L"名前欄枠線", editorSettings_.defaultNameWindowBorderColor, L"name_border_setting");
+        drawRow(L"横位置", std::to_wstring(editorSettings_.defaultNameWindowOffsetX) + L" px", L"name_x", true);
+        drawRow(L"縦位置", std::to_wstring(editorSettings_.defaultNameWindowOffsetY) + L" px", L"name_y", true);
+        drawRow(L"幅", std::to_wstring(editorSettings_.defaultNameWindowWidth) + L" px", L"name_width", true);
+        drawRow(L"高さ", std::to_wstring(editorSettings_.defaultNameWindowHeight) + L" px", L"name_height", true);
+        drawRow(L"透明度", std::to_wstring((editorSettings_.defaultNameWindowOpacity * 100) / 255) + L"%", L"name_opacity", true);
+        drawPathRow(L"名前欄画像", editorSettings_.defaultNameWindowImage, L"name_browse_image", L"name_clear_image");
+        drawPlaceholder(L"補足", { L"プリセット色から即時切替できます。", L"シナリオ内で個別指定した場合は、そのコマンド指定が優先されます。" });
+    }
+    else if (selectedSettingsCategoryIndex_ == 9)
+    {
+        drawSectionTitle(L"オーディオ");
+        drawRow(L"マスター音量", std::to_wstring(editorSettings_.masterVolume) + L"%", L"master", true);
+        drawRow(L"BGM音量", std::to_wstring(editorSettings_.bgmVolume) + L"%", L"bgm", true);
+        drawRow(L"SE音量", std::to_wstring(editorSettings_.seVolume) + L"%", L"se", true);
+        drawRow(L"ボイス音量", std::to_wstring(editorSettings_.voiceVolume) + L"%", L"voice", true);
+        drawPlaceholder(L"今後追加", { L"再生デバイス切替、試聴、カテゴリ別ミュートをここへ追加予定です。" });
+    }
+    else
+    {
+        drawPlaceholder(settingsCategories[selectedSettingsCategoryIndex_], { L"このカテゴリはまだ土台段階です。", L"左のカテゴリ切替と右のスクロール構造は先に有効化しています。" });
     }
 
-    settingsDialogRestoreRect_ = { settingsDialogRect_.left + 20, cursorY, settingsDialogRect_.left + 220, cursorY + 30 };
-    drawButton(settingsDialogRestoreRect_, L"オートセーブから復元", RGB(84, 104, 132), L"");
+    RestoreDC(hdc, savedDc);
+
+    const int contentHeight = cursorY - contentStartY + 8;
+    const int visibleHeight = contentInnerRect.bottom - contentInnerRect.top;
+    settingsScrollMax_ = (std::max)(0, contentHeight - visibleHeight);
+    settingsScrollOffset_ = (std::max)(0, (std::min)(settingsScrollOffset_, settingsScrollMax_));
+
+    HBRUSH trackBrush = CreateSolidBrush(RGB(32, 36, 42));
+    FillRect(hdc, &scrollTrackRect, trackBrush);
+    DeleteObject(trackBrush);
+    HBRUSH trackBorderBrush = CreateSolidBrush(RGB(82, 88, 96));
+    FrameRect(hdc, &scrollTrackRect, trackBorderBrush);
+    DeleteObject(trackBorderBrush);
+    if (settingsScrollMax_ > 0)
+    {
+        const int trackHeight = scrollTrackRect.bottom - scrollTrackRect.top - 4;
+        const int thumbHeight = (std::max)(28, (visibleHeight * trackHeight) / (contentHeight <= 0 ? 1 : contentHeight));
+        const int travel = (std::max)(1, trackHeight - thumbHeight);
+        const int thumbTop = scrollTrackRect.top + 2 + (settingsScrollOffset_ * travel) / settingsScrollMax_;
+        RECT thumbRect = { scrollTrackRect.left + 2, thumbTop, scrollTrackRect.right - 2, thumbTop + thumbHeight };
+        HBRUSH thumbBrush = CreateSolidBrush(RGB(118, 126, 136));
+        FillRect(hdc, &thumbRect, thumbBrush);
+        DeleteObject(thumbBrush);
+    }
 }
 
 COLORREF NovelRuntime::GetCommandAccentColor(const ScriptCommand& command) const
@@ -8521,6 +10799,7 @@ COLORREF NovelRuntime::GetCommandAccentColor(const ScriptCommand& command) const
     case ScriptCommand::Type::TextSpeed: return RGB(153, 120, 236);
     case ScriptCommand::Type::MessageFont: return RGB(153, 120, 236);
     case ScriptCommand::Type::MessageFontReset: return RGB(153, 120, 236);
+    case ScriptCommand::Type::MessageStyle: return RGB(153, 120, 236);
     case ScriptCommand::Type::TextColor: return RGB(153, 120, 236);
     case ScriptCommand::Type::NameColor: return RGB(153, 120, 236);
     case ScriptCommand::Type::NameWindow: return RGB(153, 120, 236);
@@ -8563,6 +10842,8 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
     materialPreviewRect_ = {};
     materialPreviewPlayRect_ = {};
     materialPreviewStopRect_ = {};
+    materialPreviewVolumeDownRect_ = {};
+    materialPreviewVolumeUpRect_ = {};
     if (paletteSections_.empty())
     {
         paletteSections_ =
@@ -8625,7 +10906,6 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
     const int sectionPadding = 10;
     const int buttonHeight = 34;
     const int buttonGap = 8;
-    const int buttonWidth = (panelRect.right - panelRect.left - 24 - buttonGap) / 2;
 
     if (leftPanelTab_ == LeftPanelTab::Materials)
     {
@@ -8796,35 +11076,55 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
                 RECT playRect = { materialPreviewRect_.left + 16, materialPreviewRect_.top + 58, materialPreviewRect_.left + 52, materialPreviewRect_.top + 82 };
                 RECT stopRect = { materialPreviewRect_.left + 56, materialPreviewRect_.top + 58, materialPreviewRect_.left + 92, materialPreviewRect_.top + 82 };
                 RECT speakerRect = { materialPreviewRect_.right - 38, materialPreviewRect_.top + 58, materialPreviewRect_.right - 16, materialPreviewRect_.top + 82 };
+                RECT volumeLabelRect = { materialPreviewRect_.left + 14, materialPreviewRect_.top + 92, materialPreviewRect_.left + 88, materialPreviewRect_.top + 116 };
+                RECT volumeDownRect = { materialPreviewRect_.left + 98, materialPreviewRect_.top + 90, materialPreviewRect_.left + 126, materialPreviewRect_.top + 114 };
+                RECT volumeValueRect = { materialPreviewRect_.left + 130, materialPreviewRect_.top + 90, materialPreviewRect_.left + 186, materialPreviewRect_.top + 114 };
+                RECT volumeUpRect = { materialPreviewRect_.left + 190, materialPreviewRect_.top + 90, materialPreviewRect_.left + 218, materialPreviewRect_.top + 114 };
                 materialPreviewPlayRect_ = playRect;
                 materialPreviewStopRect_ = stopRect;
+                materialPreviewVolumeDownRect_ = volumeDownRect;
+                materialPreviewVolumeUpRect_ = volumeUpRect;
                 SetTextColor(hdc, RGB(66, 70, 76));
                 DrawWrappedText(hdc, titleRect, selectedAssetLabel_.empty() ? L"音声プレビュー" : selectedAssetLabel_, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
                 HBRUSH playBrush = CreateSolidBrush(RGB(244, 244, 240));
                 FillRect(hdc, &playRect, playBrush);
                 FillRect(hdc, &stopRect, playBrush);
+                FillRect(hdc, &volumeDownRect, playBrush);
+                FillRect(hdc, &volumeUpRect, playBrush);
                 DeleteObject(playBrush);
                 FrameRect(hdc, &playRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
                 FrameRect(hdc, &stopRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+                FrameRect(hdc, &volumeDownRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+                FrameRect(hdc, &volumeUpRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
                 DrawWrappedText(hdc, playRect, L"\u25b6", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                 DrawWrappedText(hdc, stopRect, L"\u25a0", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                DrawWrappedText(hdc, volumeLabelRect, L"音量", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                DrawWrappedText(hdc, volumeDownRect, L"-", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                DrawWrappedText(hdc, volumeValueRect, std::to_wstring(assetPreviewVolume_) + L"%", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                DrawWrappedText(hdc, volumeUpRect, L"+", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                 HBRUSH barBrush = CreateSolidBrush(RGB(108, 112, 118));
                 FillRect(hdc, &barRect, barBrush);
                 DeleteObject(barBrush);
                 DrawWrappedText(hdc, speakerRect, L"VOL", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                 RECT hintRect = { materialPreviewRect_.left + 14, materialPreviewRect_.bottom - 28, materialPreviewRect_.right - 14, materialPreviewRect_.bottom - 10 };
                 SetTextColor(hdc, RGB(84, 88, 92));
-                DrawWrappedText(hdc, hintRect, L"再生 / 停止 で音声プレビューを操作します", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                DrawWrappedText(hdc, hintRect, L"再生 / 停止 / 音量調整で素材プレビューを操作します", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             }
         }
     }
     else if (leftPanelTab_ == LeftPanelTab::Scenario)
     {
-        RECT titleRect = { panelRect.left + 12, cursorY, panelRect.left + 90, cursorY + 24 };
-        RECT addButtonRect = { panelRect.left + 92, cursorY - 2, panelRect.left + 160, cursorY + 24 };
-        RECT renameButtonRect = { panelRect.left + 164, cursorY - 2, panelRect.left + 232, cursorY + 24 };
-        RECT duplicateButtonRect = { panelRect.left + 236, cursorY - 2, panelRect.left + 304, cursorY + 24 };
-        RECT deleteButtonRect = { panelRect.left + 308, cursorY - 2, panelRect.left + 376, cursorY + 24 };
+        const int contentLeft = panelRect.left + 12;
+        const int contentRight = panelRect.right - 12;
+        const int headerWidth = 74;
+        const int buttonGap = 8;
+        const int availableWidth = contentRight - (contentLeft + headerWidth + 8);
+        const int buttonWidth = (std::max)(56, (availableWidth - buttonGap) / 2);
+        RECT titleRect = { contentLeft, cursorY, contentLeft + headerWidth, cursorY + 24 };
+        RECT addButtonRect = { titleRect.right + 8, cursorY - 2, titleRect.right + 8 + buttonWidth, cursorY + 24 };
+        RECT renameButtonRect = { addButtonRect.right + buttonGap, cursorY - 2, addButtonRect.right + buttonGap + buttonWidth, cursorY + 24 };
+        RECT duplicateButtonRect = { addButtonRect.left, cursorY + 28, addButtonRect.left + buttonWidth, cursorY + 54 };
+        RECT deleteButtonRect = { renameButtonRect.left, cursorY + 28, renameButtonRect.left + buttonWidth, cursorY + 54 };
         SetTextColor(hdc, RGB(228, 228, 224));
         DrawWrappedText(hdc, titleRect, L"シナリオ", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         const struct { RECT rect; const wchar_t* label; COLORREF fill; } sceneActions[] =
@@ -8847,7 +11147,7 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
         sceneRenameRect_ = renameButtonRect;
         sceneDuplicateRect_ = duplicateButtonRect;
         sceneDeleteRect_ = deleteButtonRect;
-        cursorY += 34;
+        cursorY += 64;
 
         RECT searchRect = { panelRect.left + 12, cursorY, panelRect.right - 44, cursorY + 30 };
         RECT searchButtonRect = { panelRect.right - 40, cursorY, panelRect.right - 12, cursorY + 30 };
@@ -8921,7 +11221,7 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
             { L"演出", RGB(50, 147, 255), { { L"ウェイト", ScriptCommand::Type::Wait }, { L"フェード", ScriptCommand::Type::Fade }, { L"トランジション", ScriptCommand::Type::Transition }, { L"ズーム", ScriptCommand::Type::Zoom }, { L"パン", ScriptCommand::Type::Pan }, { L"画面揺れ", ScriptCommand::Type::Shake }, { L"フラッシュ", ScriptCommand::Type::Flash }, { L"画面色調", ScriptCommand::Type::Tint }, { L"テキスト消去", ScriptCommand::Type::ClearText } } },
             { L"キャラクター", RGB(241, 172, 59), { { L"登場", ScriptCommand::Type::Character }, { L"退場", ScriptCommand::Type::HideCharacter }, { L"話者設定", ScriptCommand::Type::Speaker }, { L"話者クリア", ScriptCommand::Type::ClearSpeaker } } },
             { L"背景・画像", RGB(120, 201, 63), { { L"背景変更", ScriptCommand::Type::Background }, { L"タイトル", ScriptCommand::Type::Title } } },
-            { L"メッセージ", RGB(153, 120, 236), { { L"メッセージ枠表示", ScriptCommand::Type::MessageWindow }, { L"テキスト消去", ScriptCommand::Type::ClearText }, { L"改ページ", ScriptCommand::Type::PageBreak }, { L"テキスト速度", ScriptCommand::Type::TextSpeed }, { L"フォント", ScriptCommand::Type::MessageFont }, { L"フォントリセット", ScriptCommand::Type::MessageFontReset }, { L"本文色", ScriptCommand::Type::TextColor }, { L"名前色", ScriptCommand::Type::NameColor }, { L"名前欄", ScriptCommand::Type::NameWindow }, { L"縦書き", ScriptCommand::Type::VerticalText } } },
+            { L"メッセージ", RGB(153, 120, 236), { { L"メッセージ枠表示", ScriptCommand::Type::MessageWindow }, { L"テキスト消去", ScriptCommand::Type::ClearText }, { L"改ページ", ScriptCommand::Type::PageBreak }, { L"テキスト速度", ScriptCommand::Type::TextSpeed }, { L"フォント", ScriptCommand::Type::MessageFont }, { L"フォントリセット", ScriptCommand::Type::MessageFontReset }, { L"メッセージUI", ScriptCommand::Type::MessageStyle }, { L"本文色", ScriptCommand::Type::TextColor }, { L"名前色", ScriptCommand::Type::NameColor }, { L"名前欄", ScriptCommand::Type::NameWindow }, { L"縦書き", ScriptCommand::Type::VerticalText } } },
             { L"サウンド", RGB(146, 122, 234), { { L"BGM", ScriptCommand::Type::Bgm }, { L"SE", ScriptCommand::Type::Se }, { L"ボイス", ScriptCommand::Type::Voice }, { L"BGM停止", ScriptCommand::Type::StopBgm } } },
             { L"システム", RGB(255, 148, 66), { { L"変数設定", ScriptCommand::Type::SetValue }, { L"変数加算", ScriptCommand::Type::AddValue }, { L"条件分岐", ScriptCommand::Type::IfJump } } },
         };
@@ -8942,10 +11242,17 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
         for (const auto& section : sections)
         {
             const int itemCount = static_cast<int>(section.items.size());
-            const int rows = (itemCount + 1) / 2;
             PaletteSectionItem& sectionState = paletteSections_[&section - sections];
+            const int cardInnerWidth = (panelRect.right - panelRect.left) - 44;
+            const int columnCount = cardInnerWidth < 240 ? 1 : 2;
+            const int rows = itemCount > 0 ? (itemCount + columnCount - 1) / columnCount : 0;
+            const int buttonWidth = columnCount == 1
+                ? cardInnerWidth
+                : (std::max)(56, (cardInnerWidth - buttonGap) / columnCount);
             const int sectionHeight = sectionState.expanded ? 30 + sectionPadding * 2 + rows * buttonHeight + (rows - 1) * buttonGap : 32;
             RECT cardRect = { panelRect.left + 12, cursorY, panelRect.right - 12, cursorY + sectionHeight };
+            const int innerLeft = cardRect.left + 10;
+            const int innerRight = cardRect.right - 10;
             sectionState.rect = cardRect;
             sectionState.toggleRect = { cardRect.right - 28, cardRect.top + 2, cardRect.right - 8, cardRect.top + 22 };
 
@@ -8956,12 +11263,13 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
             FrameRect(hdc, &cardRect, cardFrameBrush);
             DeleteObject(cardFrameBrush);
 
-            RECT titleBand = { cardRect.left, cardRect.top, cardRect.left + 96, cardRect.top + 24 };
+            const int titleBandWidth = (std::min)(120, (std::max)(80, static_cast<int>(cardRect.right - cardRect.left - 32)));
+            RECT titleBand = { cardRect.left, cardRect.top, cardRect.left + titleBandWidth, cardRect.top + 24 };
             HBRUSH titleBrush = CreateSolidBrush(section.color);
             FillRect(hdc, &titleBand, titleBrush);
             DeleteObject(titleBrush);
             SetTextColor(hdc, RGB(255, 255, 255));
-            DrawWrappedText(hdc, titleBand, section.title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            DrawWrappedText(hdc, titleBand, section.title, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             SetTextColor(hdc, RGB(205, 212, 220));
             DrawWrappedText(hdc, sectionState.toggleRect, sectionState.expanded ? L"\u25b2" : L"\u25bc", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
@@ -8974,15 +11282,16 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
             int itemIndex = 0;
             for (const auto& item : section.items)
             {
-                const int column = itemIndex % 2;
-                const int row = itemIndex / 2;
+                const int column = itemIndex % columnCount;
+                const int row = itemIndex / columnCount;
                 RECT buttonRect =
                 {
-                    cardRect.left + 10 + column * (buttonWidth + buttonGap),
+                    innerLeft + column * (buttonWidth + buttonGap),
                     cardRect.top + 34 + row * (buttonHeight + buttonGap),
-                    cardRect.left + 10 + column * (buttonWidth + buttonGap) + buttonWidth,
+                    innerLeft + column * (buttonWidth + buttonGap) + buttonWidth,
                     cardRect.top + 34 + row * (buttonHeight + buttonGap) + buttonHeight
                 };
+                buttonRect.right = (std::min<LONG>)(buttonRect.right, static_cast<LONG>(innerRight));
                 HBRUSH buttonBrush = CreateSolidBrush(RGB(40, 46, 54));
                 FillRect(hdc, &buttonRect, buttonBrush);
                 DeleteObject(buttonBrush);
@@ -8995,7 +11304,7 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
 
                 RECT labelRect = { buttonRect.left + 34, buttonRect.top, buttonRect.right - 8, buttonRect.bottom };
                 SetTextColor(hdc, RGB(220, 225, 232));
-                DrawWrappedText(hdc, labelRect, item.first, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                DrawWrappedText(hdc, labelRect, item.first, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
                 paletteButtons_.push_back(PaletteButtonItem{ item.first, item.second, buttonRect });
                 ++itemIndex;
             }
@@ -9204,6 +11513,7 @@ std::wstring NovelRuntime::GetCommandTypeLabel(const ScriptCommand& command) con
     case ScriptCommand::Type::TextSpeed: return L"\u30c6\u30ad\u30b9\u30c8\u901f\u5ea6";
     case ScriptCommand::Type::MessageFont: return L"\u30d5\u30a9\u30f3\u30c8";
     case ScriptCommand::Type::MessageFontReset: return L"\u30d5\u30a9\u30f3\u30c8\u30ea\u30bb\u30c3\u30c8";
+    case ScriptCommand::Type::MessageStyle: return L"メッセージUI";
     case ScriptCommand::Type::TextColor: return L"本文色";
     case ScriptCommand::Type::NameColor: return L"名前色";
     case ScriptCommand::Type::NameWindow: return L"名前欄";
@@ -9256,13 +11566,20 @@ std::wstring NovelRuntime::GetCommandSummary(const ScriptCommand& command) const
     {
         return L"標準フォントへ戻す";
     }
+    if (command.type == ScriptCommand::Type::MessageStyle)
+    {
+        const std::wstring image = GetCommandParameter(command, L"image");
+        return L"色 " + GetCommandParameter(command, L"color") + L" / " + GetCommandParameter(command, L"opacity") + L"%"
+            + (image.empty() ? L"" : L" / 画像あり");
+    }
     if (command.type == ScriptCommand::Type::TextColor || command.type == ScriptCommand::Type::NameColor)
     {
         return GetCommandParameter(command, L"color");
     }
     if (command.type == ScriptCommand::Type::NameWindow)
     {
-        return ParseBoolValue(GetCommandParameter(command, L"visible"), true) ? L"表示" : L"非表示";
+        const std::wstring mode = ParseBoolValue(GetCommandParameter(command, L"visible"), true) ? L"表示" : L"非表示";
+        return mode + L" / (" + GetCommandParameter(command, L"x") + L"," + GetCommandParameter(command, L"y") + L")";
     }
     if (command.type == ScriptCommand::Type::VerticalText)
     {
@@ -9681,10 +11998,63 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
         else if (command.type == ScriptCommand::Type::MessageFont)
         {
             drawEditable(selectedCommandIndex_, L"フォント名", L"face", GetCommandParameter(command, L"face"));
+            RECT cycleTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+            RECT cycleButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+            const std::wstring fontInfo = availableFonts_.empty() ? L"assets/fonts にフォントがありません" : L"候補数: " + std::to_wstring(availableFonts_.size());
+            SetTextColor(hdc, RGB(205, 214, 222));
+            DrawWrappedText(hdc, cycleTextRect, fontInfo, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            drawActionButton(cycleButtonRect, L"選択", RGB(58, 88, 118));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"cycle_message_font", selectedCommandIndex_, 0, cycleButtonRect });
+            cursorY += lineHeight;
+
+            std::wstring previewFace = GetCommandParameter(command, L"face");
+            if (previewFace.empty())
+            {
+                previewFace = editorSettings_.defaultFont.empty() ? messageFontFace_ : editorSettings_.defaultFont;
+            }
+            if (previewFace.empty())
+            {
+                previewFace = L"Yu Gothic UI";
+            }
+
+            RECT sampleFrame = { panelRect.left + 20, cursorY, panelRect.right - 20, cursorY + 52 };
+            HBRUSH sampleBrush = CreateSolidBrush(RGB(28, 34, 42));
+            FillRect(hdc, &sampleFrame, sampleBrush);
+            DeleteObject(sampleBrush);
+            HBRUSH sampleBorder = CreateSolidBrush(RGB(74, 82, 92));
+            FrameRect(hdc, &sampleFrame, sampleBorder);
+            DeleteObject(sampleBorder);
+
+            HFONT sampleFont = CreateFontW(20, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                DEFAULT_PITCH | FF_DONTCARE, previewFace.c_str());
+            HFONT oldSampleFont = static_cast<HFONT>(SelectObject(hdc, sampleFont));
+            RECT sampleTextRect = { sampleFrame.left + 12, sampleFrame.top + 10, sampleFrame.right - 12, sampleFrame.bottom - 10 };
+            SetTextColor(hdc, RGB(244, 246, 250));
+            DrawWrappedText(hdc, sampleTextRect, L"見本 Aa あア 亜 Sample 0123", DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            SelectObject(hdc, oldSampleFont);
+            DeleteObject(sampleFont);
+            cursorY += 60;
         }
         else if (command.type == ScriptCommand::Type::MessageFontReset)
         {
             drawLine(L"標準フォントへ戻します。", RGB(205, 214, 222));
+        }
+        else if (command.type == ScriptCommand::Type::MessageStyle)
+        {
+            drawEditable(selectedCommandIndex_, L"背景色", L"color", GetCommandParameter(command, L"color"));
+            drawEditable(selectedCommandIndex_, L"枠線色", L"border", GetCommandParameter(command, L"border"));
+            drawEditable(selectedCommandIndex_, L"透明度(%)", L"opacity", GetCommandParameter(command, L"opacity"));
+            drawEditable(selectedCommandIndex_, L"余白", L"padding", GetCommandParameter(command, L"padding"));
+            drawEditable(selectedCommandIndex_, L"画像", L"image", GetCommandParameter(command, L"image"));
+            RECT browseRect = { panelRect.left + 20, cursorY, panelRect.left + 92, cursorY + 28 };
+            RECT clearRect = { panelRect.left + 100, cursorY, panelRect.left + 172, cursorY + 28 };
+            drawActionButton(browseRect, L"参照", RGB(58, 88, 118));
+            drawActionButton(clearRect, L"解除", RGB(112, 62, 70));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"browse_message_image", selectedCommandIndex_, 0, browseRect });
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"clear_message_image", selectedCommandIndex_, 0, clearRect });
+            cursorY += 36;
+            drawLine(L"プレビューを開いたまま編集すると即時反映されます。", RGB(180, 188, 196));
         }
         else if (command.type == ScriptCommand::Type::TextColor)
         {
@@ -9697,6 +12067,23 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
         else if (command.type == ScriptCommand::Type::NameWindow)
         {
             drawEditable(selectedCommandIndex_, L"表示", L"visible", GetCommandParameter(command, L"visible"));
+            drawEditable(selectedCommandIndex_, L"横位置", L"x", GetCommandParameter(command, L"x"));
+            drawEditable(selectedCommandIndex_, L"縦位置", L"y", GetCommandParameter(command, L"y"));
+            drawEditable(selectedCommandIndex_, L"幅", L"width", GetCommandParameter(command, L"width"));
+            drawEditable(selectedCommandIndex_, L"高さ", L"height", GetCommandParameter(command, L"height"));
+            drawEditable(selectedCommandIndex_, L"余白", L"padding", GetCommandParameter(command, L"padding"));
+            drawEditable(selectedCommandIndex_, L"背景色", L"color", GetCommandParameter(command, L"color"));
+            drawEditable(selectedCommandIndex_, L"枠線色", L"border", GetCommandParameter(command, L"border"));
+            drawEditable(selectedCommandIndex_, L"透明度(%)", L"opacity", GetCommandParameter(command, L"opacity"));
+            drawEditable(selectedCommandIndex_, L"画像", L"image", GetCommandParameter(command, L"image"));
+            RECT browseRect = { panelRect.left + 20, cursorY, panelRect.left + 92, cursorY + 28 };
+            RECT clearRect = { panelRect.left + 100, cursorY, panelRect.left + 172, cursorY + 28 };
+            drawActionButton(browseRect, L"参照", RGB(58, 88, 118));
+            drawActionButton(clearRect, L"解除", RGB(112, 62, 70));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"browse_name_image", selectedCommandIndex_, 0, browseRect });
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"clear_name_image", selectedCommandIndex_, 0, clearRect });
+            cursorY += 36;
+            drawLine(L"話者名をメッセージウィンドウ左上基準で表示します。", RGB(180, 188, 196));
         }
         else if (command.type == ScriptCommand::Type::VerticalText)
         {
@@ -9722,6 +12109,13 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawEditable(selectedCommandIndex_, L"時間(ms)", L"time", GetCommandParameter(command, L"time"));
             drawEditable(selectedCommandIndex_, L"色", L"color", GetCommandParameter(command, L"color"));
             drawEditable(selectedCommandIndex_, L"不透明度", L"opacity", GetCommandParameter(command, L"opacity"));
+            RECT targetTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+            RECT targetButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+            SetTextColor(hdc, RGB(205, 214, 222));
+            DrawWrappedText(hdc, targetTextRect, L"対象: " + GetEffectTargetLabel(GetCommandParameter(command, L"target")), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            drawActionButton(targetButtonRect, L"切替", RGB(58, 88, 118));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"fade_cycle_target", selectedCommandIndex_, 0, targetButtonRect });
+            cursorY += lineHeight;
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
         }
         else if (command.type == ScriptCommand::Type::Transition)
@@ -9729,6 +12123,13 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawEditable(selectedCommandIndex_, L"時間(ms)", L"time", GetCommandParameter(command, L"time"));
             drawEditable(selectedCommandIndex_, L"種類", L"style", GetCommandParameter(command, L"style"));
             drawEditable(selectedCommandIndex_, L"色", L"color", GetCommandParameter(command, L"color"));
+            RECT targetTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+            RECT targetButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+            SetTextColor(hdc, RGB(205, 214, 222));
+            DrawWrappedText(hdc, targetTextRect, L"対象: " + GetEffectTargetLabel(GetCommandParameter(command, L"target")), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            drawActionButton(targetButtonRect, L"切替", RGB(58, 88, 118));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"fade_cycle_target", selectedCommandIndex_, 0, targetButtonRect });
+            cursorY += lineHeight;
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
         }
         else if (command.type == ScriptCommand::Type::Zoom)
@@ -9758,7 +12159,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
         }
         else if (command.type == ScriptCommand::Type::Choice)
         {
-            drawEditable(selectedCommandIndex_, L"雉ｪ蝠乗枚", L"prompt", GetCommandParameter(command, L"prompt"));
+            drawEditable(selectedCommandIndex_, L"選択肢文", L"prompt", GetCommandParameter(command, L"prompt"));
             cursorY += 8;
             drawLine(L"\u9078\u629e\u80a2GUI", RGB(255, 225, 160));
             for (size_t linkIndex = 0; linkIndex < command.links.size(); ++linkIndex)
@@ -9771,7 +12172,14 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
                 drawLine(std::to_wstring(linkIndex + 1) + L". \u679d", linkIndex == selectedChoiceLinkIndex_ ? RGB(255, 225, 160) : RGB(205, 214, 222));
                 drawEditable(selectedCommandIndex_, L"\u6587\u8a00", L"__choice_text_" + std::to_wstring(linkIndex), link.first);
                 drawEditable(selectedCommandIndex_, L"\u9077\u79fb\u5148", L"__choice_target_" + std::to_wstring(linkIndex), link.second);
-                drawEditable(selectedCommandIndex_, L"条件変数", GetChoiceParamKey(L"__choice_cond_name_", linkIndex), conditionName);
+                RECT condVarTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+                RECT condVarButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+                SetTextColor(hdc, RGB(205, 214, 222));
+                DrawWrappedText(hdc, condVarTextRect, L"条件変数: " + (conditionName.empty() ? L"(未設定)" : conditionName), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                drawActionButton(condVarButtonRect, L"切替", RGB(58, 88, 118));
+                inspectorActionTargets_.push_back(InspectorActionTarget{ L"choice_cycle_var", selectedCommandIndex_, linkIndex, condVarButtonRect });
+                cursorY += lineHeight;
+                drawEditable(selectedCommandIndex_, L"条件変数名", GetChoiceParamKey(L"__choice_cond_name_", linkIndex), conditionName);
                 RECT opTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
                 RECT opButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
                 SetTextColor(hdc, RGB(205, 214, 222));
@@ -9803,6 +12211,13 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
         }
         else if (command.type == ScriptCommand::Type::IfJump)
         {
+            RECT varTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+            RECT varButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+            SetTextColor(hdc, RGB(205, 214, 222));
+            DrawWrappedText(hdc, varTextRect, L"変数名: " + GetCommandParameter(command, L"name"), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            drawActionButton(varButtonRect, L"切替", RGB(58, 88, 118));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"if_cycle_var", selectedCommandIndex_, 0, varButtonRect });
+            cursorY += lineHeight;
             drawEditable(selectedCommandIndex_, L"\u5909\u6570\u540d", L"name", GetCommandParameter(command, L"name"));
             RECT opTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
             RECT opButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };

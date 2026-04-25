@@ -39,6 +39,9 @@ IDC_KAKTOSENGINE MENU
 BEGIN
     POPUP "ファイル(&F)"
     BEGIN
+        MENUITEM "新規プロジェクト(&N)",        IDM_PROJECT_NEW
+        MENUITEM "プロジェクトを開く(&O)...",   IDM_PROJECT_OPEN
+        MENUITEM SEPARATOR
         MENUITEM "終了する(&X)",                IDM_EXIT
     END
     POPUP "表示(&V)"
