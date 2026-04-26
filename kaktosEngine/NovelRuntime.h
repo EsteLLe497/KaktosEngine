@@ -42,6 +42,7 @@ struct AssetListItem
 struct CharacterSlot
 {
     std::wstring slotName;
+    std::wstring characterId;
     std::wstring displayName;
     std::wstring imagePath;
     std::unique_ptr<Gdiplus::Image> image;
@@ -327,6 +328,13 @@ private:
     void ApplyShakeCommand(const ScriptCommand& command);
     void ApplyFadeCommand(const ScriptCommand& command);
     void ApplyTransitionCommand(const ScriptCommand& command);
+    bool CharacterSlotMatchesFadeTarget(const CharacterSlot& slot, const std::wstring& target) const;
+    bool IsCharacterFadeTargetVisible(const std::wstring& target) const;
+    void StartFadeRuntime(int duration, COLORREF color, int opacity, const std::wstring& target, bool waitForCompletion);
+    void StartPendingCharacterFadeIfMatched(const CharacterSlot& slot);
+    void StartCharacterAlphaFade(const std::wstring& target, bool fadeOut, int duration, bool waitForCompletion);
+    void CompletePendingCharacterHide();
+    void ClearCharacterSlot(CharacterSlot& slot);
     void ApplyZoomCommand(const ScriptCommand& command);
     void ApplyPanCommand(const ScriptCommand& command);
     void ApplyFlashCommand(const ScriptCommand& command);
@@ -351,7 +359,7 @@ private:
     std::unique_ptr<Gdiplus::Image> TryLoadImage(const std::wstring& fullPath) const;
     void DrawWrappedText(HDC hdc, const RECT& bounds, const std::wstring& text, UINT format) const;
     void DrawVerticalText(HDC hdc, const RECT& bounds, const std::wstring& text, int lineHeight) const;
-    void DrawCharacterSlot(HDC hdc, const RECT& stageRect, CharacterSlot& slot, int centerX) const;
+    void DrawCharacterSlot(HDC hdc, const RECT& stageRect, const CharacterSlot& slot, int centerX) const;
     void DrawChoices(HDC hdc, const RECT& messageRect);
     void PushBacklogEntry(const std::wstring& speaker, const std::wstring& text);
     void PushVariableHistory(const std::wstring& entry);
@@ -434,7 +442,7 @@ private:
     bool LoadRuntimeStateFromDialog();
     bool SaveRuntimeStateToPath(const std::wstring& savePath);
     bool LoadRuntimeStateFromPath(const std::wstring& savePath);
-    void ApplyLoadedCharacterState(CharacterSlot& slot, const std::wstring& slotName, const std::wstring& displayName, const std::wstring& imagePath);
+    void ApplyLoadedCharacterState(CharacterSlot& slot, const std::wstring& slotName, const std::wstring& characterId, const std::wstring& displayName, const std::wstring& imagePath);
     void LoadProjectSettings(const std::wstring& projectPath);
     void ApplyEditorUiDefaults();
     std::wstring MakeProjectRelativeAssetPath(const std::wstring& fullPath) const;
@@ -503,6 +511,9 @@ private:
     CharacterDefinition* FindCharacterDefinition(const std::wstring& id);
     std::wstring GetCharacterDefinitionLabel(const CharacterDefinition& definition) const;
     std::wstring GetEffectTargetLabel(const std::wstring& target) const;
+    std::wstring ShowEffectTargetSelectionMenu(POINT point, const std::wstring& currentTarget) const;
+    std::wstring ShowLabelSelectionMenu(POINT point, const std::wstring& currentTarget) const;
+    std::wstring ShowCharacterTagSelectionMenu(POINT point, const std::wstring& currentTag) const;
     void SyncVariableDefinitions();
     std::wstring ShowVariableSelectionMenu(POINT point, const std::wstring& currentName) const;
     std::wstring ShowFontSelectionMenu(POINT point, const std::wstring& currentName) const;
@@ -747,6 +758,16 @@ private:
     COLORREF fadeColor_ = RGB(0, 0, 0);
     int fadeOpacity_ = 255;
     std::wstring fadeTarget_ = L"stage";
+    std::wstring pendingCharacterFadeTarget_;
+    COLORREF pendingCharacterFadeColor_ = RGB(0, 0, 0);
+    int pendingCharacterFadeOpacity_ = 255;
+    int pendingCharacterFadeDuration_ = 0;
+    bool pendingCharacterFadeWait_ = false;
+    DWORD characterFadeStartTick_ = 0;
+    DWORD characterFadeEndTick_ = 0;
+    std::wstring characterFadeTarget_;
+    bool characterFadeOut_ = false;
+    std::wstring pendingHideCharacterTarget_;
     DWORD shakeEndTick_ = 0;
     int shakePower_ = 0;
     DWORD flashStartTick_ = 0;
@@ -808,6 +829,8 @@ private:
     POINT lastMousePoint_ = {};
     int adjustStartX_ = 0;
     int adjustStartY_ = 0;
+    int activeChoiceOffsetX_ = 0;
+    int activeChoiceOffsetY_ = 0;
     int hoveredToolbarIndex_ = -1;
     DWORD autoAdvanceTick_ = 0;
     WINDOWPLACEMENT windowedPlacement_ = { sizeof(WINDOWPLACEMENT) };

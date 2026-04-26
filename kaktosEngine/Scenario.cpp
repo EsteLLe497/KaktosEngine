@@ -334,10 +334,18 @@ std::wstring SerializeScenario(const ScenarioDocument& document)
             output += AppendAttribute(L"y", command.parameters.count(L"y") ? command.parameters.at(L"y") : L"");
             output += AppendAttribute(L"scale", command.parameters.count(L"scale") ? command.parameters.at(L"scale") : L"");
             output += AppendAttribute(L"opacity", command.parameters.count(L"opacity") ? command.parameters.at(L"opacity") : L"");
+            output += AppendAttribute(L"fade", command.parameters.count(L"fade") ? command.parameters.at(L"fade") : L"");
+            output += AppendAttribute(L"fade_time", command.parameters.count(L"fade_time") ? command.parameters.at(L"fade_time") : L"");
+            output += AppendAttribute(L"fade_wait", command.parameters.count(L"fade_wait") ? command.parameters.at(L"fade_wait") : L"");
             output += L"]\r\n";
             break;
         case ScriptCommand::Type::HideCharacter:
-            output += L"[hidech" + AppendAttribute(L"pos", command.parameters.count(L"pos") ? command.parameters.at(L"pos") : L"") + L"]\r\n";
+            output += L"[hidech";
+            output += AppendAttribute(L"pos", command.parameters.count(L"pos") ? command.parameters.at(L"pos") : L"");
+            output += AppendAttribute(L"fade", command.parameters.count(L"fade") ? command.parameters.at(L"fade") : L"");
+            output += AppendAttribute(L"fade_time", command.parameters.count(L"fade_time") ? command.parameters.at(L"fade_time") : L"");
+            output += AppendAttribute(L"fade_wait", command.parameters.count(L"fade_wait") ? command.parameters.at(L"fade_wait") : L"");
+            output += L"]\r\n";
             break;
         case ScriptCommand::Type::Speaker:
             output += L"[speaker" + AppendAttribute(L"name", command.parameters.count(L"name") ? command.parameters.at(L"name") : L"") + L"]\r\n";
@@ -346,10 +354,21 @@ std::wstring SerializeScenario(const ScenarioDocument& document)
             output += L"[clear_speaker]\r\n";
             break;
         case ScriptCommand::Type::Text:
-            output += L"[text" + AppendAttribute(L"value", command.parameters.count(L"value") ? command.parameters.at(L"value") : L"") + L"]\r\n";
+            output += L"[text";
+            output += AppendAttribute(L"value", command.parameters.count(L"value") ? command.parameters.at(L"value") : L"");
+            output += AppendAttribute(L"name_visible", command.parameters.count(L"name_visible") ? command.parameters.at(L"name_visible") : L"");
+            output += AppendAttribute(L"name_target", command.parameters.count(L"name_target") ? command.parameters.at(L"name_target") : L"");
+            output += AppendAttribute(L"name_x", command.parameters.count(L"name_x") ? command.parameters.at(L"name_x") : L"");
+            output += AppendAttribute(L"name_y", command.parameters.count(L"name_y") ? command.parameters.at(L"name_y") : L"");
+            output += AppendAttribute(L"name_image", command.parameters.count(L"name_image") ? command.parameters.at(L"name_image") : L"");
+            output += L"]\r\n";
             break;
         case ScriptCommand::Type::Choice:
-            output += L"[choice" + AppendAttribute(L"prompt", command.parameters.count(L"prompt") ? command.parameters.at(L"prompt") : L"") + L"]\r\n";
+            output += L"[choice";
+            output += AppendAttribute(L"prompt", command.parameters.count(L"prompt") ? command.parameters.at(L"prompt") : L"");
+            output += AppendAttribute(L"x", command.parameters.count(L"x") ? command.parameters.at(L"x") : L"");
+            output += AppendAttribute(L"y", command.parameters.count(L"y") ? command.parameters.at(L"y") : L"");
+            output += L"]\r\n";
             for (const auto& link : command.links)
             {
                 output += L"[option" + AppendAttribute(L"text", link.first) + AppendAttribute(L"target", link.second) + L"]\r\n";
@@ -547,6 +566,9 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
             SetCommandParameter(command, L"y", GetAttributeValue(body, L"y"));
             SetCommandParameter(command, L"scale", GetAttributeValue(body, L"scale"));
             SetCommandParameter(command, L"opacity", GetAttributeValue(body, L"opacity"));
+            SetCommandParameter(command, L"fade", GetAttributeValue(body, L"fade"));
+            SetCommandParameter(command, L"fade_time", GetAttributeValue(body, L"fade_time"));
+            SetCommandParameter(command, L"fade_wait", GetAttributeValue(body, L"fade_wait"));
             document.commands.push_back(std::move(command));
             continue;
         }
@@ -570,6 +592,9 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
         {
             ScriptCommand command = MakeCommand(ScriptCommand::Type::HideCharacter, lineNumber);
             SetCommandParameter(command, L"pos", GetAttributeValue(body, L"pos"));
+            SetCommandParameter(command, L"fade", GetAttributeValue(body, L"fade"));
+            SetCommandParameter(command, L"fade_time", GetAttributeValue(body, L"fade_time"));
+            SetCommandParameter(command, L"fade_wait", GetAttributeValue(body, L"fade_wait"));
             document.commands.push_back(std::move(command));
             continue;
         }
@@ -592,6 +617,11 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
         {
             ScriptCommand command = MakeCommand(ScriptCommand::Type::Text, lineNumber);
             SetCommandParameter(command, L"value", GetAttributeValue(body, L"value"));
+            SetCommandParameter(command, L"name_visible", GetAttributeValue(body, L"name_visible"));
+            SetCommandParameter(command, L"name_target", GetAttributeValue(body, L"name_target"));
+            SetCommandParameter(command, L"name_x", GetAttributeValue(body, L"name_x"));
+            SetCommandParameter(command, L"name_y", GetAttributeValue(body, L"name_y"));
+            SetCommandParameter(command, L"name_image", GetAttributeValue(body, L"name_image"));
             document.commands.push_back(std::move(command));
             continue;
         }
@@ -600,6 +630,8 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
         {
             ScriptCommand command = MakeCommand(ScriptCommand::Type::Choice, lineNumber);
             SetCommandParameter(command, L"prompt", GetAttributeValue(body, L"prompt"));
+            SetCommandParameter(command, L"x", GetAttributeValue(body, L"x"));
+            SetCommandParameter(command, L"y", GetAttributeValue(body, L"y"));
 
             while (std::getline(input, line))
             {

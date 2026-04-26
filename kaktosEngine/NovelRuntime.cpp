@@ -1344,7 +1344,7 @@ std::unique_ptr<Gdiplus::Image> NovelRuntime::TryLoadImage(const std::wstring& f
     }
 
     auto image = std::make_unique<Gdiplus::Image>(fullPath.c_str());
-    if (image->GetLastStatus() != Gdiplus::Ok)
+    if (image->GetLastStatus() != Gdiplus::Ok || image->GetWidth() == 0 || image->GetHeight() == 0)
     {
         return nullptr;
     }
@@ -1535,6 +1535,7 @@ void NovelRuntime::ApplyCharacterCommand(const ScriptCommand& command)
     }
 
     const CharacterDefinition* definition = FindCharacterDefinition(name);
+    slot->characterId = name;
     slot->displayName = name;
     slot->imagePath.clear();
     slot->image.reset();
@@ -1547,6 +1548,20 @@ void NovelRuntime::ApplyCharacterCommand(const ScriptCommand& command)
     {
         slot->displayName = definition->displayName;
     }
+    auto applyEntryFade = [&]()
+    {
+        if (!slot->visible || !ParseBoolValue(GetCommandParameter(command, L"fade"), true))
+        {
+            return;
+        }
+        const int duration = (std::max)(0, ParseIntValue(GetCommandParameter(command, L"fade_time"), 500));
+        if (duration <= 0)
+        {
+            return;
+        }
+        const bool waitForCompletion = ParseBoolValue(GetCommandParameter(command, L"fade_wait"), true);
+        StartCharacterAlphaFade(L"character:" + slot->slotName, false, duration, waitForCompletion);
+    };
 
     std::wstring storage = GetCommandParameter(command, L"storage");
     if (storage.empty() && definition)
@@ -1586,6 +1601,8 @@ void NovelRuntime::ApplyCharacterCommand(const ScriptCommand& command)
             {
                 slot->displayName = GetFileStemPart(storage);
             }
+            StartPendingCharacterFadeIfMatched(*slot);
+            applyEntryFade();
             statusText_ = L"\u7acb\u3061\u7d75\u3092\u8868\u793a\u3057\u307e\u3057\u305f: " + slot->slotName;
             return;
         }
@@ -1594,17 +1611,29 @@ void NovelRuntime::ApplyCharacterCommand(const ScriptCommand& command)
         return;
     }
 
+    StartPendingCharacterFadeIfMatched(*slot);
+    applyEntryFade();
     statusText_ = L"\u7acb\u3061\u7d75\u306e\u30d7\u30ec\u30fc\u30b9\u30db\u30eb\u30c0\u3092\u8868\u793a\u3057\u307e\u3057\u305f: " + slot->slotName;
 }
 
 void NovelRuntime::ApplyHideCharacterCommand(const ScriptCommand& command)
 {
     const std::wstring normalized = Trim(GetCommandParameter(command, L"pos"));
+    const bool fadeEnabled = ParseBoolValue(GetCommandParameter(command, L"fade"), true);
+    const int fadeDuration = (std::max)(0, ParseIntValue(GetCommandParameter(command, L"fade_time"), 500));
+    const bool waitForCompletion = ParseBoolValue(GetCommandParameter(command, L"fade_wait"), true);
     if (normalized.empty() || normalized == L"all")
     {
-        leftCharacter_ = { L"left" };
-        centerCharacter_ = { L"center" };
-        rightCharacter_ = { L"right" };
+        if (fadeEnabled && fadeDuration > 0 && (IsCharacterFadeTargetVisible(L"character:left") || IsCharacterFadeTargetVisible(L"character:center") || IsCharacterFadeTargetVisible(L"character:right")))
+        {
+            StartCharacterAlphaFade(L"character:all", true, fadeDuration, waitForCompletion);
+            pendingHideCharacterTarget_ = L"character:all";
+            statusText_ = L"all characters fading out";
+            return;
+        }
+        ClearCharacterSlot(leftCharacter_);
+        ClearCharacterSlot(centerCharacter_);
+        ClearCharacterSlot(rightCharacter_);
         statusText_ = L"all characters hidden";
         return;
     }
@@ -1617,7 +1646,15 @@ void NovelRuntime::ApplyHideCharacterCommand(const ScriptCommand& command)
     }
 
     const std::wstring slotName = slot->slotName;
-    *slot = { slotName };
+    if (fadeEnabled && fadeDuration > 0 && slot->visible && (!slot->displayName.empty() || slot->image))
+    {
+        const std::wstring target = L"character:" + slotName;
+        StartCharacterAlphaFade(target, true, fadeDuration, waitForCompletion);
+        pendingHideCharacterTarget_ = target;
+        statusText_ = L"character fading out: " + slotName;
+        return;
+    }
+    ClearCharacterSlot(*slot);
     statusText_ = L"character hidden: " + slot->slotName;
 }
 
@@ -1997,34 +2034,45 @@ void NovelRuntime::ApplyShakeCommand(const ScriptCommand& command)
 
 void NovelRuntime::ApplyFadeCommand(const ScriptCommand& command)
 {
-    fadeStartTick_ = GetTickCount();
     const int duration = (std::max)(0, ParseIntValue(GetCommandParameter(command, L"time"), 700));
-    fadeEndTick_ = duration > 0 ? fadeStartTick_ + static_cast<DWORD>(duration) : 0;
-    fadeOpacity_ = (std::max)(0, (std::min)(255, ParseIntValue(GetCommandParameter(command, L"opacity"), 255)));
+    const int opacity = (std::max)(0, (std::min)(255, ParseIntValue(GetCommandParameter(command, L"opacity"), 255)));
     COLORREF color = fadeColor_;
     if (TryParseHexColor(GetCommandParameter(command, L"color"), color))
     {
-        fadeColor_ = color;
+        // Parsed below.
     }
     const std::wstring target = Trim(GetCommandParameter(command, L"target"));
+    std::wstring resolvedTarget = L"stage";
     if (target == L"message" ||
         target == L"all" ||
         target == L"background" ||
-        target == L"character:left" ||
-        target == L"character:center" ||
-        target == L"character:right")
+        StartsWithText(target, L"character:"))
     {
-        fadeTarget_ = target;
+        resolvedTarget = target;
     }
-    else
+    else if (target == L"left" || target == L"center" || target == L"right")
     {
-        fadeTarget_ = L"stage";
+        resolvedTarget = L"character:" + target;
     }
+    else if (FindCharacterDefinition(target))
+    {
+        resolvedTarget = L"character:" + target;
+    }
+
+    const bool waitForCompletion = duration > 0 && !ParseBoolValue(GetCommandParameter(command, L"parallel"), false);
+    if (StartsWithText(resolvedTarget, L"character:") && !IsCharacterFadeTargetVisible(resolvedTarget))
+    {
+        pendingCharacterFadeTarget_ = resolvedTarget;
+        pendingCharacterFadeColor_ = color;
+        pendingCharacterFadeOpacity_ = opacity;
+        pendingCharacterFadeDuration_ = duration;
+        pendingCharacterFadeWait_ = waitForCompletion;
+        statusText_ = L"キャラ表示時にフェードします: " + GetEffectTargetLabel(resolvedTarget);
+        return;
+    }
+
+    StartFadeRuntime(duration, color, opacity, resolvedTarget, waitForCompletion);
     statusText_ = L"フェード: " + std::to_wstring(duration) + L"ms";
-    if (duration > 0 && !ParseBoolValue(GetCommandParameter(command, L"parallel"), false))
-    {
-        waitUntilTick_ = fadeEndTick_;
-    }
 }
 
 void NovelRuntime::ApplyTransitionCommand(const ScriptCommand& command)
@@ -2035,6 +2083,119 @@ void NovelRuntime::ApplyTransitionCommand(const ScriptCommand& command)
     {
         statusText_ = L"トランジション: " + style;
     }
+}
+
+bool NovelRuntime::CharacterSlotMatchesFadeTarget(const CharacterSlot& slot, const std::wstring& target) const
+{
+    if (!StartsWithText(target, L"character:"))
+    {
+        return false;
+    }
+
+    const std::wstring tag = target.substr(10);
+    if (tag == L"all")
+    {
+        return true;
+    }
+    const CharacterDefinition* definition = FindCharacterDefinition(tag);
+    return slot.slotName == tag ||
+        (!slot.characterId.empty() && slot.characterId == tag) ||
+        (!slot.displayName.empty() && slot.displayName == tag) ||
+        (definition && !definition->displayName.empty() && slot.displayName == definition->displayName);
+}
+
+bool NovelRuntime::IsCharacterFadeTargetVisible(const std::wstring& target) const
+{
+    auto visibleMatch = [&](const CharacterSlot& slot)
+    {
+        return CharacterSlotMatchesFadeTarget(slot, target) && slot.visible && (!slot.displayName.empty() || slot.image);
+    };
+    return visibleMatch(leftCharacter_) || visibleMatch(centerCharacter_) || visibleMatch(rightCharacter_);
+}
+
+void NovelRuntime::StartFadeRuntime(int duration, COLORREF color, int opacity, const std::wstring& target, bool waitForCompletion)
+{
+    fadeStartTick_ = GetTickCount();
+    fadeEndTick_ = duration > 0 ? fadeStartTick_ + static_cast<DWORD>(duration) : 0;
+    fadeColor_ = color;
+    fadeOpacity_ = (std::max)(0, (std::min)(255, opacity));
+    fadeTarget_ = target.empty() ? L"stage" : target;
+    if (waitForCompletion && fadeEndTick_ != 0)
+    {
+        waitUntilTick_ = fadeEndTick_;
+    }
+}
+
+void NovelRuntime::StartPendingCharacterFadeIfMatched(const CharacterSlot& slot)
+{
+    if (pendingCharacterFadeTarget_.empty() || !CharacterSlotMatchesFadeTarget(slot, pendingCharacterFadeTarget_))
+    {
+        return;
+    }
+
+    const std::wstring target = pendingCharacterFadeTarget_;
+    const COLORREF color = pendingCharacterFadeColor_;
+    const int opacity = pendingCharacterFadeOpacity_;
+    const int duration = pendingCharacterFadeDuration_;
+    const bool waitForCompletion = pendingCharacterFadeWait_;
+    pendingCharacterFadeTarget_.clear();
+    pendingCharacterFadeDuration_ = 0;
+    pendingCharacterFadeWait_ = false;
+    StartFadeRuntime(duration, color, opacity, target, waitForCompletion);
+}
+
+void NovelRuntime::StartCharacterAlphaFade(const std::wstring& target, bool fadeOut, int duration, bool waitForCompletion)
+{
+    characterFadeStartTick_ = GetTickCount();
+    characterFadeEndTick_ = duration > 0 ? characterFadeStartTick_ + static_cast<DWORD>(duration) : 0;
+    characterFadeTarget_ = target;
+    characterFadeOut_ = fadeOut;
+    if (waitForCompletion && characterFadeEndTick_ != 0)
+    {
+        waitUntilTick_ = characterFadeEndTick_;
+    }
+}
+
+void NovelRuntime::CompletePendingCharacterHide()
+{
+    if (pendingHideCharacterTarget_.empty())
+    {
+        return;
+    }
+
+    if (pendingHideCharacterTarget_ == L"character:all")
+    {
+        ClearCharacterSlot(leftCharacter_);
+        ClearCharacterSlot(centerCharacter_);
+        ClearCharacterSlot(rightCharacter_);
+    }
+    else if (StartsWithText(pendingHideCharacterTarget_, L"character:"))
+    {
+        const std::wstring slotName = pendingHideCharacterTarget_.substr(10);
+        if (CharacterSlot* slot = GetCharacterSlot(slotName))
+        {
+            ClearCharacterSlot(*slot);
+        }
+    }
+
+    pendingHideCharacterTarget_.clear();
+    characterFadeTarget_.clear();
+    characterFadeStartTick_ = 0;
+    characterFadeEndTick_ = 0;
+    characterFadeOut_ = false;
+}
+
+void NovelRuntime::ClearCharacterSlot(CharacterSlot& slot)
+{
+    slot.characterId.clear();
+    slot.displayName.clear();
+    slot.imagePath.clear();
+    slot.image.reset();
+    slot.visible = true;
+    slot.offsetX = 0;
+    slot.offsetY = 0;
+    slot.scale = 100;
+    slot.opacity = 255;
 }
 
 void NovelRuntime::ApplyZoomCommand(const ScriptCommand& command)
@@ -2234,6 +2395,8 @@ void NovelRuntime::PushVariableHistory(const std::wstring& entry)
 void NovelRuntime::ActivateChoice(const ScriptCommand& command)
 {
     activeChoices_.clear();
+    activeChoiceOffsetX_ = ParseIntValue(GetCommandParameter(command, L"x"), 0);
+    activeChoiceOffsetY_ = ParseIntValue(GetCommandParameter(command, L"y"), 0);
     for (size_t i = 0; i < command.links.size(); ++i)
     {
         const std::wstring conditionName = GetCommandParameter(command, GetChoiceParamKey(L"__choice_cond_name_", i));
@@ -2633,9 +2796,13 @@ void NovelRuntime::LoadScenario(const std::wstring& requestedPath)
     backgroundPath_.clear();
     backgroundImage_.reset();
     backgroundColor_ = RGB(28, 36, 48);
-    leftCharacter_ = { L"left" };
-    centerCharacter_ = { L"center" };
-    rightCharacter_ = { L"right" };
+    ClearCharacterSlot(leftCharacter_);
+    ClearCharacterSlot(centerCharacter_);
+    ClearCharacterSlot(rightCharacter_);
+    characterFadeStartTick_ = 0;
+    characterFadeEndTick_ = 0;
+    characterFadeTarget_.clear();
+    pendingHideCharacterTarget_.clear();
     storyTitle_ = L"Kaktos Engine";
     speakerName_.clear();
     currentText_ = L"Loading scenario...";
@@ -2799,9 +2966,17 @@ void NovelRuntime::Advance()
             break;
         case ScriptCommand::Type::Character:
             ApplyCharacterCommand(command);
+            if (waitUntilTick_ != 0)
+            {
+                return;
+            }
             break;
         case ScriptCommand::Type::HideCharacter:
             ApplyHideCharacterCommand(command);
+            if (waitUntilTick_ != 0)
+            {
+                return;
+            }
             break;
         case ScriptCommand::Type::Speaker:
             speakerName_ = GetCommandParameter(command, L"name");
@@ -2810,6 +2985,38 @@ void NovelRuntime::Advance()
             speakerName_.clear();
             break;
         case ScriptCommand::Type::Text:
+        {
+            const std::wstring nameVisible = GetCommandParameter(command, L"name_visible");
+            if (!nameVisible.empty())
+            {
+                nameBoxVisible_ = ParseBoolValue(nameVisible, true);
+                if (!nameBoxVisible_)
+                {
+                    speakerName_.clear();
+                }
+                else
+                {
+                    const std::wstring nameTarget = GetCommandParameter(command, L"name_target");
+                    const CharacterDefinition* definition = FindCharacterDefinition(nameTarget);
+                    speakerName_ = definition ? (definition->displayName.empty() ? definition->id : definition->displayName) : nameTarget;
+                    nameWindowOffsetX_ = ParseIntValue(GetCommandParameter(command, L"name_x"), nameWindowOffsetX_);
+                    nameWindowOffsetY_ = ParseIntValue(GetCommandParameter(command, L"name_y"), nameWindowOffsetY_);
+                    nameWindowImagePath_ = GetCommandParameter(command, L"name_image");
+                    if (nameWindowImagePath_.empty())
+                    {
+                        nameWindowImagePath_ = editorSettings_.defaultNameWindowImage;
+                    }
+                    nameWindowImage_.reset();
+                    if (!nameWindowImagePath_.empty())
+                    {
+                        nameWindowImage_ = TryLoadImage(nameWindowImagePath_);
+                        if (!nameWindowImage_)
+                        {
+                            nameWindowImage_ = TryLoadImage(CombinePath(scenarioBaseDir_, nameWindowImagePath_));
+                        }
+                    }
+                }
+            }
             currentText_ = GetCommandParameter(command, L"value");
             if (currentText_.empty())
             {
@@ -2831,6 +3038,7 @@ void NovelRuntime::Advance()
             }
             PushBacklogEntry(speakerName_, currentText_);
             return;
+        }
         case ScriptCommand::Type::Choice:
             ActivateChoice(command);
             if (waitingForChoice_)
@@ -4349,6 +4557,9 @@ ScriptCommand NovelRuntime::CreateDefaultCommand(ScriptCommand::Type type) const
         break;
     case ScriptCommand::Type::Text:
         command.parameters[L"value"] = L"\u65b0\u3057\u3044\u672c\u6587";
+        command.parameters[L"name_visible"] = L"false";
+        command.parameters[L"name_x"] = L"0";
+        command.parameters[L"name_y"] = L"0";
         break;
     case ScriptCommand::Type::MessageWindow:
         command.parameters[L"visible"] = L"true";
@@ -4369,6 +4580,8 @@ ScriptCommand NovelRuntime::CreateDefaultCommand(ScriptCommand::Type type) const
         break;
     case ScriptCommand::Type::Choice:
         command.parameters[L"prompt"] = L"\u65b0\u3057\u3044\u9078\u629e\u80a2";
+        command.parameters[L"x"] = L"0";
+        command.parameters[L"y"] = L"0";
         command.links.push_back({ L"\u9078\u629e\u80a21", L"start" });
         command.links.push_back({ L"\u9078\u629e\u80a22", L"start" });
         break;
@@ -4390,9 +4603,15 @@ ScriptCommand NovelRuntime::CreateDefaultCommand(ScriptCommand::Type type) const
         command.parameters[L"visible"] = L"true";
         command.parameters[L"scale"] = L"100";
         command.parameters[L"opacity"] = L"255";
+        command.parameters[L"fade"] = L"true";
+        command.parameters[L"fade_time"] = L"500";
+        command.parameters[L"fade_wait"] = L"true";
         break;
     case ScriptCommand::Type::HideCharacter:
         command.parameters[L"pos"] = L"all";
+        command.parameters[L"fade"] = L"true";
+        command.parameters[L"fade_time"] = L"500";
+        command.parameters[L"fade_wait"] = L"true";
         break;
     case ScriptCommand::Type::Speaker:
         command.parameters[L"name"] = L"話者";
@@ -4945,8 +5164,8 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
                 const std::wstring dir = target.action.substr(firstColon + 1, secondColon - firstColon - 1);
                 const std::wstring key = target.action.substr(secondColon + 1);
                 int step = 1;
-                if (key == L"time" || key == L"fadein" || key == L"fadeout") step = 100;
-                else if (key == L"x" || key == L"y") step = 10;
+                if (key == L"time" || key == L"fadein" || key == L"fadeout" || key == L"fade_time") step = 100;
+                else if (key == L"x" || key == L"y" || key == L"name_x" || key == L"name_y") step = 10;
                 else if (key == L"scale" || key == L"opacity" || key == L"volume") step = 5;
                 else if (key == L"power") step = 2;
                 const int delta = dir == L"-" ? -step : step;
@@ -4975,6 +5194,10 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
         if (target.action == L"browse_name_image")
         {
             return BrowseCommandAsset(target.commandIndex, L"image", false);
+        }
+        if (target.action == L"browse_text_name_image")
+        {
+            return BrowseCommandAsset(target.commandIndex, L"name_image", false);
         }
         if (target.action == L"clear_image")
         {
@@ -5011,6 +5234,38 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             ApplyNameWindowCommand(command);
             statusText_ = L"名前欄画像を解除しました";
             RefreshPreviewIfActive();
+            return true;
+        }
+        if (target.action == L"clear_text_name_image")
+        {
+            PushUndoSnapshot();
+            command.parameters[L"name_image"].clear();
+            SyncDocumentMetadata();
+            statusText_ = L"本文の名前画像を解除しました";
+            RefreshPreviewIfActive();
+            return true;
+        }
+        if (target.action == L"text_name_toggle" && command.type == ScriptCommand::Type::Text)
+        {
+            PushUndoSnapshot();
+            command.parameters[L"name_visible"] = ParseBoolValue(GetCommandParameter(command, L"name_visible"), false) ? L"false" : L"true";
+            SyncDocumentMetadata();
+            statusText_ = L"本文の名前表示を更新しました";
+            RefreshPreviewIfActive();
+            return true;
+        }
+        if (target.action == L"text_name_select" && command.type == ScriptCommand::Type::Text)
+        {
+            const std::wstring selectedTag = ShowCharacterTagSelectionMenu(point, GetCommandParameter(command, L"name_target"));
+            if (!selectedTag.empty())
+            {
+                PushUndoSnapshot();
+                command.parameters[L"name_target"] = selectedTag;
+                command.parameters[L"name_visible"] = L"true";
+                SyncDocumentMetadata();
+                statusText_ = L"本文の名前タグを設定しました: " + selectedTag;
+                RefreshPreviewIfActive();
+            }
             return true;
         }
         if (target.action == L"browse_audio")
@@ -5050,33 +5305,50 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             RefreshPreviewIfActive();
             return true;
         }
-        if (target.action == L"fade_cycle_target" && (command.type == ScriptCommand::Type::Fade || command.type == ScriptCommand::Type::Transition))
+        if (target.action == L"toggle_character_fade" && (command.type == ScriptCommand::Type::Character || command.type == ScriptCommand::Type::HideCharacter))
         {
             PushUndoSnapshot();
-            const std::wstring current = GetCommandParameter(command, L"target");
-            const std::wstring targets[] =
-            {
-                L"stage",
-                L"background",
-                L"character:left",
-                L"character:center",
-                L"character:right",
-                L"message",
-                L"all"
-            };
-            size_t nextIndex = 0;
-            for (size_t i = 0; i < _countof(targets); ++i)
-            {
-                if (current == targets[i])
-                {
-                    nextIndex = (i + 1) % _countof(targets);
-                    break;
-                }
-            }
-            command.parameters[L"target"] = targets[nextIndex];
+            command.parameters[L"fade"] = ParseBoolValue(GetCommandParameter(command, L"fade"), true) ? L"false" : L"true";
             SyncDocumentMetadata();
-            statusText_ = L"フェード対象を更新しました";
+            statusText_ = L"キャラフェードを更新しました";
             RefreshPreviewIfActive();
+            return true;
+        }
+        if (target.action == L"toggle_character_fade_wait" && (command.type == ScriptCommand::Type::Character || command.type == ScriptCommand::Type::HideCharacter))
+        {
+            PushUndoSnapshot();
+            command.parameters[L"fade_wait"] = ParseBoolValue(GetCommandParameter(command, L"fade_wait"), true) ? L"false" : L"true";
+            SyncDocumentMetadata();
+            statusText_ = L"キャラフェードのウェイトを更新しました";
+            RefreshPreviewIfActive();
+            return true;
+        }
+        if (target.action == L"fade_cycle_target" && (command.type == ScriptCommand::Type::Fade || command.type == ScriptCommand::Type::Transition))
+        {
+            const std::wstring current = GetCommandParameter(command, L"target");
+            const std::wstring selectedTarget = ShowEffectTargetSelectionMenu(point, current.empty() ? L"stage" : current);
+            if (!selectedTarget.empty() && selectedTarget != current)
+            {
+                PushUndoSnapshot();
+                command.parameters[L"target"] = selectedTarget;
+                SyncDocumentMetadata();
+                statusText_ = L"フェード対象を更新しました: " + GetEffectTargetLabel(selectedTarget);
+                RefreshPreviewIfActive();
+            }
+            return true;
+        }
+        if (target.action == L"jump_select_target" && (command.type == ScriptCommand::Type::Jump || command.type == ScriptCommand::Type::IfJump))
+        {
+            const std::wstring current = GetCommandParameter(command, L"target");
+            const std::wstring selectedTarget = ShowLabelSelectionMenu(point, current);
+            if (!selectedTarget.empty() && selectedTarget != current)
+            {
+                PushUndoSnapshot();
+                command.parameters[L"target"] = selectedTarget;
+                SyncDocumentMetadata();
+                statusText_ = L"遷移先を更新しました: " + selectedTarget;
+                RefreshPreviewIfActive();
+            }
             return true;
         }
         if (target.action == L"character_adjust")
@@ -5084,7 +5356,7 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             characterAdjustMode_ = !characterAdjustMode_;
             characterAdjustDragging_ = false;
             adjustCharacterCommandIndex_ = characterAdjustMode_ ? target.commandIndex : static_cast<size_t>(-1);
-            statusText_ = characterAdjustMode_ ? L"立ち位置調整モードを開始しました" : L"立ち位置調整モードを終了しました";
+            statusText_ = characterAdjustMode_ ? L"位置調整モードを開始しました" : L"位置調整モードを終了しました";
             if (characterAdjustMode_ && (!previewWindow_ || !IsWindowVisible(previewWindow_)))
             {
                 TogglePreviewWindow();
@@ -5324,6 +5596,21 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
                     statusText_ = L"選択肢条件の変数を更新しました";
                     RefreshPreviewIfActive();
                 }
+            }
+            return true;
+        }
+        if (target.action == L"choice_select_target" && command.type == ScriptCommand::Type::Choice && target.linkIndex < command.links.size())
+        {
+            const std::wstring current = command.links[target.linkIndex].second;
+            const std::wstring selectedTarget = ShowLabelSelectionMenu(point, current);
+            if (!selectedTarget.empty() && selectedTarget != current)
+            {
+                PushUndoSnapshot();
+                command.links[target.linkIndex].second = selectedTarget;
+                selectedChoiceLinkIndex_ = target.linkIndex;
+                SyncDocumentMetadata();
+                statusText_ = L"選択肢の遷移先を更新しました: " + selectedTarget;
+                RefreshPreviewIfActive();
             }
             return true;
         }
@@ -5634,7 +5921,9 @@ bool NovelRuntime::HandlePreviewMouseDown(POINT point)
     }
 
     ScriptCommand& command = scenario_.commands[adjustCharacterCommandIndex_];
-    if (command.type != ScriptCommand::Type::Character)
+    if (command.type != ScriptCommand::Type::Character &&
+        command.type != ScriptCommand::Type::Background &&
+        command.type != ScriptCommand::Type::Choice)
     {
         return false;
     }
@@ -5672,7 +5961,9 @@ bool NovelRuntime::HandlePreviewMouseMove(POINT point)
     }
 
     ScriptCommand& command = scenario_.commands[adjustCharacterCommandIndex_];
-    if (command.type != ScriptCommand::Type::Character)
+    if (command.type != ScriptCommand::Type::Character &&
+        command.type != ScriptCommand::Type::Background &&
+        command.type != ScriptCommand::Type::Choice)
     {
         return false;
     }
@@ -5681,7 +5972,24 @@ bool NovelRuntime::HandlePreviewMouseMove(POINT point)
     const int deltaY = point.y - adjustDragStartPoint_.y;
     command.parameters[L"x"] = std::to_wstring(adjustStartX_ + deltaX);
     command.parameters[L"y"] = std::to_wstring(adjustStartY_ + deltaY);
-    ApplyCharacterCommand(command);
+    if (command.type == ScriptCommand::Type::Character)
+    {
+        if (CharacterSlot* slot = GetCharacterSlot(GetCommandParameter(command, L"pos")))
+        {
+            slot->offsetX = ParseIntValue(command.parameters[L"x"], 0);
+            slot->offsetY = ParseIntValue(command.parameters[L"y"], 0);
+        }
+    }
+    else if (command.type == ScriptCommand::Type::Background)
+    {
+        backgroundOffsetX_ = ParseIntValue(command.parameters[L"x"], 0);
+        backgroundOffsetY_ = ParseIntValue(command.parameters[L"y"], 0);
+    }
+    else if (command.type == ScriptCommand::Type::Choice)
+    {
+        activeChoiceOffsetX_ = ParseIntValue(command.parameters[L"x"], 0);
+        activeChoiceOffsetY_ = ParseIntValue(command.parameters[L"y"], 0);
+    }
     statusText_ = L"横位置: " + command.parameters[L"x"] + L" / 縦位置: " + command.parameters[L"y"];
     if (hostWindow_)
     {
@@ -5724,6 +6032,12 @@ bool NovelRuntime::HandleTimer()
             nextTextRevealTick_ = 0;
             needsRedraw = true;
         }
+    }
+
+    if (!pendingHideCharacterTarget_.empty() && characterFadeEndTick_ != 0 && now >= characterFadeEndTick_)
+    {
+        CompletePendingCharacterHide();
+        needsRedraw = true;
     }
 
     if (waitUntilTick_ != 0 && now >= waitUntilTick_)
@@ -5801,6 +6115,17 @@ bool NovelRuntime::HandleTimer()
         {
             fadeStartTick_ = 0;
             fadeEndTick_ = 0;
+        }
+    }
+    if (characterFadeEndTick_ != 0)
+    {
+        needsRedraw = true;
+        if (now >= characterFadeEndTick_ && pendingHideCharacterTarget_.empty())
+        {
+            characterFadeStartTick_ = 0;
+            characterFadeEndTick_ = 0;
+            characterFadeTarget_.clear();
+            characterFadeOut_ = false;
         }
     }
 
@@ -5894,11 +6219,6 @@ bool NovelRuntime::HandleControlCommand(WPARAM wParam, LPARAM lParam)
         else if (leftPanelTab_ == LeftPanelTab::Scenario)
         {
             scenarioFilterText_ = value;
-        }
-        else
-        {
-            eventFilterText_ = value;
-            eventListScrollOffset_ = 0;
         }
         return true;
     }
@@ -6006,10 +6326,7 @@ std::vector<size_t> NovelRuntime::BuildFilteredEventIndices() const
     std::vector<size_t> indices;
     for (size_t i = 0; i < scenario_.commands.size(); ++i)
     {
-        if (MatchesEventFilter(scenario_.commands[i]))
-        {
-            indices.push_back(i);
-        }
+        indices.push_back(i);
     }
     return indices;
 }
@@ -6084,19 +6401,6 @@ void NovelRuntime::UpdateChildControls()
             if (currentValue != expectedValue)
             {
                 SetWindowTextW(eventSearchEdit_, expectedValue.c_str());
-            }
-        }
-        else if (showEventList_ && HasVisibleArea(currentEventListRect_))
-        {
-            eventSearchRect_ = { currentEventListRect_.left + 12, currentEventListRect_.top + 8, currentEventListRect_.left + 220, currentEventListRect_.top + 30 };
-            SetWindowPos(eventSearchEdit_, nullptr, eventSearchRect_.left, eventSearchRect_.top, eventSearchRect_.right - eventSearchRect_.left, eventSearchRect_.bottom - eventSearchRect_.top, SWP_NOZORDER | SWP_SHOWWINDOW);
-            const int length = GetWindowTextLengthW(eventSearchEdit_);
-            std::wstring currentValue(static_cast<size_t>(length) + 1, L'\0');
-            GetWindowTextW(eventSearchEdit_, &currentValue[0], length + 1);
-            currentValue.resize(length);
-            if (currentValue != eventFilterText_)
-            {
-                SetWindowTextW(eventSearchEdit_, eventFilterText_.c_str());
             }
         }
         else
@@ -7609,6 +7913,7 @@ bool NovelRuntime::SaveRuntimeStateToPath(const std::wstring& savePath)
     saveText += L"reached_end=" + std::to_wstring(reachedEnd_ ? 1 : 0) + L"\r\n";
     saveText += L"text_reveal_active=" + std::to_wstring(textRevealActive_ ? 1 : 0) + L"\r\n";
     saveText += L"text_reveal_index=" + std::to_wstring(textRevealIndex_) + L"\r\n";
+    saveText += L"left_id=" + EscapeSaveValue(leftCharacter_.characterId) + L"\r\n";
     saveText += L"left_name=" + EscapeSaveValue(leftCharacter_.displayName) + L"\r\n";
     saveText += L"left_image=" + EscapeSaveValue(leftCharacter_.imagePath) + L"\r\n";
     saveText += L"left_visible=" + std::to_wstring(leftCharacter_.visible ? 1 : 0) + L"\r\n";
@@ -7616,6 +7921,7 @@ bool NovelRuntime::SaveRuntimeStateToPath(const std::wstring& savePath)
     saveText += L"left_y=" + std::to_wstring(leftCharacter_.offsetY) + L"\r\n";
     saveText += L"left_scale=" + std::to_wstring(leftCharacter_.scale) + L"\r\n";
     saveText += L"left_opacity=" + std::to_wstring(leftCharacter_.opacity) + L"\r\n";
+    saveText += L"center_id=" + EscapeSaveValue(centerCharacter_.characterId) + L"\r\n";
     saveText += L"center_name=" + EscapeSaveValue(centerCharacter_.displayName) + L"\r\n";
     saveText += L"center_image=" + EscapeSaveValue(centerCharacter_.imagePath) + L"\r\n";
     saveText += L"center_visible=" + std::to_wstring(centerCharacter_.visible ? 1 : 0) + L"\r\n";
@@ -7623,6 +7929,7 @@ bool NovelRuntime::SaveRuntimeStateToPath(const std::wstring& savePath)
     saveText += L"center_y=" + std::to_wstring(centerCharacter_.offsetY) + L"\r\n";
     saveText += L"center_scale=" + std::to_wstring(centerCharacter_.scale) + L"\r\n";
     saveText += L"center_opacity=" + std::to_wstring(centerCharacter_.opacity) + L"\r\n";
+    saveText += L"right_id=" + EscapeSaveValue(rightCharacter_.characterId) + L"\r\n";
     saveText += L"right_name=" + EscapeSaveValue(rightCharacter_.displayName) + L"\r\n";
     saveText += L"right_image=" + EscapeSaveValue(rightCharacter_.imagePath) + L"\r\n";
     saveText += L"right_visible=" + std::to_wstring(rightCharacter_.visible ? 1 : 0) + L"\r\n";
@@ -7674,9 +7981,11 @@ bool NovelRuntime::SaveRuntimeStateAs()
     return SaveRuntimeStateToPath(fileBuffer);
 }
 
-void NovelRuntime::ApplyLoadedCharacterState(CharacterSlot& slot, const std::wstring& slotName, const std::wstring& displayName, const std::wstring& imagePath)
+void NovelRuntime::ApplyLoadedCharacterState(CharacterSlot& slot, const std::wstring& slotName, const std::wstring& characterId, const std::wstring& displayName, const std::wstring& imagePath)
 {
-    slot = { slotName };
+    slot.slotName = slotName;
+    ClearCharacterSlot(slot);
+    slot.characterId = characterId;
     slot.displayName = displayName;
     slot.imagePath = imagePath;
     if (!imagePath.empty() && imagePath != L"solid")
@@ -7832,9 +8141,9 @@ bool NovelRuntime::LoadRuntimeStateFromPath(const std::wstring& savePath)
     }
     activeChoiceRects_.assign(activeChoices_.size(), RECT{});
 
-    ApplyLoadedCharacterState(leftCharacter_, L"left", getValue(L"left_name"), getValue(L"left_image"));
-    ApplyLoadedCharacterState(centerCharacter_, L"center", getValue(L"center_name"), getValue(L"center_image"));
-    ApplyLoadedCharacterState(rightCharacter_, L"right", getValue(L"right_name"), getValue(L"right_image"));
+    ApplyLoadedCharacterState(leftCharacter_, L"left", getValue(L"left_id"), getValue(L"left_name"), getValue(L"left_image"));
+    ApplyLoadedCharacterState(centerCharacter_, L"center", getValue(L"center_id"), getValue(L"center_name"), getValue(L"center_image"));
+    ApplyLoadedCharacterState(rightCharacter_, L"right", getValue(L"right_id"), getValue(L"right_name"), getValue(L"right_image"));
     leftCharacter_.visible = getValue(L"left_visible") != L"0";
     leftCharacter_.offsetX = _wtoi(getValue(L"left_x").c_str());
     leftCharacter_.offsetY = _wtoi(getValue(L"left_y").c_str());
@@ -8310,12 +8619,17 @@ bool NovelRuntime::ApplyEffectToCharacterDrop(size_t effectCommandIndex, size_t 
         return false;
     }
 
+    std::wstring targetTag = GetCommandParameter(character, L"name");
     std::wstring position = GetCommandParameter(character, L"pos");
-    if (position != L"left" && position != L"right" && position != L"center")
+    if (targetTag.empty())
     {
-        position = L"center";
+        if (position != L"left" && position != L"right" && position != L"center")
+        {
+            position = L"center";
+        }
+        targetTag = position;
     }
-    effect.parameters[L"target"] = L"character:" + position;
+    effect.parameters[L"target"] = L"character:" + targetTag;
 
     size_t insertIndex = characterCommandIndex + 1;
     ScriptCommand movedEffect = effect;
@@ -8328,7 +8642,7 @@ bool NovelRuntime::ApplyEffectToCharacterDrop(size_t effectCommandIndex, size_t 
     scenario_.commands.insert(scenario_.commands.begin() + static_cast<std::ptrdiff_t>(insertIndex), std::move(movedEffect));
     selectedCommandIndex_ = insertIndex;
     SyncDocumentMetadata();
-    statusText_ = L"演出対象を" + GetEffectTargetLabel(L"character:" + position) + L"に設定しました";
+    statusText_ = L"演出対象を" + GetEffectTargetLabel(L"character:" + targetTag) + L"に設定しました";
     RefreshPreviewIfActive();
     return true;
 }
@@ -8349,9 +8663,9 @@ void NovelRuntime::ResetPlaybackState()
     backgroundOffsetY_ = 0;
     backgroundScale_ = 100;
     backgroundOpacity_ = 255;
-    leftCharacter_ = { L"left" };
-    centerCharacter_ = { L"center" };
-    rightCharacter_ = { L"right" };
+    ClearCharacterSlot(leftCharacter_);
+    ClearCharacterSlot(centerCharacter_);
+    ClearCharacterSlot(rightCharacter_);
     speakerName_.clear();
     currentText_.clear();
     displayedText_.clear();
@@ -8379,6 +8693,14 @@ void NovelRuntime::ResetPlaybackState()
     fadeEndTick_ = 0;
     fadeOpacity_ = 255;
     fadeTarget_ = L"stage";
+    pendingCharacterFadeTarget_.clear();
+    pendingCharacterFadeDuration_ = 0;
+    pendingCharacterFadeWait_ = false;
+    characterFadeStartTick_ = 0;
+    characterFadeEndTick_ = 0;
+    characterFadeTarget_.clear();
+    characterFadeOut_ = false;
+    pendingHideCharacterTarget_.clear();
     shakeEndTick_ = 0;
     shakePower_ = 0;
     flashStartTick_ = 0;
@@ -8889,7 +9211,177 @@ std::wstring NovelRuntime::GetEffectTargetLabel(const std::wstring& target) cons
     {
         return L"右キャラ";
     }
+    if (StartsWithText(target, L"character:"))
+    {
+        const std::wstring id = target.substr(10);
+        const CharacterDefinition* definition = FindCharacterDefinition(id);
+        if (definition)
+        {
+            return GetCharacterDefinitionLabel(*definition);
+        }
+        return L"キャラ: " + id;
+    }
     return L"ステージ";
+}
+
+std::wstring NovelRuntime::ShowEffectTargetSelectionMenu(POINT point, const std::wstring& currentTarget) const
+{
+    struct TargetItem
+    {
+        std::wstring value;
+        std::wstring label;
+    };
+
+    std::vector<TargetItem> targets =
+    {
+        { L"stage", L"ステージ" },
+        { L"background", L"背景" },
+        { L"character:left", L"左キャラ" },
+        { L"character:center", L"中央キャラ" },
+        { L"character:right", L"右キャラ" },
+    };
+    for (const CharacterDefinition& definition : characterDefinitions_)
+    {
+        if (!definition.id.empty())
+        {
+            targets.push_back({ L"character:" + definition.id, GetCharacterDefinitionLabel(definition) });
+        }
+    }
+    targets.push_back({ L"message", L"メッセージ" });
+    targets.push_back({ L"all", L"全体" });
+
+    HMENU menu = CreatePopupMenu();
+    static constexpr UINT kBaseId = 66000;
+    for (size_t i = 0; i < targets.size(); ++i)
+    {
+        UINT flags = MF_STRING;
+        if (targets[i].value == currentTarget)
+        {
+            flags |= MF_CHECKED;
+        }
+        AppendMenuW(menu, flags, kBaseId + static_cast<UINT>(i), targets[i].label.c_str());
+    }
+
+    POINT screenPoint = point;
+    if (hostWindow_)
+    {
+        ClientToScreen(hostWindow_, &screenPoint);
+    }
+    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, 0, hostWindow_, nullptr);
+    DestroyMenu(menu);
+    if (command >= kBaseId && command < kBaseId + targets.size())
+    {
+        return targets[command - kBaseId].value;
+    }
+    return L"";
+}
+
+std::wstring NovelRuntime::ShowLabelSelectionMenu(POINT point, const std::wstring& currentTarget) const
+{
+    struct TargetItem
+    {
+        std::wstring value;
+        std::wstring label;
+    };
+
+    std::vector<TargetItem> targets;
+    std::unordered_set<std::wstring> seen;
+    auto appendTarget = [&](const std::wstring& value, const std::wstring& label)
+    {
+        const std::wstring trimmed = Trim(value);
+        if (trimmed.empty() || seen.find(trimmed) != seen.end())
+        {
+            return;
+        }
+        seen.insert(trimmed);
+        targets.push_back({ trimmed, label });
+    };
+
+    for (const ScriptCommand& command : scenario_.commands)
+    {
+        if (command.type == ScriptCommand::Type::Label)
+        {
+            const std::wstring labelName = GetCommandParameter(command, L"name");
+            appendTarget(labelName, L"ラベル: " + labelName);
+        }
+    }
+
+    for (const std::wstring& path : EnumerateFiles(GetScenarioDirectory(), L"*.ks"))
+    {
+        const std::wstring fileName = GetFileNamePart(path);
+        appendTarget(fileName, L"シーン: " + fileName);
+    }
+
+    if (!currentTarget.empty() && seen.find(currentTarget) == seen.end())
+    {
+        appendTarget(currentTarget, L"現在値: " + currentTarget);
+    }
+
+    if (!hostWindow_ || targets.empty())
+    {
+        return currentTarget;
+    }
+
+    HMENU menu = CreatePopupMenu();
+    if (!menu)
+    {
+        return currentTarget;
+    }
+
+    static constexpr UINT kBaseId = 67000;
+    for (size_t i = 0; i < targets.size(); ++i)
+    {
+        UINT flags = MF_STRING;
+        if (targets[i].value == currentTarget)
+        {
+            flags |= MF_CHECKED;
+        }
+        AppendMenuW(menu, flags, kBaseId + static_cast<UINT>(i), targets[i].label.c_str());
+    }
+
+    POINT screenPoint = point;
+    ClientToScreen(hostWindow_, &screenPoint);
+    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, 0, hostWindow_, nullptr);
+    DestroyMenu(menu);
+    if (command >= kBaseId && command < kBaseId + targets.size())
+    {
+        return targets[command - kBaseId].value;
+    }
+    return currentTarget;
+}
+
+std::wstring NovelRuntime::ShowCharacterTagSelectionMenu(POINT point, const std::wstring& currentTag) const
+{
+    if (characterDefinitions_.empty())
+    {
+        return L"";
+    }
+
+    HMENU menu = CreatePopupMenu();
+    static constexpr UINT kBaseId = 66500;
+    for (size_t i = 0; i < characterDefinitions_.size(); ++i)
+    {
+        const CharacterDefinition& definition = characterDefinitions_[i];
+        UINT flags = MF_STRING;
+        if (definition.id == currentTag)
+        {
+            flags |= MF_CHECKED;
+        }
+        AppendMenuW(menu, flags, kBaseId + static_cast<UINT>(i), GetCharacterDefinitionLabel(definition).c_str());
+    }
+
+    POINT screenPoint = point;
+    if (hostWindow_)
+    {
+        ClientToScreen(hostWindow_, &screenPoint);
+    }
+    const UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPoint.x, screenPoint.y, 0, hostWindow_, nullptr);
+    DestroyMenu(menu);
+    if (command >= kBaseId && command < kBaseId + characterDefinitions_.size())
+    {
+        return characterDefinitions_[command - kBaseId].id;
+    }
+    return L"";
 }
 
 std::wstring NovelRuntime::GetVariableTypeLabel(VariableType type) const
@@ -9920,11 +10412,20 @@ void NovelRuntime::DrawVerticalText(HDC hdc, const RECT& bounds, const std::wstr
     }
 }
 
-void NovelRuntime::DrawCharacterSlot(HDC hdc, const RECT& stageRect, CharacterSlot& slot, int centerX) const
+void NovelRuntime::DrawCharacterSlot(HDC hdc, const RECT& stageRect, const CharacterSlot& slot, int centerX) const
 {
     if (!slot.visible || (slot.displayName.empty() && !slot.image))
     {
         return;
+    }
+
+    int effectiveOpacity = slot.opacity;
+    if (!characterFadeTarget_.empty() && characterFadeEndTick_ != 0 && characterFadeEndTick_ > characterFadeStartTick_ && CharacterSlotMatchesFadeTarget(slot, characterFadeTarget_))
+    {
+        const DWORD now = GetTickCount();
+        const double progress = static_cast<double>((std::min)(now, characterFadeEndTick_) - characterFadeStartTick_) / static_cast<double>((std::max<DWORD>)(1, characterFadeEndTick_ - characterFadeStartTick_));
+        const double factor = characterFadeOut_ ? (1.0 - progress) : progress;
+        effectiveOpacity = (std::max)(0, (std::min)(255, static_cast<int>(static_cast<double>(slot.opacity) * factor)));
     }
 
     const int slotWidth = (260 * slot.scale * stageScale_) / 10000;
@@ -9946,7 +10447,7 @@ void NovelRuntime::DrawCharacterSlot(HDC hdc, const RECT& stageRect, CharacterSl
             1.0f, 0, 0, 0, 0,
             0, 1.0f, 0, 0, 0,
             0, 0, 1.0f, 0, 0,
-            0, 0, 0, static_cast<Gdiplus::REAL>(slot.opacity) / 255.0f, 0,
+            0, 0, 0, static_cast<Gdiplus::REAL>(effectiveOpacity) / 255.0f, 0,
             0, 0, 0, 0, 1.0f
         };
         attributes.SetColorMatrix(&matrix);
@@ -9962,6 +10463,10 @@ void NovelRuntime::DrawCharacterSlot(HDC hdc, const RECT& stageRect, CharacterSl
     }
     else
     {
+        if (effectiveOpacity <= 0)
+        {
+            return;
+        }
         HBRUSH fillBrush = CreateSolidBrush(RGB(74, 91, 118));
         FillRect(hdc, &characterRect, fillBrush);
         DeleteObject(fillBrush);
@@ -9989,7 +10494,12 @@ void NovelRuntime::DrawChoices(HDC hdc, const RECT& messageRect)
     const int buttonTop = messageRect.top - static_cast<int>(activeChoices_.size()) * 56 - 18;
     for (size_t index = 0; index < activeChoices_.size(); ++index)
     {
-        RECT optionRect = { messageRect.left + 64, buttonTop + static_cast<int>(index) * 56, messageRect.right - 64, buttonTop + static_cast<int>(index) * 56 + 42 };
+        RECT optionRect = {
+            messageRect.left + 64 + activeChoiceOffsetX_,
+            buttonTop + static_cast<int>(index) * 56 + activeChoiceOffsetY_,
+            messageRect.right - 64 + activeChoiceOffsetX_,
+            buttonTop + static_cast<int>(index) * 56 + 42 + activeChoiceOffsetY_
+        };
         activeChoiceRects_[index] = optionRect;
 
         const bool enabled = activeChoices_[index].enabled;
@@ -10462,22 +10972,31 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
         {
             fadeRect = {};
         }
-        else if (fadeTarget_ == L"character:left" || fadeTarget_ == L"character:center" || fadeTarget_ == L"character:right")
+        else if (StartsWithText(fadeTarget_, L"character:"))
         {
-            const CharacterSlot* slot = &centerCharacter_;
+            const CharacterSlot* slot = nullptr;
             int centerX = stageRect.left + stageWidth / 2 + stageOffsetX_;
-            if (fadeTarget_ == L"character:left")
+            auto matchesSlot = [&](const CharacterSlot& candidate)
+            {
+                return CharacterSlotMatchesFadeTarget(candidate, fadeTarget_);
+            };
+            if (matchesSlot(leftCharacter_))
             {
                 slot = &leftCharacter_;
                 centerX = stageRect.left + stageWidth / 4 + stageOffsetX_;
             }
-            else if (fadeTarget_ == L"character:right")
+            else if (matchesSlot(centerCharacter_))
+            {
+                slot = &centerCharacter_;
+                centerX = stageRect.left + stageWidth / 2 + stageOffsetX_;
+            }
+            else if (matchesSlot(rightCharacter_))
             {
                 slot = &rightCharacter_;
                 centerX = stageRect.left + (stageWidth * 3) / 4 + stageOffsetX_;
             }
 
-            if (!slot->visible || (slot->displayName.empty() && !slot->image))
+            if (!slot || !slot->visible || (slot->displayName.empty() && !slot->image))
             {
                 fadeRect = {};
             }
@@ -12663,9 +13182,7 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
     RECT titleRect = { panelRect.left + 12, panelRect.top + 8, panelRect.right - 12, panelRect.top + 34 };
     SetTextColor(hdc, RGB(228, 234, 240));
     DrawWrappedText(hdc, titleRect, L"\u30a4\u30d9\u30f3\u30c8\u4e00\u89a7", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    RECT searchLabelRect = { panelRect.left + 224, panelRect.top + 8, panelRect.left + 320, panelRect.top + 32 };
-    SetTextColor(hdc, RGB(168, 178, 188));
-    DrawWrappedText(hdc, searchLabelRect, L"\u691c\u7d22", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    eventSearchRect_ = {};
 
     eventAddTextRect_ = { panelRect.right - 340, panelRect.top + 8, panelRect.right - 280, panelRect.top + 32 };
     eventAddChoiceRect_ = { panelRect.right - 274, panelRect.top + 8, panelRect.right - 202, panelRect.top + 32 };
@@ -12901,7 +13418,8 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
     {
         const bool numericField =
             key == L"time" || key == L"x" || key == L"y" || key == L"scale" || key == L"opacity" ||
-            key == L"volume" || key == L"fadein" || key == L"fadeout" || key == L"power" || key == L"value";
+            key == L"volume" || key == L"fadein" || key == L"fadeout" || key == L"power" || key == L"value" ||
+            key == L"name_x" || key == L"name_y" || key == L"fade_time";
         RECT textRect = { panelRect.left + 20, cursorY, panelRect.right - (numericField ? 150 : 90), cursorY + lineHeight };
         RECT buttonRect = { panelRect.right - (numericField ? 140 : 80), cursorY, panelRect.right - (numericField ? 80 : 20), cursorY + lineHeight - 4 };
         SetTextColor(hdc, RGB(205, 214, 222));
@@ -12940,24 +13458,110 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
         SetTextColor(hdc, RGB(245, 248, 250));
         DrawWrappedText(hdc, rect, label, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     };
+    auto getJumpTargetLabel = [&](const std::wstring& target)
+    {
+        if (target.empty())
+        {
+            return std::wstring(L"(未設定)");
+        }
+        std::wstring lower = target;
+        if (!lower.empty())
+        {
+            CharLowerBuffW(&lower[0], static_cast<DWORD>(lower.size()));
+        }
+        if (lower.size() >= 3 && lower.substr(lower.size() - 3) == L".ks")
+        {
+            return L"シーン: " + target;
+        }
+        if (scenario_.labels.find(target) != scenario_.labels.end())
+        {
+            return L"ラベル: " + target;
+        }
+        return target;
+    };
+    auto drawTargetPicker = [&](size_t commandIndex, const std::wstring& target, const std::wstring& action, size_t linkIndex)
+    {
+        RECT targetTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+        RECT targetButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+        SetTextColor(hdc, RGB(205, 214, 222));
+        DrawWrappedText(hdc, targetTextRect, L"遷移先: " + getJumpTargetLabel(target), DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        drawActionButton(targetButtonRect, L"選択", RGB(58, 88, 118));
+        inspectorActionTargets_.push_back(InspectorActionTarget{ action, commandIndex, linkIndex, targetButtonRect });
+        cursorY += lineHeight;
+    };
+    auto drawCharacterFadeControls = [&](size_t commandIndex, const ScriptCommand& command)
+    {
+        const bool fadeEnabled = ParseBoolValue(GetCommandParameter(command, L"fade"), true);
+        RECT fadeTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+        RECT fadeButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+        SetTextColor(hdc, RGB(205, 214, 222));
+        DrawWrappedText(hdc, fadeTextRect, L"フェード: " + std::wstring(fadeEnabled ? L"ON" : L"OFF"), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        drawActionButton(fadeButtonRect, fadeEnabled ? L"OFF" : L"ON", fadeEnabled ? RGB(76, 108, 76) : RGB(90, 62, 62));
+        inspectorActionTargets_.push_back(InspectorActionTarget{ L"toggle_character_fade", commandIndex, 0, fadeButtonRect });
+        cursorY += lineHeight;
+
+        drawEditable(commandIndex, L"フェード時間(ms)", L"fade_time", GetCommandParameter(command, L"fade_time").empty() ? L"500" : GetCommandParameter(command, L"fade_time"));
+
+        const bool waitEnabled = ParseBoolValue(GetCommandParameter(command, L"fade_wait"), true);
+        RECT waitTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+        RECT waitButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+        SetTextColor(hdc, RGB(205, 214, 222));
+        DrawWrappedText(hdc, waitTextRect, L"完了待ち: " + std::wstring(waitEnabled ? L"ON" : L"OFF"), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        drawActionButton(waitButtonRect, waitEnabled ? L"OFF" : L"ON", waitEnabled ? RGB(76, 108, 76) : RGB(90, 62, 62));
+        inspectorActionTargets_.push_back(InspectorActionTarget{ L"toggle_character_fade_wait", commandIndex, 0, waitButtonRect });
+        cursorY += lineHeight;
+    };
 
     if (!scenario_.commands.empty() && selectedCommandIndex_ < scenario_.commands.size())
     {
         const ScriptCommand& command = scenario_.commands[selectedCommandIndex_];
-        drawLine(L"\u7a2e\u985e: " + GetCommandTypeLabel(command), RGB(255, 225, 160));
-        drawLine(L"\u884c\u756a\u53f7: " + std::to_wstring(command.sourceLine), RGB(205, 214, 222));
-        drawLine(L"\u6982\u8981: " + GetCommandSummary(command), RGB(230, 236, 240));
+        drawLine(GetCommandTypeLabel(command), RGB(255, 225, 160));
+        const std::wstring summary = GetCommandSummary(command);
+        if (!summary.empty())
+        {
+            drawLine(summary, RGB(230, 236, 240));
+        }
         const std::wstring issueMessage = GetFirstIssueForCommand(selectedCommandIndex_);
         if (!issueMessage.empty())
         {
             drawLine(L"警告: " + issueMessage, RGB(255, 188, 92));
         }
         cursorY += 8;
-        drawLine(L"\u30d1\u30e9\u30e1\u30fc\u30bf", RGB(255, 225, 160));
         if (command.type == ScriptCommand::Type::Text)
         {
             drawLine(L"\u672c\u6587\u306f\u4e2d\u592e\u306e\u30a4\u30d9\u30f3\u30c8\u4e00\u89a7\u304b\u3089\u958b\u3044\u3066\u7de8\u96c6\u3057\u307e\u3059\u3002", RGB(180, 188, 196));
             drawLine(L"\u73fe\u5728\u306e\u672c\u6587: " + GetCommandParameter(command, L"value"), RGB(205, 214, 222));
+            cursorY += 8;
+            drawLine(L"名前表示", RGB(255, 225, 160));
+            const bool textNameVisible = ParseBoolValue(GetCommandParameter(command, L"name_visible"), false);
+            RECT nameToggleTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+            RECT nameToggleButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+            SetTextColor(hdc, RGB(205, 214, 222));
+            DrawWrappedText(hdc, nameToggleTextRect, L"表示: " + std::wstring(textNameVisible ? L"ON" : L"OFF"), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            drawActionButton(nameToggleButtonRect, textNameVisible ? L"OFF" : L"ON", textNameVisible ? RGB(76, 108, 76) : RGB(90, 62, 62));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"text_name_toggle", selectedCommandIndex_, 0, nameToggleButtonRect });
+            cursorY += lineHeight;
+
+            RECT nameTargetTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+            RECT nameTargetButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+            const std::wstring nameTarget = GetCommandParameter(command, L"name_target");
+            const CharacterDefinition* nameDefinition = FindCharacterDefinition(nameTarget);
+            SetTextColor(hdc, RGB(205, 214, 222));
+            DrawWrappedText(hdc, nameTargetTextRect, L"タグ: " + (nameDefinition ? GetCharacterDefinitionLabel(*nameDefinition) : (nameTarget.empty() ? L"(未設定)" : nameTarget)), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            drawActionButton(nameTargetButtonRect, L"選択", RGB(58, 88, 118));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"text_name_select", selectedCommandIndex_, 0, nameTargetButtonRect });
+            cursorY += lineHeight;
+            drawEditable(selectedCommandIndex_, L"タグID", L"name_target", nameTarget);
+            drawEditable(selectedCommandIndex_, L"横位置", L"name_x", GetCommandParameter(command, L"name_x"));
+            drawEditable(selectedCommandIndex_, L"縦位置", L"name_y", GetCommandParameter(command, L"name_y"));
+            drawEditable(selectedCommandIndex_, L"名前画像", L"name_image", GetCommandParameter(command, L"name_image"));
+            RECT browseNameRect = { panelRect.left + 20, cursorY, panelRect.left + 92, cursorY + 28 };
+            RECT clearNameRect = { panelRect.left + 100, cursorY, panelRect.left + 172, cursorY + 28 };
+            drawActionButton(browseNameRect, L"参照", RGB(58, 88, 118));
+            drawActionButton(clearNameRect, L"解除", RGB(112, 62, 70));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"browse_text_name_image", selectedCommandIndex_, 0, browseNameRect });
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"clear_text_name_image", selectedCommandIndex_, 0, clearNameRect });
+            cursorY += 36;
         }
         else if (command.type == ScriptCommand::Type::MessageWindow)
         {
@@ -13085,7 +13689,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             RECT targetButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
             SetTextColor(hdc, RGB(205, 214, 222));
             DrawWrappedText(hdc, targetTextRect, L"対象: " + GetEffectTargetLabel(GetCommandParameter(command, L"target")), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-            drawActionButton(targetButtonRect, L"切替", RGB(58, 88, 118));
+            drawActionButton(targetButtonRect, L"選択", RGB(58, 88, 118));
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"fade_cycle_target", selectedCommandIndex_, 0, targetButtonRect });
             cursorY += lineHeight;
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
@@ -13099,7 +13703,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             RECT targetButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
             SetTextColor(hdc, RGB(205, 214, 222));
             DrawWrappedText(hdc, targetTextRect, L"対象: " + GetEffectTargetLabel(GetCommandParameter(command, L"target")), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-            drawActionButton(targetButtonRect, L"切替", RGB(58, 88, 118));
+            drawActionButton(targetButtonRect, L"選択", RGB(58, 88, 118));
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"fade_cycle_target", selectedCommandIndex_, 0, targetButtonRect });
             cursorY += lineHeight;
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
@@ -13132,6 +13736,12 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
         else if (command.type == ScriptCommand::Type::Choice)
         {
             drawEditable(selectedCommandIndex_, L"選択肢文", L"prompt", GetCommandParameter(command, L"prompt"));
+            drawEditable(selectedCommandIndex_, L"横位置", L"x", GetCommandParameter(command, L"x"));
+            drawEditable(selectedCommandIndex_, L"縦位置", L"y", GetCommandParameter(command, L"y"));
+            RECT toolButtonRect = { panelRect.left + 20, cursorY, panelRect.left + 188, cursorY + 30 };
+            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"調整中" : L"位置調整ツールを開く", RGB(92, 102, 116));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"character_adjust", selectedCommandIndex_, 0, toolButtonRect });
+            cursorY += 40;
             cursorY += 8;
             drawLine(L"\u9078\u629e\u80a2GUI", RGB(255, 225, 160));
             for (size_t linkIndex = 0; linkIndex < command.links.size(); ++linkIndex)
@@ -13143,7 +13753,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
                 const bool showDisabled = ParseBoolValue(GetCommandParameter(command, GetChoiceParamKey(L"__choice_show_disabled_", linkIndex)), false);
                 drawLine(std::to_wstring(linkIndex + 1) + L". \u679d", linkIndex == selectedChoiceLinkIndex_ ? RGB(255, 225, 160) : RGB(205, 214, 222));
                 drawEditable(selectedCommandIndex_, L"\u6587\u8a00", L"__choice_text_" + std::to_wstring(linkIndex), link.first);
-                drawEditable(selectedCommandIndex_, L"\u9077\u79fb\u5148", L"__choice_target_" + std::to_wstring(linkIndex), link.second);
+                drawTargetPicker(selectedCommandIndex_, link.second, L"choice_select_target", linkIndex);
                 RECT condVarTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
                 RECT condVarButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
                 SetTextColor(hdc, RGB(205, 214, 222));
@@ -13199,7 +13809,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"if_cycle_op", selectedCommandIndex_, 0, opButtonRect });
             cursorY += lineHeight;
             drawEditable(selectedCommandIndex_, L"\u6bd4\u8f03\u5024", L"value", GetCommandParameter(command, L"value"));
-            drawEditable(selectedCommandIndex_, L"\u9077\u79fb\u5148", L"target", GetCommandParameter(command, L"target"));
+            drawTargetPicker(selectedCommandIndex_, GetCommandParameter(command, L"target"), L"jump_select_target", 0);
             cursorY += 8;
             const std::wstring variableName = GetCommandParameter(command, L"name");
             const auto currentValueIt = variables_.find(variableName);
@@ -13207,6 +13817,11 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawLine(L"現在値: " + currentValue, RGB(205, 214, 222));
             drawLine(L"現在の評価: " + std::wstring(EvaluateCondition(command) ? L"true" : L"false"), RGB(180, 188, 196));
             drawLine(L"\u5207\u66ff: \u7b49\u3057\u3044 / \u4e0d\u4e00\u81f4 / \u5927\u306a\u308a / \u4ee5\u4e0a / \u5c0f\u306a\u308a / \u4ee5\u4e0b", RGB(180, 188, 196));
+        }
+        else if (command.type == ScriptCommand::Type::Jump)
+        {
+            drawTargetPicker(selectedCommandIndex_, GetCommandParameter(command, L"target"), L"jump_select_target", 0);
+            drawEditable(selectedCommandIndex_, L"遷移先ID", L"target", GetCommandParameter(command, L"target"));
         }
         else if (command.type == ScriptCommand::Type::Background)
         {
@@ -13232,6 +13847,10 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
 
             drawEditable(selectedCommandIndex_, L"\u5ea7\u6a19X", L"x", GetCommandParameter(command, L"x"));
             drawEditable(selectedCommandIndex_, L"\u5ea7\u6a19Y", L"y", GetCommandParameter(command, L"y"));
+            RECT toolButtonRect = { panelRect.left + 20, cursorY, panelRect.left + 188, cursorY + 30 };
+            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"調整中" : L"位置調整ツールを開く", RGB(92, 102, 116));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"character_adjust", selectedCommandIndex_, 0, toolButtonRect });
+            cursorY += 40;
             drawEditable(selectedCommandIndex_, L"\u30b9\u30b1\u30fc\u30eb", L"scale", GetCommandParameter(command, L"scale"));
             drawEditable(selectedCommandIndex_, L"\u900f\u660e\u5ea6", L"opacity", GetCommandParameter(command, L"opacity"));
             drawEditable(selectedCommandIndex_, L"\u80cc\u666f\u8272", L"color", GetCommandParameter(command, L"color"));
@@ -13350,6 +13969,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawEditable(selectedCommandIndex_, L"\u6a2a\u4f4d\u7f6e", L"x", GetCommandParameter(command, L"x"));
             drawEditable(selectedCommandIndex_, L"\u30b9\u30b1\u30fc\u30eb", L"scale", GetCommandParameter(command, L"scale"));
             drawEditable(selectedCommandIndex_, L"\u900f\u660e\u5ea6", L"opacity", GetCommandParameter(command, L"opacity"));
+            drawCharacterFadeControls(selectedCommandIndex_, command);
 
             RECT visibleTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
             RECT visibleButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
@@ -13360,6 +13980,11 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"toggle_visible", selectedCommandIndex_, 0, visibleButtonRect });
             cursorY += lineHeight;
             drawLine(L"\u30d7\u30ec\u30d3\u30e5\u30fc\u7a93\u3067\u30c9\u30e9\u30c3\u30b0\u3059\u308b\u3068\u6a2a/\u7e26\u4f4d\u7f6e\u3092\u305d\u306e\u307e\u307e\u8abf\u6574\u3067\u304d\u307e\u3059\u3002", RGB(180, 188, 196));
+        }
+        else if (command.type == ScriptCommand::Type::HideCharacter)
+        {
+            drawEditable(selectedCommandIndex_, L"対象", L"pos", GetCommandParameter(command, L"pos"));
+            drawCharacterFadeControls(selectedCommandIndex_, command);
         }
         else if (command.type == ScriptCommand::Type::Bgm || command.type == ScriptCommand::Type::Se || command.type == ScriptCommand::Type::Voice)
         {
