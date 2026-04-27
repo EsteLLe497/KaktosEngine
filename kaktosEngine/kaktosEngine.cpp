@@ -12,6 +12,7 @@ WCHAR szWindowClass[MAX_LOADSTRING];
 const wchar_t* kPreviewWindowClass = L"KaktosPreviewWindow";
 NovelRuntime g_runtime;
 bool g_playerMode = false;
+HBRUSH g_darkEditBrush = nullptr;
 
 ATOM MyRegisterClass(HINSTANCE hInstance);
 BOOL InitInstance(HINSTANCE, int);
@@ -414,6 +415,21 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         return 0;
     }
+    case WM_CTLCOLOREDIT:
+    {
+        const int controlId = GetDlgCtrlID(reinterpret_cast<HWND>(lParam));
+        if (controlId == IDC_INSPECTOR_EDIT || controlId == IDC_EVENT_TEXT_EDIT)
+        {
+            SetTextColor(reinterpret_cast<HDC>(wParam), RGB(236, 242, 248));
+            SetBkColor(reinterpret_cast<HDC>(wParam), RGB(22, 28, 36));
+            if (!g_darkEditBrush)
+            {
+                g_darkEditBrush = CreateSolidBrush(RGB(22, 28, 36));
+            }
+            return reinterpret_cast<LRESULT>(g_darkEditBrush);
+        }
+        break;
+    }
     case WM_PAINT:
     {
         PAINTSTRUCT ps;
@@ -450,6 +466,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_DESTROY:
+        if (g_darkEditBrush)
+        {
+            DeleteObject(g_darkEditBrush);
+            g_darkEditBrush = nullptr;
+        }
         PostQuitMessage(0);
         return 0;
     default:

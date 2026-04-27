@@ -368,6 +368,7 @@ std::wstring SerializeScenario(const ScenarioDocument& document)
             output += AppendAttribute(L"prompt", command.parameters.count(L"prompt") ? command.parameters.at(L"prompt") : L"");
             output += AppendAttribute(L"x", command.parameters.count(L"x") ? command.parameters.at(L"x") : L"");
             output += AppendAttribute(L"y", command.parameters.count(L"y") ? command.parameters.at(L"y") : L"");
+            output += AppendAttribute(L"button_image", command.parameters.count(L"button_image") ? command.parameters.at(L"button_image") : L"");
             output += L"]\r\n";
             for (const auto& link : command.links)
             {
@@ -632,6 +633,7 @@ bool ParseScenario(const std::wstring& scenarioText, ScenarioDocument& document,
             SetCommandParameter(command, L"prompt", GetAttributeValue(body, L"prompt"));
             SetCommandParameter(command, L"x", GetAttributeValue(body, L"x"));
             SetCommandParameter(command, L"y", GetAttributeValue(body, L"y"));
+            SetCommandParameter(command, L"button_image", GetAttributeValue(body, L"button_image"));
 
             while (std::getline(input, line))
             {

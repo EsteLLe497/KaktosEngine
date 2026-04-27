@@ -333,7 +333,7 @@ namespace
                     break;
                 }
             }
-            else if (!CopyFileW(sourcePath.c_str(), targetPath.c_str(), TRUE))
+            else if (!CopyFileW(sourcePath.c_str(), targetPath.c_str(), FALSE))
             {
                 ok = false;
                 break;
@@ -960,7 +960,7 @@ void NovelRuntime::EnsureChildControls()
     if (!inspectorEdit_)
     {
         inspectorEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
+            0,
             L"EDIT",
             L"",
             WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
@@ -972,15 +972,16 @@ void NovelRuntime::EnsureChildControls()
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_INSPECTOR_EDIT)),
             GetModuleHandleW(nullptr),
             nullptr);
+        SendMessageW(inspectorEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     }
 
     if (!eventTextEdit_)
     {
         eventTextEdit_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE,
+            0,
             L"EDIT",
             L"",
-            WS_CHILD | WS_TABSTOP | ES_AUTOVSCROLL | ES_MULTILINE | WS_VSCROLL,
+            WS_CHILD | WS_TABSTOP | ES_AUTOVSCROLL | ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL,
             0,
             0,
             0,
@@ -989,6 +990,7 @@ void NovelRuntime::EnsureChildControls()
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_EVENT_TEXT_EDIT)),
             GetModuleHandleW(nullptr),
             nullptr);
+        SendMessageW(eventTextEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     }
 
     if (!sceneNameEdit_)
@@ -1187,7 +1189,7 @@ void NovelRuntime::InitializeToolbarItems()
     toolbarItems_.push_back(ToolbarItem{ L"project", L"プロジェクト", L"ui\\project.png", nullptr });
     toolbarItems_.push_back(ToolbarItem{ L"preview", L"\u30d7\u30ec\u30d3\u30e5\u30fc", L"ui\\preview.png", nullptr });
     toolbarItems_.push_back(ToolbarItem{ L"save", L"\u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u4fdd\u5b58", L"ui\\save.png", nullptr });
-    toolbarItems_.push_back(ToolbarItem{ L"characters", L"\u30ad\u30e3\u30e9\u30af\u30bf\u30fc\u7ba1\u7406", L"ui\\material_character.png", nullptr });
+    toolbarItems_.push_back(ToolbarItem{ L"story_studio", L"\u4f5c\u54c1\u8a2d\u8a08", L"ui\\material_character.png", nullptr });
     toolbarItems_.push_back(ToolbarItem{ L"config", L"\u8a2d\u5b9a", L"ui\\config.png", nullptr });
     toolbarItems_.push_back(ToolbarItem{ L"build", L"\u66f8\u304d\u51fa\u3057", L"ui\\build.png", nullptr });
 
@@ -2397,6 +2399,24 @@ void NovelRuntime::ActivateChoice(const ScriptCommand& command)
     activeChoices_.clear();
     activeChoiceOffsetX_ = ParseIntValue(GetCommandParameter(command, L"x"), 0);
     activeChoiceOffsetY_ = ParseIntValue(GetCommandParameter(command, L"y"), 0);
+    choiceButtonImagePath_.clear();
+    choiceButtonImage_.reset();
+    const std::wstring buttonImagePath = Trim(GetCommandParameter(command, L"button_image"));
+    if (!buttonImagePath.empty())
+    {
+        std::wstring fullPath = CombinePath(scenarioBaseDir_, buttonImagePath);
+        auto image = TryLoadImage(fullPath);
+        if (!image)
+        {
+            image = TryLoadImage(buttonImagePath);
+            fullPath = buttonImagePath;
+        }
+        if (image)
+        {
+            choiceButtonImagePath_ = fullPath;
+            choiceButtonImage_ = std::move(image);
+        }
+    }
     for (size_t i = 0; i < command.links.size(); ++i)
     {
         const std::wstring conditionName = GetCommandParameter(command, GetChoiceParamKey(L"__choice_cond_name_", i));
@@ -2568,6 +2588,69 @@ std::vector<ScenarioIssue> NovelRuntime::ValidateScenario() const
         }
         return false;
     };
+    auto fileExistsForProject = [&](const std::wstring& path)
+    {
+        if (path.empty())
+        {
+            return true;
+        }
+
+        const std::wstring candidates[] =
+        {
+            path,
+            CombinePath(scenarioBaseDir_, path),
+            CombinePath(GetScenarioDirectory(), path),
+            CombinePath(GetAssetsRootDirectory(), path),
+        };
+        for (const std::wstring& candidate : candidates)
+        {
+            const DWORD attributes = GetFileAttributesW(candidate.c_str());
+            if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto checkAsset = [&](size_t commandIndex, const std::wstring& value, const std::wstring& label)
+    {
+        if (!value.empty() && !fileExistsForProject(value))
+        {
+            addIssue(commandIndex, label + L"が見つかりません: " + value);
+        }
+    };
+    auto isKnownCharacter = [&](const std::wstring& id)
+    {
+        return !id.empty() && FindCharacterDefinition(id) != nullptr;
+    };
+    auto hasExpression = [&](const CharacterDefinition& definition, const std::wstring& expressionName)
+    {
+        if (expressionName.empty())
+        {
+            return true;
+        }
+        for (const CharacterExpressionDefinition& expression : definition.expressions)
+        {
+            if (expression.name == expressionName)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto checkColor = [&](size_t commandIndex, const ScriptCommand& command, const std::wstring& key)
+    {
+        const std::wstring value = GetCommandParameter(command, key);
+        if (value.empty())
+        {
+            return;
+        }
+        COLORREF color = RGB(0, 0, 0);
+        if (!TryParseHexColor(value, color))
+        {
+            addIssue(commandIndex, L"色指定が不正です: " + key + L"=" + value);
+        }
+    };
 
     for (const VariableDefinition& variable : variableDefinitions_)
     {
@@ -2681,6 +2764,7 @@ std::vector<ScenarioIssue> NovelRuntime::ValidateScenario() const
             {
                 addIssue(i, L"選択肢の枝がありません");
             }
+            checkAsset(i, GetCommandParameter(command, L"button_image"), L"選択肢ボタン画像");
             for (size_t linkIndex = 0; linkIndex < command.links.size(); ++linkIndex)
             {
                 const auto& link = command.links[linkIndex];
@@ -2702,6 +2786,11 @@ std::vector<ScenarioIssue> NovelRuntime::ValidateScenario() const
                 {
                     addIssue(i, L"選択肢条件の変数が未定義です: " + conditionName);
                 }
+                const std::wstring conditionValue = GetCommandParameter(command, GetChoiceParamKey(L"__choice_cond_value_", linkIndex));
+                if (!conditionName.empty() && conditionValue.empty())
+                {
+                    addIssue(i, L"選択肢条件の値が空です: " + std::to_wstring(linkIndex + 1));
+                }
             }
         }
 
@@ -2720,6 +2809,10 @@ std::vector<ScenarioIssue> NovelRuntime::ValidateScenario() const
                 }
                 knownVariables.insert(name);
             }
+            if (command.type == ScriptCommand::Type::IfJump && GetCommandParameter(command, L"value").empty())
+            {
+                addIssue(i, L"条件分岐の比較値が空です");
+            }
         }
 
         if (command.type == ScriptCommand::Type::AddValue)
@@ -2731,17 +2824,86 @@ std::vector<ScenarioIssue> NovelRuntime::ValidateScenario() const
             }
         }
 
-        if (command.type == ScriptCommand::Type::Background ||
-            command.type == ScriptCommand::Type::Character ||
-            command.type == ScriptCommand::Type::Bgm ||
-            command.type == ScriptCommand::Type::Se ||
-            command.type == ScriptCommand::Type::Voice)
+        if (command.type == ScriptCommand::Type::Background)
+        {
+            checkAsset(i, GetCommandParameter(command, L"storage"), L"背景画像");
+        }
+
+        if (command.type == ScriptCommand::Type::Character)
+        {
+            const std::wstring name = GetCommandParameter(command, L"name");
+            const std::wstring face = GetCommandParameter(command, L"face");
+            const std::wstring storage = GetCommandParameter(command, L"storage");
+            const CharacterDefinition* definition = FindCharacterDefinition(name);
+            if (storage.empty() && !name.empty() && !definition)
+            {
+                addIssue(i, L"キャラクタータグが未定義です: " + name);
+            }
+            if (definition)
+            {
+                if (!hasExpression(*definition, face))
+                {
+                    addIssue(i, L"表情差分が見つかりません: " + face);
+                }
+                if (storage.empty())
+                {
+                    if (!face.empty())
+                    {
+                        for (const CharacterExpressionDefinition& expression : definition->expressions)
+                        {
+                            if (expression.name == face)
+                            {
+                                checkAsset(i, expression.imagePath, L"表情画像");
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        checkAsset(i, definition->baseImagePath, L"キャラクター基準画像");
+                    }
+                }
+            }
+            checkAsset(i, storage, L"立ち絵画像");
+        }
+
+        if (command.type == ScriptCommand::Type::Bgm || command.type == ScriptCommand::Type::Se || command.type == ScriptCommand::Type::Voice)
         {
             const std::wstring storage = GetCommandParameter(command, L"storage");
-            if (!storage.empty() && !FileExistsForScenario(scenarioBaseDir_, storage))
+            if (storage.empty())
             {
-                addIssue(i, L"素材ファイルが見つかりません: " + storage);
+                addIssue(i, L"音声ファイルが未設定です");
             }
+            checkAsset(i, storage, L"音声ファイル");
+        }
+
+        if (command.type == ScriptCommand::Type::Text)
+        {
+            const std::wstring nameTarget = GetCommandParameter(command, L"name_target");
+            if (ParseBoolValue(GetCommandParameter(command, L"name_visible"), false) && !nameTarget.empty() && !isKnownCharacter(nameTarget))
+            {
+                addIssue(i, L"本文の名前タグが未定義です: " + nameTarget);
+            }
+            checkAsset(i, GetCommandParameter(command, L"name_image"), L"本文の名前画像");
+        }
+
+        if (command.type == ScriptCommand::Type::MessageStyle)
+        {
+            checkAsset(i, GetCommandParameter(command, L"image"), L"メッセージ枠画像");
+            checkColor(i, command, L"color");
+            checkColor(i, command, L"border");
+        }
+
+        if (command.type == ScriptCommand::Type::NameWindow)
+        {
+            checkAsset(i, GetCommandParameter(command, L"image"), L"名前欄画像");
+            checkColor(i, command, L"color");
+            checkColor(i, command, L"border");
+        }
+
+        if (command.type == ScriptCommand::Type::TextColor || command.type == ScriptCommand::Type::NameColor || command.type == ScriptCommand::Type::Fade || command.type == ScriptCommand::Type::Flash || command.type == ScriptCommand::Type::Tint)
+        {
+            checkColor(i, command, L"color");
         }
 
         const wchar_t* numericKeys[] = { L"time", L"x", L"y", L"scale", L"opacity", L"volume", L"fadein", L"fadeout", L"power" };
@@ -3198,6 +3360,23 @@ bool NovelRuntime::HandleClick(POINT point)
         return HandleProjectLauncherClick(point);
     }
 
+    if (storyOverviewVisible_)
+    {
+        return HandleStoryOverviewClick(point);
+    }
+    if (storyThemeVisible_)
+    {
+        return HandleStoryThemeClick(point);
+    }
+    if (storyPlotVisible_)
+    {
+        return HandleStoryPlotClick(point);
+    }
+    if (storyTimelineVisible_)
+    {
+        return HandleStoryTimelineClick(point);
+    }
+
     if (variableManagerVisible_)
     {
         if (variableFieldDialogVisible_)
@@ -3287,6 +3466,22 @@ bool NovelRuntime::HandleClick(POINT point)
 
             selectedVariableDefinitionIndex_ = target.variableIndex;
             VariableDefinition& definition = variableDefinitions_[target.variableIndex];
+            if (StartsWithText(target.action, L"usage_select:"))
+            {
+                const size_t commandIndex = static_cast<size_t>(_wtoi(target.action.substr(13).c_str()));
+                if (commandIndex < scenario_.commands.size())
+                {
+                    selectedCommandIndex_ = commandIndex;
+                    selectedChoiceLinkIndex_ = 0;
+                    HideVariableManagerDialog();
+                    statusText_ = L"変数の使用箇所へ移動しました";
+                    if (hostWindow_)
+                    {
+                        InvalidateRect(hostWindow_, nullptr, FALSE);
+                    }
+                }
+                return true;
+            }
             if (target.action == L"edit_name")
             {
                 BeginVariableFieldEdit(L"変数名", L"edit_name", target.variableIndex, definition.name);
@@ -3976,6 +4171,13 @@ bool NovelRuntime::HandleFileDrop(POINT clientPoint, const std::vector<std::wstr
         return false;
     }
 
+    if (storyOverviewVisible_ && PtInRect(&storyImageDropRect_, clientPoint))
+    {
+        storyImagePath_ = MakeProjectRelativeAssetPath(paths.front());
+        statusText_ = L"作品イメージ画像を設定しました";
+        return true;
+    }
+
     const RECT leftPanelRect = GetLeftPanelRect(lastClientRect_);
     if (leftPanelTab_ != LeftPanelTab::Materials || !HasVisibleArea(leftPanelRect) || !PtInRect(&leftPanelRect, clientPoint))
     {
@@ -4099,9 +4301,23 @@ bool NovelRuntime::HandleMouseDown(POINT point)
 bool NovelRuntime::HandleMouseMove(POINT point)
 {
     lastMousePoint_ = point;
+    const std::wstring newHoverHelp = GetHoverHelpText(point);
+    if (newHoverHelp != hoverHelpText_)
+    {
+        hoverHelpText_ = newHoverHelp;
+        if (hostWindow_)
+        {
+            InvalidateRect(hostWindow_, nullptr, FALSE);
+        }
+    }
+    if (storyThemeVisible_)
+    {
+        if (PtInRect(&storyThemeSaveRect_, point)) return L"テーマ項目の保存ボタンです。中身の保存は次の段階で実装します。";
+        return L"作品テーマ、終着点、文字数、ターゲット層を整理する画面です。";
+    }
     if (projectLauncherVisible_)
     {
-        return false;
+        return !newHoverHelp.empty();
     }
 
     if (assetDragActive_)
@@ -4424,6 +4640,24 @@ bool NovelRuntime::HandleMouseWheel(short delta, POINT point)
         settingsScrollOffset_ = (std::max)(0, (std::min)(settingsScrollOffset_ + step, settingsScrollMax_));
         return true;
     }
+    if (storyThemeVisible_ && PtInRect(&storyThemePanelRect_, point))
+    {
+        const int step = delta > 0 ? -64 : 64;
+        storyThemeScrollOffset_ = (std::max)(0, (std::min)(storyThemeScrollOffset_ + step, storyThemeScrollMax_));
+        return true;
+    }
+    if (storyPlotVisible_ && PtInRect(&storyPlotPanelRect_, point))
+    {
+        const int step = delta > 0 ? -64 : 64;
+        storyPlotScrollOffset_ = (std::max)(0, (std::min)(storyPlotScrollOffset_ + step, storyPlotScrollMax_));
+        return true;
+    }
+    if (storyTimelineVisible_ && PtInRect(&storyTimelinePanelRect_, point))
+    {
+        const int step = delta > 0 ? -64 : 64;
+        storyTimelineScrollOffset_ = (std::max)(0, (std::min)(storyTimelineScrollOffset_ + step, storyTimelineScrollMax_));
+        return true;
+    }
 
     const RECT leftPanelRect = GetLeftPanelRect(lastClientRect_);
     if (leftPanelTab_ == LeftPanelTab::Components && PtInRect(&leftPanelRect, point))
@@ -4582,6 +4816,7 @@ ScriptCommand NovelRuntime::CreateDefaultCommand(ScriptCommand::Type type) const
         command.parameters[L"prompt"] = L"\u65b0\u3057\u3044\u9078\u629e\u80a2";
         command.parameters[L"x"] = L"0";
         command.parameters[L"y"] = L"0";
+        command.parameters[L"button_image"] = L"";
         command.links.push_back({ L"\u9078\u629e\u80a21", L"start" });
         command.links.push_back({ L"\u9078\u629e\u80a22", L"start" });
         break;
@@ -5022,6 +5257,14 @@ void NovelRuntime::CommitInspectorEdit()
         value.resize(length);
         editingBuffer_ = value;
     }
+    if (editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ != L"story_title" && eventTextEdit_)
+    {
+        const int length = GetWindowTextLengthW(eventTextEdit_);
+        std::wstring value(static_cast<size_t>(length) + 1, L'\0');
+        GetWindowTextW(eventTextEdit_, &value[0], length + 1);
+        value.resize(length);
+        editingBuffer_ = value;
+    }
 
     if (editingCommandIndex_ == static_cast<size_t>(-1))
     {
@@ -5037,6 +5280,81 @@ void NovelRuntime::CommitInspectorEdit()
         editingLabel_.clear();
         editingBuffer_.clear();
         editingKey_.clear();
+        return;
+    }
+    if (editingCommandIndex_ == static_cast<size_t>(-2))
+    {
+        if (editingKey_ == L"story_title")
+        {
+            storyTitle_ = editingBuffer_.empty() ? L"未定~undecided~" : editingBuffer_;
+            scenario_.title = storyTitle_;
+        }
+        else if (editingKey_ == L"story_synopsis")
+        {
+            storySynopsis_ = editingBuffer_;
+        }
+        else if (editingKey_ == L"story_theme") storyThemeText_ = editingBuffer_;
+        else if (editingKey_ == L"story_goal") storyGoalText_ = editingBuffer_;
+        else if (editingKey_ == L"story_target_words") storyTargetWords_ = editingBuffer_;
+        else if (editingKey_ == L"story_target_age_gender") storyTargetAgeGender_ = editingBuffer_;
+        else if (editingKey_ == L"story_target_taste") storyTargetTaste_ = editingBuffer_;
+        else if (editingKey_ == L"story_target_comparable") storyTargetComparable_ = editingBuffer_;
+        else if (StartsWithText(editingKey_, L"story_plot_intro_item.") ||
+                 StartsWithText(editingKey_, L"story_plot_development_item.") ||
+                 StartsWithText(editingKey_, L"story_plot_turn_item.") ||
+                 StartsWithText(editingKey_, L"story_plot_conclusion_item."))
+        {
+            auto joinItems = [](const std::vector<std::wstring>& items)
+            {
+                std::wstring joined;
+                for (const std::wstring& item : items)
+                {
+                    if (!joined.empty()) joined += L"\r\n";
+                    joined += item;
+                }
+                return joined;
+            };
+            auto updateItem = [&](const std::wstring& prefix, std::vector<std::wstring>& items, std::wstring& legacy)
+            {
+                if (!StartsWithText(editingKey_, prefix))
+                {
+                    return false;
+                }
+                const size_t index = static_cast<size_t>(_wtoi(editingKey_.substr(prefix.size()).c_str()));
+                if (items.empty() && !legacy.empty())
+                {
+                    std::wistringstream input(legacy);
+                    std::wstring line;
+                    while (std::getline(input, line))
+                    {
+                        if (!line.empty() && line.back() == L'\r') line.pop_back();
+                        items.push_back(line);
+                    }
+                }
+                while (items.size() <= index) items.push_back(L"");
+                items[index] = editingBuffer_;
+                legacy = joinItems(items);
+                return true;
+            };
+            updateItem(L"story_plot_intro_item.", storyPlotIntroItems_, storyPlotIntro_) ||
+                updateItem(L"story_plot_development_item.", storyPlotDevelopmentItems_, storyPlotDevelopment_) ||
+                updateItem(L"story_plot_turn_item.", storyPlotTurnItems_, storyPlotTurn_) ||
+                updateItem(L"story_plot_conclusion_item.", storyPlotConclusionItems_, storyPlotConclusion_);
+        }
+        else if (StartsWithText(editingKey_, L"story_timeline_cell."))
+        {
+            storyTimelineCells_[editingKey_.substr(20)] = editingBuffer_;
+        }
+        else if (editingKey_ == L"story_plot_intro") storyPlotIntro_ = editingBuffer_.empty() ? L"起" : editingBuffer_;
+        else if (editingKey_ == L"story_plot_development") storyPlotDevelopment_ = editingBuffer_.empty() ? L"承" : editingBuffer_;
+        else if (editingKey_ == L"story_plot_turn") storyPlotTurn_ = editingBuffer_.empty() ? L"転" : editingBuffer_;
+        else if (editingKey_ == L"story_plot_conclusion") storyPlotConclusion_ = editingBuffer_.empty() ? L"結" : editingBuffer_;
+        SyncDocumentMetadata();
+        inspectorEditing_ = false;
+        editingLabel_.clear();
+        editingBuffer_.clear();
+        editingKey_.clear();
+        statusText_ = L"作品情報を更新しました";
         return;
     }
 
@@ -5183,6 +5501,36 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
                 return true;
             }
         }
+        if (StartsWithText(target.action, L"effect_time:"))
+        {
+            const int value = (std::max)(0, _wtoi(target.action.substr(12).c_str()));
+            PushUndoSnapshot();
+            command.parameters[L"time"] = std::to_wstring(value);
+            SyncDocumentMetadata();
+            RefreshPreviewIfActive();
+            statusText_ = L"演出時間を " + std::to_wstring(value) + L"ms にしました";
+            return true;
+        }
+        if (target.action == L"effect_parallel_toggle")
+        {
+            PushUndoSnapshot();
+            const bool current = ParseBoolValue(GetCommandParameter(command, L"parallel"), false);
+            command.parameters[L"parallel"] = current ? L"false" : L"true";
+            SyncDocumentMetadata();
+            RefreshPreviewIfActive();
+            statusText_ = current ? L"演出を完了待ちにしました" : L"演出を並列にしました";
+            return true;
+        }
+        if (target.action == L"effect_preview")
+        {
+            if (!previewWindow_ || !IsWindowVisible(previewWindow_))
+            {
+                TogglePreviewWindow();
+            }
+            StartPreviewFromIndex(target.commandIndex);
+            statusText_ = L"この演出からプレビューします";
+            return true;
+        }
         if (target.action == L"browse_image")
         {
             return BrowseCommandAsset(target.commandIndex, L"storage", false);
@@ -5198,6 +5546,10 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
         if (target.action == L"browse_text_name_image")
         {
             return BrowseCommandAsset(target.commandIndex, L"name_image", false);
+        }
+        if (target.action == L"browse_choice_button_image")
+        {
+            return BrowseCommandAsset(target.commandIndex, L"button_image", false);
         }
         if (target.action == L"clear_image")
         {
@@ -5242,6 +5594,17 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             command.parameters[L"name_image"].clear();
             SyncDocumentMetadata();
             statusText_ = L"本文の名前画像を解除しました";
+            RefreshPreviewIfActive();
+            return true;
+        }
+        if (target.action == L"clear_choice_button_image" && command.type == ScriptCommand::Type::Choice)
+        {
+            PushUndoSnapshot();
+            command.parameters[L"button_image"].clear();
+            SyncDocumentMetadata();
+            choiceButtonImagePath_.clear();
+            choiceButtonImage_.reset();
+            statusText_ = L"選択肢ボタン画像を解除しました";
             RefreshPreviewIfActive();
             return true;
         }
@@ -5725,6 +6088,10 @@ bool NovelRuntime::BrowseCommandAsset(size_t commandIndex, const std::wstring& k
         }
     }
     SyncDocumentMetadata();
+    if (mutableCommand.type == ScriptCommand::Type::Choice && key == L"button_image" && waitingForChoice_)
+    {
+        ActivateChoice(mutableCommand);
+    }
     statusText_ = audio ? L"\u97f3\u58f0\u30d5\u30a1\u30a4\u30eb\u3092\u66f4\u65b0\u3057\u307e\u3057\u305f" : L"\u753b\u50cf\u30d5\u30a1\u30a4\u30eb\u3092\u66f4\u65b0\u3057\u307e\u3057\u305f";
     RefreshPreviewIfActive();
     return true;
@@ -5829,6 +6196,12 @@ bool NovelRuntime::HandlePreviewClick(POINT point)
             ShowSettingsDialog();
             return true;
         }
+        if (PtInRect(&previewMenuDebugRect_, point))
+        {
+            previewDebugVisible_ = !previewDebugVisible_;
+            statusText_ = previewDebugVisible_ ? L"デバッグ表示をONにしました" : L"デバッグ表示をOFFにしました";
+            return true;
+        }
         if (PtInRect(&previewMenuFullscreenRect_, point))
         {
             previewMenuVisible_ = false;
@@ -5923,7 +6296,8 @@ bool NovelRuntime::HandlePreviewMouseDown(POINT point)
     ScriptCommand& command = scenario_.commands[adjustCharacterCommandIndex_];
     if (command.type != ScriptCommand::Type::Character &&
         command.type != ScriptCommand::Type::Background &&
-        command.type != ScriptCommand::Type::Choice)
+        command.type != ScriptCommand::Type::Choice &&
+        command.type != ScriptCommand::Type::Pan)
     {
         return false;
     }
@@ -5963,7 +6337,8 @@ bool NovelRuntime::HandlePreviewMouseMove(POINT point)
     ScriptCommand& command = scenario_.commands[adjustCharacterCommandIndex_];
     if (command.type != ScriptCommand::Type::Character &&
         command.type != ScriptCommand::Type::Background &&
-        command.type != ScriptCommand::Type::Choice)
+        command.type != ScriptCommand::Type::Choice &&
+        command.type != ScriptCommand::Type::Pan)
     {
         return false;
     }
@@ -5989,6 +6364,13 @@ bool NovelRuntime::HandlePreviewMouseMove(POINT point)
     {
         activeChoiceOffsetX_ = ParseIntValue(command.parameters[L"x"], 0);
         activeChoiceOffsetY_ = ParseIntValue(command.parameters[L"y"], 0);
+    }
+    else if (command.type == ScriptCommand::Type::Pan)
+    {
+        stageOffsetX_ = ParseIntValue(command.parameters[L"x"], 0);
+        stageOffsetY_ = ParseIntValue(command.parameters[L"y"], 0);
+        panTargetX_ = stageOffsetX_;
+        panTargetY_ = stageOffsetY_;
     }
     statusText_ = L"横位置: " + command.parameters[L"x"] + L" / 縦位置: " + command.parameters[L"y"];
     if (hostWindow_)
@@ -6230,12 +6612,84 @@ bool NovelRuntime::HandleControlCommand(WPARAM wParam, LPARAM lParam)
         GetWindowTextW(inspectorEdit_, &value[0], length + 1);
         value.resize(length);
         editingBuffer_ = value;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == L"story_title")
+        {
+            storyTitle_ = editingBuffer_.empty() ? L"未定~undecided~" : editingBuffer_;
+            scenario_.title = storyTitle_;
+            return false;
+        }
         return true;
     }
 
     if (controlId == IDC_EVENT_TEXT_EDIT && notifyCode == EN_CHANGE && eventTextEdit_)
     {
-        if (expandedTextCommandIndex_ < scenario_.commands.size() && scenario_.commands[expandedTextCommandIndex_].type == ScriptCommand::Type::Text)
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ != L"story_title")
+        {
+            const int length = GetWindowTextLengthW(eventTextEdit_);
+            std::wstring value(static_cast<size_t>(length) + 1, L'\0');
+            GetWindowTextW(eventTextEdit_, &value[0], length + 1);
+            value.resize(length);
+            editingBuffer_ = value;
+            if (editingKey_ == L"story_synopsis") storySynopsis_ = value;
+            else if (editingKey_ == L"story_theme") storyThemeText_ = value;
+            else if (editingKey_ == L"story_goal") storyGoalText_ = value;
+            else if (editingKey_ == L"story_target_words") storyTargetWords_ = value;
+            else if (editingKey_ == L"story_target_age_gender") storyTargetAgeGender_ = value;
+            else if (editingKey_ == L"story_target_taste") storyTargetTaste_ = value;
+            else if (editingKey_ == L"story_target_comparable") storyTargetComparable_ = value;
+            else if (StartsWithText(editingKey_, L"story_plot_intro_item.") ||
+                     StartsWithText(editingKey_, L"story_plot_development_item.") ||
+                     StartsWithText(editingKey_, L"story_plot_turn_item.") ||
+                     StartsWithText(editingKey_, L"story_plot_conclusion_item."))
+            {
+                auto joinItems = [](const std::vector<std::wstring>& items)
+                {
+                    std::wstring joined;
+                    for (const std::wstring& item : items)
+                    {
+                        if (!joined.empty()) joined += L"\r\n";
+                        joined += item;
+                    }
+                    return joined;
+                };
+                auto updateItem = [&](const std::wstring& prefix, std::vector<std::wstring>& items, std::wstring& legacy)
+                {
+                    if (!StartsWithText(editingKey_, prefix))
+                    {
+                        return false;
+                    }
+                    const size_t index = static_cast<size_t>(_wtoi(editingKey_.substr(prefix.size()).c_str()));
+                    if (items.empty() && !legacy.empty())
+                    {
+                        std::wistringstream input(legacy);
+                        std::wstring line;
+                        while (std::getline(input, line))
+                        {
+                            if (!line.empty() && line.back() == L'\r') line.pop_back();
+                            items.push_back(line);
+                        }
+                    }
+                    while (items.size() <= index) items.push_back(L"");
+                    items[index] = value;
+                    legacy = joinItems(items);
+                    return true;
+                };
+                updateItem(L"story_plot_intro_item.", storyPlotIntroItems_, storyPlotIntro_) ||
+                    updateItem(L"story_plot_development_item.", storyPlotDevelopmentItems_, storyPlotDevelopment_) ||
+                    updateItem(L"story_plot_turn_item.", storyPlotTurnItems_, storyPlotTurn_) ||
+                    updateItem(L"story_plot_conclusion_item.", storyPlotConclusionItems_, storyPlotConclusion_);
+            }
+            else if (StartsWithText(editingKey_, L"story_timeline_cell."))
+            {
+                storyTimelineCells_[editingKey_.substr(20)] = value;
+            }
+            else if (editingKey_ == L"story_plot_intro") storyPlotIntro_ = value.empty() ? L"起" : value;
+            else if (editingKey_ == L"story_plot_development") storyPlotDevelopment_ = value.empty() ? L"承" : value;
+            else if (editingKey_ == L"story_plot_turn") storyPlotTurn_ = value.empty() ? L"転" : value;
+            else if (editingKey_ == L"story_plot_conclusion") storyPlotConclusion_ = value.empty() ? L"結" : value;
+            return false;
+        }
+        else if (expandedTextCommandIndex_ < scenario_.commands.size() && scenario_.commands[expandedTextCommandIndex_].type == ScriptCommand::Type::Text)
         {
             const int length = GetWindowTextLengthW(eventTextEdit_);
             std::wstring value(static_cast<size_t>(length) + 1, L'\0');
@@ -6374,8 +6828,12 @@ void NovelRuntime::UpdateChildControls()
         if (inspectorEdit_) ShowWindow(inspectorEdit_, SW_HIDE);
         if (eventTextEdit_) ShowWindow(eventTextEdit_, SW_HIDE);
     }
+    if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_) && eventSearchEdit_)
+    {
+        ShowWindow(eventSearchEdit_, SW_HIDE);
+    }
 
-    if (eventSearchEdit_ && !projectLauncherVisible_ && !projectDialogVisible_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_)
+    if (eventSearchEdit_ && !projectLauncherVisible_ && !projectDialogVisible_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_ && !storyOverviewVisible_ && !storyThemeVisible_ && !storyPlotVisible_ && !storyTimelineVisible_)
     {
         if (leftPanelTab_ == LeftPanelTab::Materials && showComponents_)
         {
@@ -6411,7 +6869,25 @@ void NovelRuntime::UpdateChildControls()
 
     if (inspectorEdit_ && !projectLauncherVisible_ && !projectDialogVisible_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_)
     {
-        if (inspectorEditing_ && HasVisibleArea(currentInspectorRect_))
+        if (storyOverviewVisible_ && inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == L"story_title" && HasVisibleArea(inspectorEditRect_))
+        {
+            RECT editRect = { inspectorEditRect_.left + 12, inspectorEditRect_.top + 7, inspectorEditRect_.right - 12, inspectorEditRect_.bottom - 7 };
+            SetWindowPos(inspectorEdit_, HWND_TOP, editRect.left, editRect.top, editRect.right - editRect.left, editRect.bottom - editRect.top, SWP_SHOWWINDOW);
+            const int length = GetWindowTextLengthW(inspectorEdit_);
+            std::wstring currentValue(static_cast<size_t>(length) + 1, L'\0');
+            GetWindowTextW(inspectorEdit_, &currentValue[0], length + 1);
+            currentValue.resize(length);
+            if (currentValue != editingBuffer_)
+            {
+                SetWindowTextW(inspectorEdit_, editingBuffer_.c_str());
+                SendMessageW(inspectorEdit_, EM_SETSEL, static_cast<WPARAM>(editingBuffer_.size()), static_cast<LPARAM>(editingBuffer_.size()));
+            }
+            if (GetFocus() != inspectorEdit_)
+            {
+                SetFocus(inspectorEdit_);
+            }
+        }
+        else if (inspectorEditing_ && editingCommandIndex_ != static_cast<size_t>(-2) && HasVisibleArea(currentInspectorRect_))
         {
             inspectorEditRect_ = { currentInspectorRect_.left + 20, inspectorCommitRect_.top - 74, currentInspectorRect_.right - 20, inspectorCommitRect_.top - 38 };
             SetWindowPos(inspectorEdit_, nullptr, inspectorEditRect_.left, inspectorEditRect_.top, inspectorEditRect_.right - inspectorEditRect_.left, inspectorEditRect_.bottom - inspectorEditRect_.top, SWP_NOZORDER | SWP_SHOWWINDOW);
@@ -6437,7 +6913,25 @@ void NovelRuntime::UpdateChildControls()
 
     if (eventTextEdit_ && !projectLauncherVisible_ && !projectDialogVisible_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_)
     {
-        if (expandedTextCommandIndex_ < scenario_.commands.size() && HasVisibleArea(eventTextEditRect_))
+        if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_) && inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ != L"story_title" && HasVisibleArea(inspectorEditRect_))
+        {
+            RECT editRect = { inspectorEditRect_.left + 12, inspectorEditRect_.top + 8, inspectorEditRect_.right - 12, inspectorEditRect_.bottom - 8 };
+            SetWindowPos(eventTextEdit_, HWND_TOP, editRect.left, editRect.top, editRect.right - editRect.left, editRect.bottom - editRect.top, SWP_SHOWWINDOW);
+            const int length = GetWindowTextLengthW(eventTextEdit_);
+            std::wstring currentValue(static_cast<size_t>(length) + 1, L'\0');
+            GetWindowTextW(eventTextEdit_, &currentValue[0], length + 1);
+            currentValue.resize(length);
+            if (currentValue != editingBuffer_)
+            {
+                SetWindowTextW(eventTextEdit_, editingBuffer_.c_str());
+                SendMessageW(eventTextEdit_, EM_SETSEL, static_cast<WPARAM>(editingBuffer_.size()), static_cast<LPARAM>(editingBuffer_.size()));
+            }
+            if (GetFocus() != eventTextEdit_)
+            {
+                SetFocus(eventTextEdit_);
+            }
+        }
+        else if (!storyOverviewVisible_ && !storyThemeVisible_ && !storyPlotVisible_ && !storyTimelineVisible_ && expandedTextCommandIndex_ < scenario_.commands.size() && HasVisibleArea(eventTextEditRect_))
         {
             SetWindowPos(eventTextEdit_, nullptr, eventTextEditRect_.left, eventTextEditRect_.top, eventTextEditRect_.right - eventTextEditRect_.left, eventTextEditRect_.bottom - eventTextEditRect_.top, SWP_NOZORDER | SWP_SHOWWINDOW);
             const std::wstring value = GetCommandParameter(scenario_.commands[expandedTextCommandIndex_], L"value");
@@ -6583,6 +7077,13 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
 
     characterDefinitions_.clear();
     variableDefinitions_.clear();
+    storyCategories_.clear();
+    storyPlotIntroItems_.clear();
+    storyPlotDevelopmentItems_.clear();
+    storyPlotTurnItems_.clear();
+    storyPlotConclusionItems_.clear();
+    storyTimelineRows_ = { L"\u30d7\u30ed\u30c3\u30c8", L"\u30b9\u30c8\u30fc\u30ea\u30fc", L"\u4f0f\u7dda" };
+    storyTimelineCells_.clear();
     std::wistringstream input(content);
     std::wstring line;
     while (std::getline(input, line))
@@ -6608,6 +7109,63 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
         else if (key == L"show_flow_graph") showFlowGraph_ = value == L"1";
         else if (key == L"show_preview_panel") showPreviewPanel_ = value == L"1";
         else if (key == L"show_event_list") showEventList_ = value == L"1";
+        else if (key == L"preview_debug_visible") previewDebugVisible_ = value == L"1";
+        else if (key == L"story_production_status") storyProductionStatus_ = UnescapeSaveValue(value);
+        else if (key == L"story_genre") storyGenre_ = UnescapeSaveValue(value);
+        else if (key == L"story_image") storyImagePath_ = UnescapeSaveValue(value);
+        else if (key == L"story_synopsis") storySynopsis_ = UnescapeSaveValue(value);
+        else if (key == L"story_theme") storyThemeText_ = UnescapeSaveValue(value);
+        else if (key == L"story_goal") storyGoalText_ = UnescapeSaveValue(value);
+        else if (key == L"story_target_words") storyTargetWords_ = UnescapeSaveValue(value);
+        else if (key == L"story_target_age_gender") storyTargetAgeGender_ = UnescapeSaveValue(value);
+        else if (key == L"story_target_taste") storyTargetTaste_ = UnescapeSaveValue(value);
+        else if (key == L"story_target_comparable") storyTargetComparable_ = UnescapeSaveValue(value);
+        else if (key == L"story_plot_intro") storyPlotIntro_ = UnescapeSaveValue(value);
+        else if (key == L"story_plot_development") storyPlotDevelopment_ = UnescapeSaveValue(value);
+        else if (key == L"story_plot_turn") storyPlotTurn_ = UnescapeSaveValue(value);
+        else if (key == L"story_plot_conclusion") storyPlotConclusion_ = UnescapeSaveValue(value);
+        else if (StartsWithText(key, L"story_plot_intro_item."))
+        {
+            const size_t index = static_cast<size_t>(_wtoi(key.substr(22).c_str()));
+            while (storyPlotIntroItems_.size() <= index) storyPlotIntroItems_.push_back(L"");
+            storyPlotIntroItems_[index] = UnescapeSaveValue(value);
+        }
+        else if (StartsWithText(key, L"story_plot_development_item."))
+        {
+            const size_t index = static_cast<size_t>(_wtoi(key.substr(28).c_str()));
+            while (storyPlotDevelopmentItems_.size() <= index) storyPlotDevelopmentItems_.push_back(L"");
+            storyPlotDevelopmentItems_[index] = UnescapeSaveValue(value);
+        }
+        else if (StartsWithText(key, L"story_plot_turn_item."))
+        {
+            const size_t index = static_cast<size_t>(_wtoi(key.substr(21).c_str()));
+            while (storyPlotTurnItems_.size() <= index) storyPlotTurnItems_.push_back(L"");
+            storyPlotTurnItems_[index] = UnescapeSaveValue(value);
+        }
+        else if (StartsWithText(key, L"story_plot_conclusion_item."))
+        {
+            const size_t index = static_cast<size_t>(_wtoi(key.substr(27).c_str()));
+            while (storyPlotConclusionItems_.size() <= index) storyPlotConclusionItems_.push_back(L"");
+            storyPlotConclusionItems_[index] = UnescapeSaveValue(value);
+        }
+        else if (StartsWithText(key, L"story_timeline_row."))
+        {
+            const size_t index = static_cast<size_t>(_wtoi(key.substr(19).c_str()));
+            while (storyTimelineRows_.size() <= index) storyTimelineRows_.push_back(L"");
+            storyTimelineRows_[index] = UnescapeSaveValue(value);
+        }
+        else if (StartsWithText(key, L"story_timeline_cell."))
+        {
+            storyTimelineCells_[key.substr(20)] = UnescapeSaveValue(value);
+        }
+        else if (StartsWithText(key, L"story_category."))
+        {
+            const std::wstring category = UnescapeSaveValue(value);
+            if (!category.empty() && storyCategories_.size() < 3)
+            {
+                storyCategories_.push_back(category);
+            }
+        }
         else if (key == L"settings_window_width") editorSettings_.windowWidth = (std::max)(960, _wtoi(value.c_str()));
         else if (key == L"settings_window_height") editorSettings_.windowHeight = (std::max)(540, _wtoi(value.c_str()));
         else if (key == L"settings_default_font" && !value.empty()) editorSettings_.defaultFont = UnescapeSaveValue(value);
@@ -6751,8 +7309,11 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
     SyncVariableDefinitions();
     ApplyEditorUiDefaults();
 
-    showEventList_ = true;
-    if (hostWindow_ && !playerMode_)
+    if (!playerMode_)
+    {
+        showEventList_ = true;
+    }
+    if (hostWindow_)
     {
         SetWindowPos(hostWindow_, nullptr, 0, 0, editorSettings_.windowWidth, editorSettings_.windowHeight, SWP_NOMOVE | SWP_NOZORDER);
     }
@@ -6958,6 +7519,44 @@ std::wstring NovelRuntime::SerializeProjectSettings() const
     projectText += L"show_flow_graph=" + std::wstring(showFlowGraph_ ? L"1" : L"0") + L"\r\n";
     projectText += L"show_preview_panel=" + std::wstring(showPreviewPanel_ ? L"1" : L"0") + L"\r\n";
     projectText += L"show_event_list=" + std::wstring(showEventList_ ? L"1" : L"0") + L"\r\n";
+    projectText += L"preview_debug_visible=" + std::wstring(previewDebugVisible_ ? L"1" : L"0") + L"\r\n";
+    projectText += L"story_production_status=" + EscapeSaveValue(storyProductionStatus_) + L"\r\n";
+    projectText += L"story_genre=" + EscapeSaveValue(storyGenre_) + L"\r\n";
+    for (size_t i = 0; i < storyCategories_.size(); ++i)
+    {
+        projectText += L"story_category." + std::to_wstring(i) + L"=" + EscapeSaveValue(storyCategories_[i]) + L"\r\n";
+    }
+    projectText += L"story_image=" + EscapeSaveValue(storyImagePath_) + L"\r\n";
+    projectText += L"story_synopsis=" + EscapeSaveValue(storySynopsis_) + L"\r\n";
+    projectText += L"story_theme=" + EscapeSaveValue(storyThemeText_) + L"\r\n";
+    projectText += L"story_goal=" + EscapeSaveValue(storyGoalText_) + L"\r\n";
+    projectText += L"story_target_words=" + EscapeSaveValue(storyTargetWords_) + L"\r\n";
+    projectText += L"story_target_age_gender=" + EscapeSaveValue(storyTargetAgeGender_) + L"\r\n";
+    projectText += L"story_target_taste=" + EscapeSaveValue(storyTargetTaste_) + L"\r\n";
+    projectText += L"story_target_comparable=" + EscapeSaveValue(storyTargetComparable_) + L"\r\n";
+    projectText += L"story_plot_intro=" + EscapeSaveValue(storyPlotIntro_) + L"\r\n";
+    projectText += L"story_plot_development=" + EscapeSaveValue(storyPlotDevelopment_) + L"\r\n";
+    projectText += L"story_plot_turn=" + EscapeSaveValue(storyPlotTurn_) + L"\r\n";
+    projectText += L"story_plot_conclusion=" + EscapeSaveValue(storyPlotConclusion_) + L"\r\n";
+    auto appendPlotItems = [&](const std::wstring& prefix, const std::vector<std::wstring>& items)
+    {
+        for (size_t i = 0; i < items.size(); ++i)
+        {
+            projectText += prefix + std::to_wstring(i) + L"=" + EscapeSaveValue(items[i]) + L"\r\n";
+        }
+    };
+    appendPlotItems(L"story_plot_intro_item.", storyPlotIntroItems_);
+    appendPlotItems(L"story_plot_development_item.", storyPlotDevelopmentItems_);
+    appendPlotItems(L"story_plot_turn_item.", storyPlotTurnItems_);
+    appendPlotItems(L"story_plot_conclusion_item.", storyPlotConclusionItems_);
+    for (size_t i = 0; i < storyTimelineRows_.size(); ++i)
+    {
+        projectText += L"story_timeline_row." + std::to_wstring(i) + L"=" + EscapeSaveValue(storyTimelineRows_[i]) + L"\r\n";
+    }
+    for (const auto& cell : storyTimelineCells_)
+    {
+        projectText += L"story_timeline_cell." + cell.first + L"=" + EscapeSaveValue(cell.second) + L"\r\n";
+    }
     projectText += L"settings_window_width=" + std::to_wstring(editorSettings_.windowWidth) + L"\r\n";
     projectText += L"settings_window_height=" + std::to_wstring(editorSettings_.windowHeight) + L"\r\n";
     projectText += L"settings_default_font=" + EscapeSaveValue(editorSettings_.defaultFont) + L"\r\n";
@@ -7044,6 +7643,21 @@ std::wstring NovelRuntime::BuildDefaultProjectSettingsText(const std::wstring& s
     text += L"show_flow_graph=0\r\n";
     text += L"show_preview_panel=0\r\n";
     text += L"show_event_list=1\r\n";
+    text += L"preview_debug_visible=0\r\n";
+    text += L"story_production_status=制作中\r\n";
+    text += L"story_genre=ゲームシナリオ\r\n";
+    text += L"story_image=\r\n";
+    text += L"story_synopsis=\r\n";
+    text += L"story_theme=\r\n";
+    text += L"story_goal=\r\n";
+    text += L"story_target_words=\r\n";
+    text += L"story_target_age_gender=\r\n";
+    text += L"story_target_taste=\r\n";
+    text += L"story_target_comparable=\r\n";
+    text += L"story_plot_intro=起\r\n";
+    text += L"story_plot_development=承\r\n";
+    text += L"story_plot_turn=転\r\n";
+    text += L"story_plot_conclusion=結\r\n";
     text += L"settings_window_width=1280\r\n";
     text += L"settings_window_height=720\r\n";
     text += L"settings_default_font=" + EscapeSaveValue(editorSettings_.defaultFont) + L"\r\n";
@@ -7323,7 +7937,7 @@ bool NovelRuntime::CreateProjectFromDialog()
         return true;
     }
 
-    const wchar_t* subdirs[] = { L"background", L"bgm", L"character", L"fonts", L"picture", L"save", L"se", L"textbox", L"ui" };
+    const wchar_t* subdirs[] = { L"background", L"bgm", L"character", L"choice", L"fonts", L"picture", L"save", L"se", L"textbox", L"ui" };
     for (const wchar_t* subdir : subdirs)
     {
         EnsureDirectoryExists(CombinePath(assetsRoot, subdir));
@@ -7518,9 +8132,24 @@ bool NovelRuntime::ExportBuild()
         return false;
     }
 
-    const std::wstring exportRoot = std::wstring(selectedPath) + L"\\" + GetFileStemPart(scenarioPath_) + L"_export";
+    std::wstring exportName = GetFileStemPart(scenarioPath_);
+    if (!projectPath_.empty())
+    {
+        const std::wstring projectRoot = GetProjectRootFromProjectPath(projectPath_);
+        const std::wstring projectFolderName = GetFileNamePart(projectRoot);
+        if (!projectFolderName.empty())
+        {
+            exportName = projectFolderName;
+        }
+    }
+    if (exportName.empty())
+    {
+        exportName = L"kaktos";
+    }
+
+    const std::wstring exportRoot = std::wstring(selectedPath) + L"\\" + exportName + L"_export";
     const std::wstring exportAssetsDir = exportRoot + L"\\assets";
-    if (!EnsureDirectoryExists(exportRoot) || !EnsureDirectoryExists(exportAssetsDir))
+    if (!EnsureDirectoryExists(exportRoot) || !EnsureDirectoryExists(exportAssetsDir) || !EnsureDirectoryExists(exportAssetsDir + L"\\save"))
     {
         statusText_ = L"\u66f8\u304d\u51fa\u3057\u5148\u306e\u4f5c\u6210\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
         return false;
@@ -7542,6 +8171,7 @@ bool NovelRuntime::ExportBuild()
         statusText_ = L"\u30a2\u30bb\u30c3\u30c8\u306e\u66f8\u304d\u51fa\u3057\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
         return false;
     }
+    DeleteFileW((exportAssetsDir + L"\\.editor_autosave.kauto").c_str());
 
     const std::wstring sourceUiDir = sourceAssetsDir + L"\\ui";
     if (GetFileAttributesW(sourceUiDir.c_str()) != INVALID_FILE_ATTRIBUTES)
@@ -7550,56 +8180,742 @@ bool NovelRuntime::ExportBuild()
     }
 
     const std::wstring exportScenarioPath = exportAssetsDir + L"\\main.ks";
-    if (!CopyFileW(scenarioPath_.c_str(), exportScenarioPath.c_str(), TRUE))
+    if (!CopyFileW(scenarioPath_.c_str(), exportScenarioPath.c_str(), FALSE))
     {
         statusText_ = L"\u30b7\u30ca\u30ea\u30aa\u306e\u66f8\u304d\u51fa\u3057\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
         return false;
     }
 
-    if (!projectPath_.empty())
     {
-        std::wstring projectText;
-        if (TryReadTextFile(projectPath_, projectText))
+        std::wistringstream input(BuildProjectFileText());
+        std::wstring line;
+        std::wstring normalizedProjectText;
+        bool wroteScenarioPath = false;
+        bool wroteDebugVisible = false;
+        while (std::getline(input, line))
         {
-            std::wistringstream input(projectText);
-            std::wstring line;
-            std::wstring normalizedProjectText;
-            bool wroteScenarioPath = false;
-            while (std::getline(input, line))
+            if (!line.empty() && line.back() == L'\r')
             {
-                if (!line.empty() && line.back() == L'\r')
-                {
-                    line.pop_back();
-                }
-                const size_t split = line.find(L'=');
-                if (split != std::wstring::npos && Trim(line.substr(0, split)) == L"scenario_path")
-                {
-                    normalizedProjectText += L"scenario_path=main.ks\r\n";
-                    wroteScenarioPath = true;
-                }
-                else
-                {
-                    normalizedProjectText += line + L"\r\n";
-                }
+                line.pop_back();
             }
-            if (!wroteScenarioPath)
+            const size_t split = line.find(L'=');
+            if (split != std::wstring::npos && Trim(line.substr(0, split)) == L"scenario_path")
             {
-                normalizedProjectText = L"scenario_path=main.ks\r\n" + normalizedProjectText;
+                normalizedProjectText += L"scenario_path=main.ks\r\n";
+                wroteScenarioPath = true;
             }
-            TryWriteTextFile(exportAssetsDir + L"\\project.kproj", normalizedProjectText);
+            else if (split != std::wstring::npos && Trim(line.substr(0, split)) == L"preview_debug_visible")
+            {
+                normalizedProjectText += L"preview_debug_visible=0\r\n";
+                wroteDebugVisible = true;
+            }
+            else
+            {
+                normalizedProjectText += line + L"\r\n";
+            }
+        }
+        if (!wroteScenarioPath)
+        {
+            normalizedProjectText = L"scenario_path=main.ks\r\n" + normalizedProjectText;
+        }
+        if (!wroteDebugVisible)
+        {
+            normalizedProjectText += L"preview_debug_visible=0\r\n";
+        }
+        if (!TryWriteTextFile(exportAssetsDir + L"\\project.kproj", normalizedProjectText))
+        {
+            statusText_ = L"\u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u8a2d\u5b9a\u306e\u66f8\u304d\u51fa\u3057\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
+            return false;
         }
     }
+
+    const std::wstring launchPath = exportRoot + L"\\起動.bat";
+    std::wstring launchText;
+    launchText += L"@echo off\r\n";
+    launchText += L"cd /d \"%~dp0\"\r\n";
+    launchText += L"start \"\" \"%~dp0kaktosPlayer.exe\" --player \"%~dp0assets\\main.ks\"\r\n";
+    TryWriteTextFile(launchPath, launchText);
 
     const std::wstring readmePath = exportRoot + L"\\README.txt";
     std::wstring readme;
     readme += L"Kaktos Engine Export\r\n";
-    readme += L"1. kaktosPlayer.exe \u3092\u8d77\u52d5\r\n";
+    readme += L"1. \u8d77\u52d5.bat \u307e\u305f\u306f kaktosPlayer.exe \u3092\u8d77\u52d5\r\n";
     readme += L"2. assets\\main.ks \u3092\u8aad\u307f\u8fbc\u3093\u3067\u518d\u751f\r\n";
     readme += L"3. assets \u30d5\u30a9\u30eb\u30c0\u306b\u7d20\u6750\u3068 project.kproj \u3092\u540c\u68b1\r\n";
+    readme += L"4. \u66f8\u304d\u51fa\u3057\u6642\u306f\u30c7\u30d0\u30c3\u30b0\u8868\u793a\u3092OFF\u306b\u56fa\u5b9a\r\n";
     TryWriteTextFile(readmePath, readme);
 
     statusText_ = L"\u66f8\u304d\u51fa\u3057\u5b8c\u4e86: " + exportRoot;
     return true;
+}
+
+bool NovelRuntime::BrowseStoryImage()
+{
+    WCHAR fileBuffer[MAX_PATH] = {};
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hostWindow_;
+    ofn.lpstrFilter = L"画像ファイル (*.png;*.jpg;*.jpeg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0すべてのファイル (*.*)\0*.*\0";
+    ofn.lpstrFile = fileBuffer;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn))
+    {
+        statusText_ = L"画像選択をキャンセルしました";
+        return false;
+    }
+    storyImagePath_ = MakeProjectRelativeAssetPath(fileBuffer);
+    statusText_ = L"作品イメージ画像を設定しました";
+    return true;
+}
+
+bool NovelRuntime::HandleStoryOverviewClick(POINT point)
+{
+    if (!PtInRect(&storyOverviewRect_, point))
+    {
+        storyOverviewVisible_ = false;
+        storyStatusDropdownVisible_ = false;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CancelInspectorEdit();
+        }
+        return true;
+    }
+    const wchar_t* statuses[] = { L"制作中", L"制作完了", L"保留", L"制作中断" };
+    if (storyStatusDropdownVisible_)
+    {
+        for (size_t i = 0; i < storyStatusOptionRects_.size() && i < _countof(statuses); ++i)
+        {
+            if (PtInRect(&storyStatusOptionRects_[i], point))
+            {
+                storyProductionStatus_ = statuses[i];
+                storyStatusDropdownVisible_ = false;
+                statusText_ = L"制作状況を更新しました";
+                return true;
+            }
+        }
+        if (!PtInRect(&storyStatusDropdownRect_, point))
+        {
+            storyStatusDropdownVisible_ = false;
+        }
+    }
+    if (PtInRect(&storyOverviewSaveRect_, point))
+    {
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CommitInspectorEdit();
+        }
+        SaveProject();
+        statusText_ = L"作品情報を保存しました";
+        return true;
+    }
+    if (PtInRect(&storyTitleEditRect_, point))
+    {
+        BeginInspectorEdit(static_cast<size_t>(-2), L"story_title", L"タイトル", storyTitle_);
+        return true;
+    }
+    if (PtInRect(&storySynopsisEditRect_, point))
+    {
+        BeginInspectorEdit(static_cast<size_t>(-2), L"story_synopsis", L"あらすじ", storySynopsis_);
+        return true;
+    }
+    if (PtInRect(&storyImageBrowseRect_, point) || PtInRect(&storyImageDropRect_, point))
+    {
+        return BrowseStoryImage();
+    }
+    if (PtInRect(&storyStatusDropdownRect_, point))
+    {
+        storyStatusDropdownVisible_ = !storyStatusDropdownVisible_;
+        return true;
+    }
+    const wchar_t* categories[] = { L"ファンタジー", L"ローファンタジー", L"異世界ファンタジー", L"異世界ロマンスファンタジー", L"現代恋愛", L"恋愛", L"ラブコメ", L"バトル", L"ミステリー", L"ホラー", L"探偵", L"ギャグ", L"冒険活劇", L"歴史もの", L"BL", L"百合", L"TL", L"官能小説", L"教育", L"児童書", L"二次創作" };
+    for (size_t i = 0; i < storyCategoryChipRects_.size() && i < _countof(categories); ++i)
+    {
+        if (PtInRect(&storyCategoryChipRects_[i], point))
+        {
+            const std::wstring category = categories[i];
+            const auto found = std::find(storyCategories_.begin(), storyCategories_.end(), category);
+            if (found != storyCategories_.end())
+            {
+                storyCategories_.erase(found);
+            }
+            else if (storyCategories_.size() < 3)
+            {
+                storyCategories_.push_back(category);
+            }
+            else
+            {
+                statusText_ = L"カテゴリは3つまでです";
+            }
+            return true;
+        }
+    }
+    return true;
+}
+
+bool NovelRuntime::HandleStoryThemeClick(POINT point)
+{
+    if (!PtInRect(&storyThemePanelRect_, point))
+    {
+        if (HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges())
+        {
+            return true;
+        }
+        storyThemeVisible_ = false;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CancelInspectorEdit();
+        }
+        statusText_ = L"テーマ画面を閉じました";
+        return true;
+    }
+    if (PtInRect(&storyThemeSaveRect_, point))
+    {
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CommitInspectorEdit();
+        }
+        SaveProject();
+        statusText_ = L"テーマを保存しました";
+        return true;
+    }
+    for (const auto& field : storyThemeFieldRects_)
+    {
+        if (PtInRect(&field.second, point))
+        {
+            std::wstring value;
+            if (field.first == L"story_theme") value = storyThemeText_;
+            else if (field.first == L"story_goal") value = storyGoalText_;
+            else if (field.first == L"story_target_words") value = storyTargetWords_;
+            else if (field.first == L"story_target_age_gender") value = storyTargetAgeGender_;
+            else if (field.first == L"story_target_taste") value = storyTargetTaste_;
+            else if (field.first == L"story_target_comparable") value = storyTargetComparable_;
+            BeginInspectorEdit(static_cast<size_t>(-2), field.first, L"テーマ項目", value);
+            return true;
+        }
+    }
+    return true;
+}
+
+bool NovelRuntime::HandleStoryPlotClick(POINT point)
+{
+    if (!PtInRect(&storyPlotPanelRect_, point))
+    {
+        if (HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges())
+        {
+            return true;
+        }
+        storyPlotVisible_ = false;
+        storyPlotEditMode_ = false;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CancelInspectorEdit();
+        }
+        statusText_ = L"プロット画面を閉じました";
+        return true;
+    }
+    if (PtInRect(&storyPlotEditRect_, point))
+    {
+        storyPlotEditMode_ = true;
+        statusText_ = L"プロットを編集できます";
+        return true;
+    }
+    if (PtInRect(&storyPlotSaveRect_, point))
+    {
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CommitInspectorEdit();
+        }
+        storyPlotEditMode_ = false;
+        SaveProject();
+        statusText_ = L"プロットを保存しました";
+        return true;
+    }
+    if (storyPlotEditMode_)
+    {
+        auto appendPlotItem = [&](const std::wstring& key)
+        {
+            std::vector<std::wstring>* items = nullptr;
+            if (key == L"story_plot_intro") items = &storyPlotIntroItems_;
+            else if (key == L"story_plot_development") items = &storyPlotDevelopmentItems_;
+            else if (key == L"story_plot_turn") items = &storyPlotTurnItems_;
+            else if (key == L"story_plot_conclusion") items = &storyPlotConclusionItems_;
+            if (!items)
+            {
+                return false;
+            }
+            const size_t index = items->size();
+            items->push_back(L"");
+            BeginInspectorEdit(static_cast<size_t>(-2), key + L"_item." + std::to_wstring(index), L"プロット", L"");
+            statusText_ = L"プロット項目を追加しました";
+            return true;
+        };
+        for (const auto& addTarget : storyPlotAddRects_)
+        {
+            if (PtInRect(&addTarget.second, point))
+            {
+                return appendPlotItem(addTarget.first);
+            }
+        }
+        for (const auto& field : storyPlotFieldRects_)
+        {
+            if (PtInRect(&field.second, point))
+            {
+                std::wstring value;
+                if (field.first == L"story_plot_intro") value = storyPlotIntro_;
+                else if (field.first == L"story_plot_development") value = storyPlotDevelopment_;
+                else if (field.first == L"story_plot_turn") value = storyPlotTurn_;
+                else if (field.first == L"story_plot_conclusion") value = storyPlotConclusion_;
+                else if (StartsWithText(field.first, L"story_plot_intro_item."))
+                {
+                    const size_t index = static_cast<size_t>(_wtoi(field.first.substr(22).c_str()));
+                    if (index < storyPlotIntroItems_.size()) value = storyPlotIntroItems_[index];
+                    else
+                    {
+                        std::vector<std::wstring> items;
+                        std::wistringstream input(storyPlotIntro_);
+                        std::wstring line;
+                        while (std::getline(input, line)) { if (!line.empty() && line.back() == L'\r') line.pop_back(); if (!Trim(line).empty()) items.push_back(Trim(line)); }
+                        if (index < items.size()) value = items[index];
+                    }
+                }
+                else if (StartsWithText(field.first, L"story_plot_development_item."))
+                {
+                    const size_t index = static_cast<size_t>(_wtoi(field.first.substr(28).c_str()));
+                    if (index < storyPlotDevelopmentItems_.size()) value = storyPlotDevelopmentItems_[index];
+                    else
+                    {
+                        std::vector<std::wstring> items;
+                        std::wistringstream input(storyPlotDevelopment_);
+                        std::wstring line;
+                        while (std::getline(input, line)) { if (!line.empty() && line.back() == L'\r') line.pop_back(); if (!Trim(line).empty()) items.push_back(Trim(line)); }
+                        if (index < items.size()) value = items[index];
+                    }
+                }
+                else if (StartsWithText(field.first, L"story_plot_turn_item."))
+                {
+                    const size_t index = static_cast<size_t>(_wtoi(field.first.substr(21).c_str()));
+                    if (index < storyPlotTurnItems_.size()) value = storyPlotTurnItems_[index];
+                    else
+                    {
+                        std::vector<std::wstring> items;
+                        std::wistringstream input(storyPlotTurn_);
+                        std::wstring line;
+                        while (std::getline(input, line)) { if (!line.empty() && line.back() == L'\r') line.pop_back(); if (!Trim(line).empty()) items.push_back(Trim(line)); }
+                        if (index < items.size()) value = items[index];
+                    }
+                }
+                else if (StartsWithText(field.first, L"story_plot_conclusion_item."))
+                {
+                    const size_t index = static_cast<size_t>(_wtoi(field.first.substr(27).c_str()));
+                    if (index < storyPlotConclusionItems_.size()) value = storyPlotConclusionItems_[index];
+                    else
+                    {
+                        std::vector<std::wstring> items;
+                        std::wistringstream input(storyPlotConclusion_);
+                        std::wstring line;
+                        while (std::getline(input, line)) { if (!line.empty() && line.back() == L'\r') line.pop_back(); if (!Trim(line).empty()) items.push_back(Trim(line)); }
+                        if (index < items.size()) value = items[index];
+                    }
+                }
+                BeginInspectorEdit(static_cast<size_t>(-2), field.first, L"プロット", value);
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
+bool NovelRuntime::HandleStoryTimelineClick(POINT point)
+{
+    if (!PtInRect(&storyTimelinePanelRect_, point))
+    {
+        if (HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges())
+        {
+            return true;
+        }
+        storyTimelineVisible_ = false;
+        storyTimelineEditMode_ = false;
+        storyTimelineAddDropdownVisible_ = false;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CancelInspectorEdit();
+        }
+        statusText_ = L"時系列画面を閉じました";
+        return true;
+    }
+    if (PtInRect(&storyTimelineEditRect_, point))
+    {
+        storyTimelineEditMode_ = true;
+        statusText_ = L"時系列を編集できます";
+        return true;
+    }
+    if (PtInRect(&storyTimelineSaveRect_, point))
+    {
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CommitInspectorEdit();
+        }
+        storyTimelineEditMode_ = false;
+        storyTimelineAddDropdownVisible_ = false;
+        SaveProject();
+        statusText_ = L"時系列を保存しました";
+        return true;
+    }
+    if (storyTimelineEditMode_ && PtInRect(&storyTimelineAddRowRect_, point))
+    {
+        storyTimelineAddDropdownVisible_ = !storyTimelineAddDropdownVisible_;
+        return true;
+    }
+    if (storyTimelineAddDropdownVisible_)
+    {
+        const wchar_t* labels[] = { L"ストーリー", L"イベント", L"伏線", L"伏線回収", L"登場人物", L"備考" };
+        for (size_t i = 0; i < storyTimelineAddOptionRects_.size() && i < _countof(labels); ++i)
+        {
+            if (PtInRect(&storyTimelineAddOptionRects_[i].second, point))
+            {
+                storyTimelineRows_.push_back(labels[i]);
+                storyTimelineAddDropdownVisible_ = false;
+                statusText_ = L"時系列の行を追加しました";
+                return true;
+            }
+        }
+    }
+    if (storyTimelineEditMode_)
+    {
+        for (const auto& field : storyTimelineFieldRects_)
+        {
+            if (PtInRect(&field.second, point))
+            {
+                BeginInspectorEdit(static_cast<size_t>(-2), L"story_timeline_cell." + field.first, L"時系列", storyTimelineCells_[field.first]);
+                return true;
+            }
+        }
+    }
+    return true;
+}
+
+std::wstring NovelRuntime::GetToolbarHelpText(const std::wstring& id) const
+{
+    if (id == L"project") return L"プロジェクトの作成、読み込み、最近使ったプロジェクトを開きます。";
+    if (id == L"preview") return L"現在の選択位置からプレビューウィンドウを開閉します。";
+    if (id == L"save") return L"現在のシナリオ、プロジェクト設定、素材設定を保存します。";
+    if (id == L"story_studio") return L"作品設計パネルを開きます。テーマ、構成、資料、メモをまとめる新しい管理画面です。";
+    if (id == L"config") return L"画面サイズ、音量、既定UI、タイトルメニューなどの設定を開きます。";
+    if (id == L"build") return L"プレイヤー実行用フォルダを書き出します。";
+    return L"ツールバーの機能を実行します。";
+}
+
+std::wstring NovelRuntime::GetPaletteHelpText(ScriptCommand::Type type) const
+{
+    switch (type)
+    {
+    case ScriptCommand::Type::Title: return L"作品タイトルを設定します。";
+    case ScriptCommand::Type::Text: return L"本文テキストを表示します。";
+    case ScriptCommand::Type::Choice: return L"選択肢ボタンと分岐先を作ります。条件付き表示も設定できます。";
+    case ScriptCommand::Type::Label: return L"ジャンプや分岐の到達点になるラベルを置きます。";
+    case ScriptCommand::Type::Jump: return L"指定したラベル、または別シナリオへ移動します。";
+    case ScriptCommand::Type::IfJump: return L"変数条件を判定し、成立時だけ指定先へ移動します。";
+    case ScriptCommand::Type::Wait: return L"指定したミリ秒だけ進行を止めます。";
+    case ScriptCommand::Type::Fade: return L"画面、メッセージ、背景、キャラなどへフェードをかけます。";
+    case ScriptCommand::Type::Transition: return L"フェード系の切り替え演出を入れます。";
+    case ScriptCommand::Type::Zoom: return L"画面全体を指定倍率へズームします。";
+    case ScriptCommand::Type::Pan: return L"画面全体の表示位置を横・縦に移動します。";
+    case ScriptCommand::Type::Shake: return L"画面を揺らす演出を入れます。";
+    case ScriptCommand::Type::Flash: return L"画面を一瞬光らせる演出を入れます。";
+    case ScriptCommand::Type::Tint: return L"画面全体に色味を重ねます。";
+    case ScriptCommand::Type::ClearText: return L"表示中の本文を消します。";
+    case ScriptCommand::Type::Character: return L"キャラクターを指定位置へ表示します。タグや表情差分を参照できます。";
+    case ScriptCommand::Type::HideCharacter: return L"表示中のキャラクターを退場させます。";
+    case ScriptCommand::Type::Speaker: return L"話者名を設定します。";
+    case ScriptCommand::Type::ClearSpeaker: return L"話者名を消します。";
+    case ScriptCommand::Type::Background: return L"背景画像や背景色を切り替えます。";
+    case ScriptCommand::Type::Bgm: return L"BGMを再生します。ループや音量も設定できます。";
+    case ScriptCommand::Type::StopBgm: return L"再生中のBGMを停止します。";
+    case ScriptCommand::Type::Se: return L"効果音を再生します。";
+    case ScriptCommand::Type::Voice: return L"ボイス音声を再生します。";
+    case ScriptCommand::Type::MessageWindow: return L"メッセージウィンドウの表示、非表示を切り替えます。";
+    case ScriptCommand::Type::TextSpeed: return L"本文が表示される速度を変更します。";
+    case ScriptCommand::Type::MessageFont: return L"本文フォントを変更します。fontsフォルダのフォントも参照できます。";
+    case ScriptCommand::Type::MessageFontReset: return L"本文フォントを標準設定へ戻します。";
+    case ScriptCommand::Type::MessageStyle: return L"メッセージ枠の色、透明度、余白、画像を設定します。";
+    case ScriptCommand::Type::TextColor: return L"本文の文字色を変更します。";
+    case ScriptCommand::Type::NameColor: return L"名前欄の文字色を変更します。";
+    case ScriptCommand::Type::NameWindow: return L"名前欄の位置、サイズ、背景画像などを設定します。";
+    case ScriptCommand::Type::VerticalText: return L"本文を縦書き、または横書きに切り替えます。";
+    case ScriptCommand::Type::PageBreak: return L"本文をページ区切りします。";
+    case ScriptCommand::Type::SetValue: return L"変数へ値を代入します。";
+    case ScriptCommand::Type::AddValue: return L"数値変数へ値を加算します。";
+    default: return L"イベント一覧へドラッグしてコマンドを追加します。";
+    }
+}
+
+std::wstring NovelRuntime::GetInspectorActionHelpText(const std::wstring& action) const
+{
+    if (StartsWithText(action, L"nudge:-:")) return L"数値を小さくします。Shift操作なしで細かく調整できます。";
+    if (StartsWithText(action, L"nudge:+:")) return L"数値を大きくします。位置、時間、音量などを素早く調整します。";
+    if (StartsWithText(action, L"effect_time:")) return L"演出時間をプリセット値に変更します。";
+    if (action == L"effect_parallel_toggle") return L"演出完了まで待つか、次のイベントと並列に動かすかを切り替えます。";
+    if (action == L"effect_preview") return L"この演出イベントからプレビューを開始します。";
+    if (action == L"browse_image") return L"画像ファイルを参照して、このイベントへ設定します。";
+    if (action == L"clear_image") return L"このイベントに設定された画像参照を解除します。";
+    if (action == L"browse_audio") return L"音声ファイルを参照して、このイベントへ設定します。";
+    if (action == L"audio_play") return L"設定中の音声をプレビュー再生します。";
+    if (action == L"audio_stop") return L"音声プレビューを停止します。";
+    if (action == L"toggle_loop") return L"BGMのループ再生を切り替えます。";
+    if (action == L"toggle_visible") return L"表示、非表示を切り替えます。";
+    if (action == L"character_adjust") return L"プレビュー上でドラッグして位置を調整します。";
+    if (action == L"fade_cycle_target") return L"フェードやトランジションの対象を選択します。";
+    if (action == L"text_name_toggle") return L"本文イベントで名前欄を表示するか切り替えます。";
+    if (action == L"text_name_select") return L"本文に表示する名前タグをキャラクター管理から選びます。";
+    if (action == L"cycle_message_font") return L"使用可能なフォントから本文フォントを選びます。";
+    if (action == L"browse_message_image") return L"メッセージ枠に使う画像を選びます。";
+    if (action == L"clear_message_image") return L"メッセージ枠画像を解除します。";
+    if (action == L"browse_name_image" || action == L"browse_text_name_image") return L"名前欄に使う画像を選びます。";
+    if (action == L"clear_name_image" || action == L"clear_text_name_image") return L"名前欄画像を解除します。";
+    if (action == L"browse_choice_button_image") return L"選択肢ボタンに使う画像を選びます。";
+    if (action == L"clear_choice_button_image") return L"選択肢ボタン画像を解除します。";
+    if (action == L"choice_add") return L"選択肢の枝を追加します。";
+    if (action == L"choice_remove") return L"この選択肢の枝を削除します。";
+    if (action == L"choice_cycle_var" || action == L"if_cycle_var") return L"条件に使う変数を変数管理から選びます。";
+    if (action == L"choice_cycle_op" || action == L"if_cycle_op") return L"条件比較の演算子を切り替えます。";
+    if (action == L"choice_toggle_disabled") return L"この選択肢を一時的に無効、または有効にします。";
+    if (StartsWithText(action, L"var_edit:")) return L"プレビュー用の現在変数値を直接編集します。";
+    if (StartsWithText(action, L"var_nudge:")) return L"プレビュー用の数値変数を増減します。";
+    if (action == L"toggle_character_fade") return L"キャラクター登場、退場時のフェードを切り替えます。";
+    if (action == L"toggle_character_fade_wait") return L"キャラフェード完了まで次へ進めるかを切り替えます。";
+    if (action == L"set_character_name") return L"このキャラクタータグをイベントに設定します。";
+    if (action == L"set_character_base") return L"キャラの基準画像を使います。";
+    if (action == L"set_character_expression") return L"キャラの表情差分を使います。";
+    return L"選択中イベントの設定を変更します。";
+}
+
+std::wstring NovelRuntime::GetSettingsActionHelpText(const std::wstring& action) const
+{
+    if (StartsWithText(action, L"settings_tab:")) return L"設定カテゴリを切り替えます。";
+    if (action == L"cycle_window") return L"ゲーム画面サイズをプリセットで切り替えます。";
+    if (action == L"browse_save_dir") return L"セーブデータの保存先フォルダを選びます。";
+    if (action == L"browse_default_font") return L"標準フォントをfontsフォルダから選びます。";
+    if (StartsWithText(action, L"ui_toggle:")) return L"タイトルやメニューのUIボタン表示を切り替えます。";
+    if (StartsWithText(action, L"ui_browse_icon:")) return L"UIボタンの画像を差し替えます。";
+    if (StartsWithText(action, L"ui_clear_icon:")) return L"UIボタンの画像を解除します。";
+    if (action.find(L"volume") != std::wstring::npos || action.find(L"master") != std::wstring::npos || action.find(L"bgm") != std::wstring::npos || action.find(L"se") != std::wstring::npos || action.find(L"voice") != std::wstring::npos) return L"音量設定を調整します。";
+    return L"プロジェクトや実行時の標準設定を変更します。";
+}
+
+std::wstring NovelRuntime::GetVariableActionHelpText(const std::wstring& action) const
+{
+    if (action == L"edit_name") return L"変数名を編集します。";
+    if (action == L"cycle_type") return L"変数の型を真偽値、数値、文字列で切り替えます。";
+    if (action == L"edit_initial") return L"新規開始時の初期値を編集します。";
+    if (action == L"edit_current") return L"プレビュー中の現在値を編集します。";
+    if (action == L"edit_description") return L"作り手向けの説明メモを編集します。";
+    if (StartsWithText(action, L"usage_select:")) return L"この変数を使っているイベントへ移動します。";
+    return L"変数定義を編集します。";
+}
+
+std::wstring NovelRuntime::GetCharacterActionHelpText(const std::wstring& action) const
+{
+    if (action == L"edit_id") return L"シナリオで参照するキャラクタータグIDを編集します。";
+    if (action == L"edit_display_name") return L"名前欄などに出す表示名を編集します。";
+    if (action == L"edit_color") return L"キャラクターの識別色を編集します。";
+    if (action == L"browse_base") return L"キャラクターの基準立ち絵を設定します。";
+    if (action == L"clear_base") return L"基準立ち絵を解除します。";
+    if (action == L"add_expression") return L"表情差分を追加します。";
+    if (action == L"edit_expression_name") return L"表情差分名を編集します。";
+    if (action == L"browse_expression") return L"表情差分の画像を設定します。";
+    if (action == L"clear_expression") return L"表情差分画像を解除します。";
+    if (action == L"remove_expression") return L"表情差分を削除します。";
+    return L"キャラクタータグと画像差分を編集します。";
+}
+
+std::wstring NovelRuntime::GetHoverHelpText(POINT point) const
+{
+    if (storyOverviewVisible_)
+    {
+        if (PtInRect(&storyOverviewSaveRect_, point)) return L"作品情報を保存します。";
+        if (PtInRect(&storyTitleEditRect_, point)) return L"作品タイトルを入力します。";
+        if (PtInRect(&storyStatusDropdownRect_, point)) return L"制作中、制作完了、保留、制作中断から選びます。";
+        if (PtInRect(&storyImageBrowseRect_, point)) return L"ローカル画像を参照して作品イメージに設定します。";
+        if (PtInRect(&storyImageDropRect_, point)) return L"ここへ画像をドラッグ&ドロップして作品イメージに設定できます。";
+        if (PtInRect(&storySynopsisEditRect_, point)) return L"作品のあらすじを入力します。";
+        for (const RECT& rect : storyCategoryChipRects_)
+        {
+            if (PtInRect(&rect, point)) return L"カテゴリを選択、解除します。最大3つまで選べます。";
+        }
+    }
+    for (size_t i = 0; i < toolbarButtonRects_.size() && i < toolbarItems_.size(); ++i)
+    {
+        if (PtInRect(&toolbarButtonRects_[i], point))
+        {
+            return GetToolbarHelpText(toolbarItems_[i].id);
+        }
+    }
+    for (const PaletteButtonItem& item : paletteButtons_)
+    {
+        if (PtInRect(&item.rect, point))
+        {
+            return GetPaletteHelpText(item.type);
+        }
+    }
+    for (const PaletteSectionItem& section : paletteSections_)
+    {
+        if (PtInRect(&section.toggleRect, point) || PtInRect(&section.rect, point))
+        {
+            return section.title + L"カテゴリを開閉します。";
+        }
+    }
+    for (const LeftTabItem& tab : leftTabs_)
+    {
+        if (PtInRect(&tab.rect, point))
+        {
+            return tab.label + L"タブへ切り替えます。";
+        }
+    }
+    for (const AssetCategoryItem& category : assetCategories_)
+    {
+        if (PtInRect(&category.rect, point))
+        {
+            return category.label + L"素材の一覧へ切り替えます。";
+        }
+    }
+    if (PtInRect(&materialAddRect_, point)) return L"選択中カテゴリへ素材ファイルを追加します。";
+    if (PtInRect(&materialPreviewPlayRect_, point)) return L"選択中の音声素材を再生します。";
+    if (PtInRect(&materialPreviewStopRect_, point)) return L"音声素材の再生を停止します。";
+    if (PtInRect(&materialPreviewVolumeDownRect_, point)) return L"素材プレビュー音量を下げます。";
+    if (PtInRect(&materialPreviewVolumeUpRect_, point)) return L"素材プレビュー音量を上げます。";
+    for (const AssetListItem& item : assetItems_)
+    {
+        if (PtInRect(&item.rect, point))
+        {
+            return item.isDirectory ? L"素材フォルダを開閉します。" : L"素材を選択します。イベントへドラッグすると差し込めます。";
+        }
+    }
+    if (leftPanelTab_ == LeftPanelTab::StoryStudio)
+    {
+        if (PtInRect(&storyThemeRect_, point)) return L"作品のテーマを管理します。";
+        if (PtInRect(&storyStatusPillRect_, point)) return L"制作状況を左パネルから変更します。";
+        if (PtInRect(&storyStructureToggleRect_, point)) return L"構成メニューを開閉します。プロットと時系列をまとめる場所です。";
+        if (PtInRect(&storyWritingRect_, point)) return L"本文執筆ビューを開く予定の場所です。";
+        if (PtInRect(&storyMaterialsToggleRect_, point)) return L"資料メニューを開閉します。登場人物、世界観、相関関係をまとめます。";
+        if (PtInRect(&storyMemoRect_, point)) return L"作品メモを管理する予定の場所です。";
+        if (PtInRect(&storyAddMaterialTypeRect_, point)) return L"新しい資料カテゴリを追加する予定のボタンです。";
+        for (size_t i = 0; i < storyStructureItemRects_.size(); ++i)
+        {
+            if (PtInRect(&storyStructureItemRects_[i], point))
+            {
+                const wchar_t* help[] =
+                {
+                    L"プロットを管理します。物語の骨組みを置く予定です。",
+                    L"時系列を管理します。",
+                };
+                return help[(std::min)(i, static_cast<size_t>(2))];
+            }
+        }
+        for (size_t i = 0; i < storyMaterialItemRects_.size(); ++i)
+        {
+            if (PtInRect(&storyMaterialItemRects_[i], point))
+            {
+                const wchar_t* help[] =
+                {
+                    L"登場人物資料を開きます。既存キャラクター管理はここへ移行予定です。",
+                    L"世界観資料を開きます。設定や用語をまとめる場所です。",
+                    L"相関関係を開きます。人物や組織のつながりを扱う予定です。",
+                    L"資料テンプレートを開きます。資料作成の雛形を管理する予定です。",
+                };
+                return help[(std::min)(i, static_cast<size_t>(3))];
+            }
+        }
+    }
+    if (PtInRect(&sceneAddRect_, point)) return L"新しいシナリオファイルを作成します。";
+    if (PtInRect(&sceneRenameRect_, point)) return L"現在のシナリオ名を変更します。";
+    if (PtInRect(&sceneDuplicateRect_, point)) return L"現在のシナリオを複製します。";
+    if (PtInRect(&sceneDeleteRect_, point)) return L"現在のシナリオを削除します。";
+    for (const SceneListItem& item : sceneItems_)
+    {
+        if (PtInRect(&item.rect, point))
+        {
+            return L"このシナリオへ切り替えます。未保存なら確認が出ます。";
+        }
+    }
+    if (PtInRect(&eventAddTextRect_, point)) return L"本文イベントを追加します。";
+    if (PtInRect(&eventAddChoiceRect_, point)) return L"分岐イベントを追加します。";
+    if (PtInRect(&eventValidateRect_, point)) return L"シナリオの未設定、欠落素材、未定義参照を検証します。";
+    if (PtInRect(&eventDuplicateRect_, point)) return L"選択中イベントを複製します。";
+    if (PtInRect(&eventDeleteRect_, point)) return L"選択中イベントを削除します。";
+    for (const InspectorEditTarget& target : inspectorEditTargets_)
+    {
+        if (PtInRect(&target.buttonRect, point))
+        {
+            return target.label + L"を直接入力で編集します。";
+        }
+    }
+    for (const InspectorActionTarget& target : inspectorActionTargets_)
+    {
+        if (PtInRect(&target.buttonRect, point))
+        {
+            return GetInspectorActionHelpText(target.action);
+        }
+    }
+    if (PtInRect(&projectLauncherCreateRect_, point)) return L"新規プロジェクトを作成します。title.ksとscene.ksも初期作成されます。";
+    if (PtInRect(&projectLauncherOpenRect_, point)) return L"既存プロジェクトファイルを選んで開きます。";
+    for (const ProjectLauncherRow& row : projectLauncherRows_)
+    {
+        if (PtInRect(&row.dataRect, point)) return L"この最近使ったプロジェクトを開きます。";
+        if (PtInRect(&row.deleteRect, point)) return L"このプロジェクトフォルダをゴミ箱へ移動します。";
+    }
+    for (const CharacterManagerActionTarget& target : characterManagerActionTargets_)
+    {
+        if (PtInRect(&target.buttonRect, point))
+        {
+            return GetCharacterActionHelpText(target.action);
+        }
+    }
+    for (const VariableManagerActionTarget& target : variableManagerActionTargets_)
+    {
+        if (PtInRect(&target.buttonRect, point))
+        {
+            return GetVariableActionHelpText(target.action);
+        }
+    }
+    if (PtInRect(&variableDialogAddRect_, point)) return L"新しい変数定義を追加します。";
+    if (PtInRect(&variableDialogDeleteRect_, point)) return L"選択中の変数定義を削除します。";
+    for (const SettingsActionTarget& target : settingsActionTargets_)
+    {
+        if (PtInRect(&target.buttonRect, point))
+        {
+            return GetSettingsActionHelpText(target.action);
+        }
+    }
+    if (PtInRect(&settingsDialogRestoreRect_, point)) return L"前回のオートセーブから編集状態を復元します。";
+    if (PtInRect(&leftSplitterRect_, point) || PtInRect(&rightSplitterRect_, point) || PtInRect(&graphSplitterRect_, point) || PtInRect(&eventSplitterRect_, point))
+    {
+        return L"ドラッグしてパネルの大きさを調整します。";
+    }
+    return L"";
+}
+
+void NovelRuntime::DrawHoverHelp(HDC hdc, const RECT& clientRect) const
+{
+    if (hoverHelpText_.empty())
+    {
+        return;
+    }
+    RECT helpRect = { clientRect.left + 10, clientRect.bottom - 32, clientRect.right - 10, clientRect.bottom - 8 };
+    HBRUSH brush = CreateSolidBrush(RGB(22, 28, 36));
+    FillRect(hdc, &helpRect, brush);
+    DeleteObject(brush);
+    HBRUSH borderBrush = CreateSolidBrush(RGB(88, 104, 122));
+    FrameRect(hdc, &helpRect, borderBrush);
+    DeleteObject(borderBrush);
+    SetBkMode(hdc, TRANSPARENT);
+    HFONT font = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, font));
+    SetTextColor(hdc, RGB(232, 238, 244));
+    RECT textRect = { helpRect.left + 12, helpRect.top, helpRect.right - 12, helpRect.bottom };
+    DrawWrappedText(hdc, textRect, hoverHelpText_, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    SelectObject(hdc, oldFont);
+    DeleteObject(font);
 }
 
 std::wstring NovelRuntime::EscapeSaveValue(const std::wstring& value) const
@@ -8317,6 +9633,9 @@ void NovelRuntime::RefreshAssetList()
         { L"background", L"background" },
         { L"picture", L"picture" },
         { L"character", L"character" },
+        { L"ui", L"ui" },
+        { L"textbox", L"textbox" },
+        { L"choice", L"choice" },
         { L"se", L"se" },
         { L"bgm", L"bgm" },
     };
@@ -8401,6 +9720,9 @@ bool NovelRuntime::AddMaterialFile()
         { L"background", L"background", L"画像ファイル (*.png;*.jpg;*.jpeg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0すべてのファイル (*.*)\0*.*\0" },
         { L"picture", L"picture", L"画像ファイル (*.png;*.jpg;*.jpeg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0すべてのファイル (*.*)\0*.*\0" },
         { L"character", L"character", L"画像ファイル (*.png;*.jpg;*.jpeg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0すべてのファイル (*.*)\0*.*\0" },
+        { L"ui", L"ui", L"画像ファイル (*.png;*.jpg;*.jpeg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0すべてのファイル (*.*)\0*.*\0" },
+        { L"textbox", L"textbox", L"画像ファイル (*.png;*.jpg;*.jpeg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0すべてのファイル (*.*)\0*.*\0" },
+        { L"choice", L"choice", L"画像ファイル (*.png;*.jpg;*.jpeg;*.bmp)\0*.png;*.jpg;*.jpeg;*.bmp\0すべてのファイル (*.*)\0*.*\0" },
         { L"se", L"se", L"音声ファイル (*.wav;*.ogg;*.mp3)\0*.wav;*.ogg;*.mp3\0すべてのファイル (*.*)\0*.*\0" },
         { L"bgm", L"bgm", L"音声ファイル (*.mp3;*.ogg;*.wav)\0*.mp3;*.ogg;*.wav\0すべてのファイル (*.*)\0*.*\0" },
     };
@@ -8579,6 +9901,24 @@ bool NovelRuntime::ApplyAssetToCommand(size_t commandIndex, const AssetListItem&
     {
         command.parameters[L"storage"] = relative;
         statusText_ = L"画像を差し込みました";
+        return true;
+    }
+    if (item.category == L"textbox" && command.type == ScriptCommand::Type::MessageStyle)
+    {
+        command.parameters[L"image"] = relative;
+        statusText_ = L"メッセージ枠画像を差し込みました";
+        return true;
+    }
+    if (item.category == L"textbox" && command.type == ScriptCommand::Type::NameWindow)
+    {
+        command.parameters[L"image"] = relative;
+        statusText_ = L"名前欄画像を差し込みました";
+        return true;
+    }
+    if ((item.category == L"choice" || item.category == L"ui") && command.type == ScriptCommand::Type::Choice)
+    {
+        command.parameters[L"button_image"] = relative;
+        statusText_ = L"選択肢ボタン画像を差し込みました";
         return true;
     }
     if (item.category == L"bgm" && command.type == ScriptCommand::Type::Bgm)
@@ -9456,13 +10796,39 @@ void NovelRuntime::SyncVariableDefinitions()
 
 size_t NovelRuntime::GetVariableUsageCount(const std::wstring& name) const
 {
-    size_t count = 0;
-    for (const ScriptCommand& command : scenario_.commands)
+    return GetVariableUsageItems(name).size();
+}
+
+std::vector<std::pair<size_t, std::wstring>> NovelRuntime::GetVariableUsageItems(const std::wstring& name) const
+{
+    std::vector<std::pair<size_t, std::wstring>> items;
+    if (name.empty())
     {
+        return items;
+    }
+
+    for (size_t commandIndex = 0; commandIndex < scenario_.commands.size(); ++commandIndex)
+    {
+        const ScriptCommand& command = scenario_.commands[commandIndex];
+        auto addItem = [&](const std::wstring& reason)
+        {
+            std::wstring label = std::to_wstring(commandIndex + 1) + L". " + GetCommandTypeLabel(command);
+            if (!reason.empty())
+            {
+                label += L" / " + reason;
+            }
+            const std::wstring summary = GetCommandSummary(command);
+            if (!summary.empty())
+            {
+                label += L" - " + summary;
+            }
+            items.push_back(std::make_pair(commandIndex, label));
+        };
+
         if ((command.type == ScriptCommand::Type::SetValue || command.type == ScriptCommand::Type::AddValue || command.type == ScriptCommand::Type::IfJump) &&
             GetCommandParameter(command, L"name") == name)
         {
-            ++count;
+            addItem(L"変数名");
         }
         if (command.type == ScriptCommand::Type::Choice)
         {
@@ -9470,12 +10836,12 @@ size_t NovelRuntime::GetVariableUsageCount(const std::wstring& name) const
             {
                 if (GetCommandParameter(command, GetChoiceParamKey(L"__choice_cond_name_", i)) == name)
                 {
-                    ++count;
+                    addItem(L"選択肢条件 " + std::to_wstring(i + 1));
                 }
             }
         }
     }
-    return count;
+    return items;
 }
 
 std::wstring NovelRuntime::ShowVariableSelectionMenu(POINT point, const std::wstring& currentName) const
@@ -9881,6 +11247,137 @@ bool NovelRuntime::HandleSceneClick(POINT point)
         return true;
     }
 
+    if (leftPanelTab_ == LeftPanelTab::StoryStudio)
+    {
+        const wchar_t* statuses[] = { L"制作中", L"制作完了", L"保留", L"制作中断" };
+        if (storyPanelStatusDropdownVisible_)
+        {
+            for (size_t i = 0; i < storyPanelStatusOptionRects_.size() && i < _countof(statuses); ++i)
+            {
+                if (PtInRect(&storyPanelStatusOptionRects_[i], point))
+                {
+                    storyProductionStatus_ = statuses[i];
+                    storyPanelStatusDropdownVisible_ = false;
+                    SyncDocumentMetadata();
+                    statusText_ = L"制作状況を更新しました";
+                    return true;
+                }
+            }
+            if (!PtInRect(&storyStatusPillRect_, point))
+            {
+                storyPanelStatusDropdownVisible_ = false;
+            }
+        }
+        if (PtInRect(&storyStatusPillRect_, point))
+        {
+            storyPanelStatusDropdownVisible_ = !storyPanelStatusDropdownVisible_;
+            statusText_ = L"制作状況を選択します";
+            return true;
+        }
+        if (PtInRect(&storyHeaderRect_, point))
+        {
+            if ((storyThemeVisible_ || storyPlotVisible_) && HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges())
+            {
+                return true;
+            }
+            storyOverviewVisible_ = true;
+            storyThemeVisible_ = false;
+            storyPlotVisible_ = false;
+            storyTimelineVisible_ = false;
+            storyPanelStatusDropdownVisible_ = false;
+            statusText_ = L"作品情報を開きました";
+            return true;
+        }
+        if (PtInRect(&storyStructureToggleRect_, point))
+        {
+            storyStructureExpanded_ = !storyStructureExpanded_;
+            statusText_ = storyStructureExpanded_ ? L"構成を展開しました" : L"構成を折りたたみました";
+            return true;
+        }
+        if (PtInRect(&storyMaterialsToggleRect_, point))
+        {
+            storyMaterialsExpanded_ = !storyMaterialsExpanded_;
+            statusText_ = storyMaterialsExpanded_ ? L"資料を展開しました" : L"資料を折りたたみました";
+            return true;
+        }
+        if (PtInRect(&storyThemeRect_, point))
+        {
+            if ((storyOverviewVisible_ || storyPlotVisible_) && HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges())
+            {
+                return true;
+            }
+            storyThemeVisible_ = true;
+            storyOverviewVisible_ = false;
+            storyPlotVisible_ = false;
+            storyTimelineVisible_ = false;
+            storyPanelStatusDropdownVisible_ = false;
+            statusText_ = L"テーマ画面を開きました";
+            return true;
+        }
+        if (PtInRect(&storyWritingRect_, point))
+        {
+            statusText_ = L"執筆画面はこれから実装します";
+            return true;
+        }
+        if (PtInRect(&storyMemoRect_, point))
+        {
+            statusText_ = L"メモ画面はこれから実装します";
+            return true;
+        }
+        if (PtInRect(&storyAddMaterialTypeRect_, point))
+        {
+            statusText_ = L"資料種別追加はこれから実装します";
+            return true;
+        }
+        for (size_t i = 0; i < storyStructureItemRects_.size(); ++i)
+        {
+            if (PtInRect(&storyStructureItemRects_[i], point))
+            {
+                const wchar_t* labels[] = { L"プロット", L"時系列" };
+                if (i == 0)
+                {
+                    if ((storyOverviewVisible_ || storyThemeVisible_) && HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges())
+                    {
+                        return true;
+                    }
+                    storyPlotVisible_ = true;
+                    storyTimelineVisible_ = false;
+                    storyThemeVisible_ = false;
+                    storyOverviewVisible_ = false;
+                    storyPanelStatusDropdownVisible_ = false;
+                    statusText_ = L"プロット画面を開きました";
+                    return true;
+                }
+                if (i == 1)
+                {
+                    if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_) && HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges())
+                    {
+                        return true;
+                    }
+                    storyTimelineVisible_ = true;
+                    storyPlotVisible_ = false;
+                    storyThemeVisible_ = false;
+                    storyOverviewVisible_ = false;
+                    storyPanelStatusDropdownVisible_ = false;
+                    statusText_ = L"時系列画面を開きました";
+                    return true;
+                }
+                statusText_ = std::wstring(labels[(std::min)(i, static_cast<size_t>(2))]) + L" を開きます";
+                return true;
+            }
+        }
+        for (size_t i = 0; i < storyMaterialItemRects_.size(); ++i)
+        {
+            if (PtInRect(&storyMaterialItemRects_[i], point))
+            {
+                const wchar_t* labels[] = { L"登場人物", L"世界観", L"相関関係", L"資料テンプレート" };
+                statusText_ = std::wstring(labels[(std::min)(i, static_cast<size_t>(3))]) + L" を開きます";
+                return true;
+            }
+        }
+        return false;
+    }
+
     for (const LeftTabItem& tab : leftTabs_)
     {
         if (PtInRect(&tab.rect, point))
@@ -10160,6 +11657,12 @@ bool NovelRuntime::HandleKeyDown(WPARAM key)
             ShowSettingsDialog();
             previewMenuVisible_ = false;
             previewLogVisible_ = false;
+            return true;
+        }
+        if (key == 'D')
+        {
+            previewDebugVisible_ = !previewDebugVisible_;
+            statusText_ = previewDebugVisible_ ? L"デバッグ表示をONにしました" : L"デバッグ表示をOFFにしました";
             return true;
         }
         if (key == VK_F11 || key == 'F')
@@ -10503,10 +12006,37 @@ void NovelRuntime::DrawChoices(HDC hdc, const RECT& messageRect)
         activeChoiceRects_[index] = optionRect;
 
         const bool enabled = activeChoices_[index].enabled;
-        HBRUSH optionBrush = CreateSolidBrush(enabled ? RGB(32, 40, 56) : RGB(52, 52, 56));
-        FillRect(hdc, &optionRect, optionBrush);
-        DeleteObject(optionBrush);
-        FrameRect(hdc, &optionRect, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+        if (choiceButtonImage_)
+        {
+            Gdiplus::Graphics graphics(hdc);
+            graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            Gdiplus::ImageAttributes attributes;
+            Gdiplus::ColorMatrix matrix =
+            {
+                1.0f, 0, 0, 0, 0,
+                0, 1.0f, 0, 0, 0,
+                0, 0, 1.0f, 0, 0,
+                0, 0, 0, enabled ? 1.0f : 0.45f, 0,
+                0, 0, 0, 0, 1.0f
+            };
+            attributes.SetColorMatrix(&matrix);
+            graphics.DrawImage(
+                choiceButtonImage_.get(),
+                Gdiplus::RectF(static_cast<Gdiplus::REAL>(optionRect.left), static_cast<Gdiplus::REAL>(optionRect.top), static_cast<Gdiplus::REAL>(optionRect.right - optionRect.left), static_cast<Gdiplus::REAL>(optionRect.bottom - optionRect.top)),
+                0.0f,
+                0.0f,
+                static_cast<Gdiplus::REAL>(choiceButtonImage_->GetWidth()),
+                static_cast<Gdiplus::REAL>(choiceButtonImage_->GetHeight()),
+                Gdiplus::UnitPixel,
+                &attributes);
+        }
+        else
+        {
+            HBRUSH optionBrush = CreateSolidBrush(enabled ? RGB(32, 40, 56) : RGB(52, 52, 56));
+            FillRect(hdc, &optionRect, optionBrush);
+            DeleteObject(optionBrush);
+            FrameRect(hdc, &optionRect, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+        }
 
         RECT textRect = optionRect;
         textRect.left += 16;
@@ -10547,9 +12077,19 @@ bool NovelRuntime::HandleToolbarClick(POINT point)
             SaveProject();
             return true;
         }
-        if (item.id == L"characters")
+        if (item.id == L"story_studio")
         {
-            ShowCharacterManagerDialog();
+            showComponents_ = true;
+            if (leftPanelTab_ == LeftPanelTab::StoryStudio)
+            {
+                leftPanelTab_ = LeftPanelTab::Components;
+                statusText_ = L"コンポーネントへ戻しました";
+            }
+            else
+            {
+                leftPanelTab_ = LeftPanelTab::StoryStudio;
+                statusText_ = L"作品設計を開きました";
+            }
             return true;
         }
         if (item.id == L"config")
@@ -10589,6 +12129,7 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
     previewMenuSkipRect_ = {};
     previewMenuAutoRect_ = {};
     previewMenuConfigRect_ = {};
+    previewMenuDebugRect_ = {};
     previewMenuFullscreenRect_ = {};
     previewMenuCloseRect_ = {};
     previewMenuTitleRect_ = {};
@@ -10898,6 +12439,7 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
             previewMenuSkipRect_ = nextRow();
             previewMenuAutoRect_ = nextRow();
             previewMenuConfigRect_ = nextRow();
+            previewMenuDebugRect_ = nextRow();
             previewMenuFullscreenRect_ = nextRow();
             previewMenuTitleRect_ = nextRow();
             previewMenuCloseRect_ = nextRow();
@@ -10908,6 +12450,7 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
             drawMenuButton(previewMenuSkipRect_, previewSkipMode_ ? L"スキップ: ON" : L"スキップ: OFF", previewSkipMode_);
             drawMenuButton(previewMenuAutoRect_, previewAutoMode_ ? L"オート: ON" : L"オート: OFF", previewAutoMode_);
             drawMenuButton(previewMenuConfigRect_, L"コンフィグ", settingsDialogVisible_);
+            drawMenuButton(previewMenuDebugRect_, previewDebugVisible_ ? L"デバッグ: ON" : L"デバッグ: OFF", previewDebugVisible_);
             drawMenuButton(previewMenuFullscreenRect_, previewFullscreen_ ? L"全画面解除" : L"フルスクリーン", previewFullscreen_);
             drawMenuButton(previewMenuTitleRect_, L"タイトルへ戻る", false);
             drawMenuButton(previewMenuCloseRect_, L"閉じる", false);
@@ -11023,6 +12566,71 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
         drawOverlayAlpha(stageRect, flashColor_, static_cast<int>((1.0 - progress) * flashOpacity_));
     }
 
+    if (previewDebugVisible_)
+    {
+        RECT debugRect = { stageRect.left + 12, stageRect.top + 12, (std::min)(stageRect.right - 12, stageRect.left + 430), stageRect.top + 238 };
+        HDC debugDc = CreateCompatibleDC(hdc);
+        HBITMAP debugBitmap = CreateCompatibleBitmap(hdc, debugRect.right - debugRect.left, debugRect.bottom - debugRect.top);
+        HGDIOBJ oldDebugBitmap = SelectObject(debugDc, debugBitmap);
+        RECT localDebugRect = { 0, 0, debugRect.right - debugRect.left, debugRect.bottom - debugRect.top };
+        HBRUSH debugBrush = CreateSolidBrush(RGB(12, 16, 22));
+        FillRect(debugDc, &localDebugRect, debugBrush);
+        DeleteObject(debugBrush);
+        SetBkMode(debugDc, TRANSPARENT);
+        HFONT debugFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+        HFONT oldDebugFont = static_cast<HFONT>(SelectObject(debugDc, debugFont));
+
+        int debugY = 10;
+        auto drawDebugLine = [&](const std::wstring& text, COLORREF color)
+        {
+            RECT lineRect = { 12, debugY, localDebugRect.right - 12, debugY + 20 };
+            SetTextColor(debugDc, color);
+            DrawTextW(debugDc, text.c_str(), -1, &lineRect, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            debugY += 20;
+        };
+
+        drawDebugLine(L"DEBUG", RGB(255, 225, 160));
+        drawDebugLine(L"次: " + std::to_wstring((std::min)(currentCommandIndex_ + 1, scenario_.commands.size())) + L" / " + std::to_wstring(scenario_.commands.size()), RGB(226, 234, 242));
+        if (currentCommandIndex_ < scenario_.commands.size())
+        {
+            const ScriptCommand& nextCommand = scenario_.commands[currentCommandIndex_];
+            drawDebugLine(L"次イベント: " + GetCommandTypeLabel(nextCommand) + L" - " + GetCommandSummary(nextCommand), RGB(205, 214, 222));
+        }
+        drawDebugLine(std::wstring(L"状態: ") + (waitingForChoice_ ? L"選択肢待ち" : (reachedEnd_ ? L"終了" : L"進行中")), RGB(205, 214, 222));
+        drawDebugLine(L"status: " + statusText_, RGB(180, 190, 202));
+
+        size_t shownVariables = 0;
+        for (const auto& variable : variables_)
+        {
+            if (shownVariables >= 5)
+            {
+                break;
+            }
+            drawDebugLine(variable.first + L" = " + variable.second, RGB(170, 220, 184));
+            ++shownVariables;
+        }
+        if (variables_.size() > shownVariables)
+        {
+            drawDebugLine(L"変数ほか " + std::to_wstring(variables_.size() - shownVariables) + L" 件", RGB(140, 170, 150));
+        }
+        if (!variableHistory_.empty())
+        {
+            drawDebugLine(L"履歴: " + variableHistory_.back(), RGB(190, 198, 210));
+        }
+
+        SelectObject(debugDc, oldDebugFont);
+        DeleteObject(debugFont);
+        HBRUSH debugBorderBrush = CreateSolidBrush(RGB(88, 104, 122));
+        FrameRect(debugDc, &localDebugRect, debugBorderBrush);
+        DeleteObject(debugBorderBrush);
+
+        BLENDFUNCTION debugBlend = { AC_SRC_OVER, 0, 222, 0 };
+        AlphaBlend(hdc, debugRect.left, debugRect.top, debugRect.right - debugRect.left, debugRect.bottom - debugRect.top, debugDc, 0, 0, localDebugRect.right, localDebugRect.bottom, debugBlend);
+        SelectObject(debugDc, oldDebugBitmap);
+        DeleteObject(debugBitmap);
+        DeleteDC(debugDc);
+    }
+
     SelectObject(hdc, originalFont);
     DeleteObject(titleFont);
     DeleteObject(bodyFont);
@@ -11135,6 +12743,941 @@ void NovelRuntime::DrawToolbar(HDC hdc, const RECT& previewRect)
     DeleteObject(buttonFont);
 }
 
+void NovelRuntime::DrawStoryStudioPanel(HDC hdc, const RECT& panelRect)
+{
+    paletteButtons_.clear();
+    leftTabs_.clear();
+    assetCategories_.clear();
+    for (SceneListItem& item : sceneItems_)
+    {
+        item.rect = {};
+    }
+    for (AssetListItem& item : assetItems_)
+    {
+        item.rect = {};
+    }
+    eventSearchRect_ = {};
+    materialAddRect_ = {};
+    materialPreviewRect_ = {};
+    materialPreviewPlayRect_ = {};
+    materialPreviewStopRect_ = {};
+    materialPreviewVolumeDownRect_ = {};
+    materialPreviewVolumeUpRect_ = {};
+    storyStructureItemRects_.clear();
+    storyMaterialItemRects_.clear();
+    storyStructureToggleRect_ = {};
+    storyMaterialsToggleRect_ = {};
+    storyThemeRect_ = {};
+    storyHeaderRect_ = {};
+    storyStatusPillRect_ = {};
+    storyWritingRect_ = {};
+    storyMemoRect_ = {};
+    storyAddMaterialTypeRect_ = {};
+    storyPanelStatusOptionRects_.clear();
+
+    HBRUSH panelBrush = CreateSolidBrush(RGB(18, 22, 28));
+    FillRect(hdc, &panelRect, panelBrush);
+    DeleteObject(panelBrush);
+    HBRUSH borderBrush = CreateSolidBrush(RGB(46, 54, 64));
+    FrameRect(hdc, &panelRect, borderBrush);
+    DeleteObject(borderBrush);
+
+    SetBkMode(hdc, TRANSPARENT);
+    HFONT titleFont = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT bodyFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT smallFont = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, bodyFont));
+
+    const int margin = 16;
+    int cursorY = panelRect.top + 14;
+    storyHeaderRect_ = { panelRect.left, panelRect.top, panelRect.right, cursorY + 112 };
+    RECT coverRect = { panelRect.left + margin, cursorY, panelRect.left + margin + 70, cursorY + 92 };
+    HBRUSH coverBrush = CreateSolidBrush(RGB(236, 232, 222));
+    FillRect(hdc, &coverRect, coverBrush);
+    DeleteObject(coverBrush);
+    RECT coverBand = { coverRect.left, coverRect.bottom - 28, coverRect.right, coverRect.bottom };
+    HBRUSH coverBandBrush = CreateSolidBrush(RGB(188, 190, 192));
+    FillRect(hdc, &coverBand, coverBandBrush);
+    DeleteObject(coverBandBrush);
+    SelectObject(hdc, smallFont);
+    SetTextColor(hdc, RGB(94, 84, 74));
+    DrawWrappedText(hdc, RECT{ coverRect.left + 6, coverRect.top + 8, coverRect.right - 6, coverRect.top + 28 }, L"BOOK NAME", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    SelectObject(hdc, titleFont);
+    SetTextColor(hdc, RGB(234, 238, 244));
+    const std::wstring title = storyTitle_.empty() ? L"未定~undecided~" : storyTitle_;
+    DrawWrappedText(hdc, RECT{ coverRect.right + 12, coverRect.top + 4, panelRect.right - margin, coverRect.top + 34 }, title, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    const int statusPillWidth = (std::max)(86, static_cast<int>(storyProductionStatus_.size()) * 16 + 32);
+    storyStatusPillRect_ = { coverRect.right + 12, coverRect.top + 58, (std::min)(panelRect.right - margin, coverRect.right + 12 + statusPillWidth), coverRect.top + 84 };
+    HBRUSH pillBrush = CreateSolidBrush(RGB(72, 142, 208));
+    HPEN pillPen = CreatePen(PS_SOLID, 1, RGB(98, 170, 232));
+    HGDIOBJ oldPillBrush = SelectObject(hdc, pillBrush);
+    HGDIOBJ oldPillPen = SelectObject(hdc, pillPen);
+    RoundRect(hdc, storyStatusPillRect_.left, storyStatusPillRect_.top, storyStatusPillRect_.right, storyStatusPillRect_.bottom, 16, 16);
+    SelectObject(hdc, oldPillPen);
+    SelectObject(hdc, oldPillBrush);
+    DeleteObject(pillPen);
+    DeleteObject(pillBrush);
+    SelectObject(hdc, bodyFont);
+    SetTextColor(hdc, RGB(255, 255, 255));
+    DrawWrappedText(hdc, storyStatusPillRect_, storyProductionStatus_ + L" v", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    cursorY = coverRect.bottom + 22;
+    auto drawSectionHeader = [&](const std::wstring& label, bool expandable, bool expanded) -> RECT
+    {
+        RECT rect = { panelRect.left + margin, cursorY, panelRect.right - margin, cursorY + 30 };
+        HBRUSH rowBrush = CreateSolidBrush(RGB(22, 28, 36));
+        FillRect(hdc, &rect, rowBrush);
+        DeleteObject(rowBrush);
+        SelectObject(hdc, titleFont);
+        SetTextColor(hdc, RGB(226, 232, 240));
+        DrawWrappedText(hdc, RECT{ rect.left + 2, rect.top, rect.right - 34, rect.bottom }, label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        if (expandable)
+        {
+            DrawWrappedText(hdc, RECT{ rect.right - 28, rect.top, rect.right, rect.bottom }, expanded ? L"v" : L">", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
+        cursorY += 36;
+        return rect;
+    };
+    auto drawItem = [&](const std::wstring& icon, const std::wstring& label, std::vector<RECT>& rects)
+    {
+        RECT rect = { panelRect.left + margin + 8, cursorY, panelRect.right - margin, cursorY + 28 };
+        SelectObject(hdc, bodyFont);
+        SetTextColor(hdc, RGB(214, 222, 232));
+        DrawWrappedText(hdc, RECT{ rect.left, rect.top, rect.left + 28, rect.bottom }, icon, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        DrawWrappedText(hdc, RECT{ rect.left + 34, rect.top, rect.right, rect.bottom }, label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        rects.push_back(rect);
+        cursorY += 32;
+    };
+
+    storyThemeRect_ = drawSectionHeader(L"テーマ", false, false);
+    storyStructureToggleRect_ = drawSectionHeader(L"構成", true, storyStructureExpanded_);
+    if (storyStructureExpanded_)
+    {
+        drawItem(L"<>", L"プロット", storyStructureItemRects_);
+        drawItem(L"|||", L"時系列", storyStructureItemRects_);
+    }
+    storyWritingRect_ = drawSectionHeader(L"執筆", false, false);
+    storyMaterialsToggleRect_ = drawSectionHeader(L"資料", true, storyMaterialsExpanded_);
+    if (storyMaterialsExpanded_)
+    {
+        drawItem(L"@", L"登場人物", storyMaterialItemRects_);
+        drawItem(L"◇", L"世界観", storyMaterialItemRects_);
+        drawItem(L"::", L"相関関係", storyMaterialItemRects_);
+        drawItem(L"X", L"資料テンプレート", storyMaterialItemRects_);
+        storyAddMaterialTypeRect_ = { panelRect.left + margin + 8, cursorY, panelRect.right - margin, cursorY + 26 };
+        SelectObject(hdc, bodyFont);
+        SetTextColor(hdc, RGB(112, 172, 226));
+        DrawWrappedText(hdc, storyAddMaterialTypeRect_, L"+ 新規の資料種別を追加する", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        cursorY += 34;
+    }
+    storyMemoRect_ = drawSectionHeader(L"メモ", false, false);
+
+    if (storyPanelStatusDropdownVisible_)
+    {
+        const wchar_t* statuses[] = { L"制作中", L"制作完了", L"保留", L"制作中断" };
+        const int optionHeight = 30;
+        RECT menuRect =
+        {
+            storyStatusPillRect_.left,
+            storyStatusPillRect_.bottom + 6,
+            (std::min)(panelRect.right - margin, storyStatusPillRect_.left + 120),
+            storyStatusPillRect_.bottom + 6 + optionHeight * static_cast<int>(_countof(statuses))
+        };
+        HBRUSH menuBrush = CreateSolidBrush(RGB(24, 32, 42));
+        FillRect(hdc, &menuRect, menuBrush);
+        DeleteObject(menuBrush);
+        HBRUSH menuFrameBrush = CreateSolidBrush(RGB(68, 82, 98));
+        FrameRect(hdc, &menuRect, menuFrameBrush);
+        DeleteObject(menuFrameBrush);
+        SelectObject(hdc, bodyFont);
+        for (size_t i = 0; i < _countof(statuses); ++i)
+        {
+            RECT optionRect =
+            {
+                menuRect.left + 4,
+                menuRect.top + 4 + static_cast<LONG>(i * optionHeight),
+                menuRect.right - 4,
+                menuRect.top + 4 + static_cast<LONG>((i + 1) * optionHeight) - 4
+            };
+            const bool selected = storyProductionStatus_ == statuses[i];
+            HBRUSH optionBrush = CreateSolidBrush(selected ? RGB(72, 118, 178) : RGB(30, 39, 50));
+            FillRect(hdc, &optionRect, optionBrush);
+            DeleteObject(optionBrush);
+            SetTextColor(hdc, selected ? RGB(255, 255, 255) : RGB(226, 234, 242));
+            DrawWrappedText(hdc, RECT{ optionRect.left + 10, optionRect.top, optionRect.right - 10, optionRect.bottom }, statuses[i], DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            storyPanelStatusOptionRects_.push_back(optionRect);
+        }
+    }
+
+    SelectObject(hdc, oldFont);
+    DeleteObject(titleFont);
+    DeleteObject(bodyFont);
+    DeleteObject(smallFont);
+}
+
+void NovelRuntime::DrawStoryOverviewPanel(HDC hdc, const RECT& clientRect)
+{
+    storyCategoryChipRects_.clear();
+    storyStatusOptionRects_.clear();
+    storyOverviewRect_ = { clientRect.left + 34, clientRect.top + 34, clientRect.right - 34, clientRect.bottom - 44 };
+    HBRUSH overlay = CreateSolidBrush(RGB(12, 16, 22));
+    FillRect(hdc, &storyOverviewRect_, overlay);
+    DeleteObject(overlay);
+    HBRUSH frame = CreateSolidBrush(RGB(48, 58, 70));
+    FrameRect(hdc, &storyOverviewRect_, frame);
+    DeleteObject(frame);
+
+    SetBkMode(hdc, TRANSPARENT);
+    HFONT titleFont = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT bodyFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, bodyFont));
+
+    const int margin = 28;
+    const int left = storyOverviewRect_.left + margin;
+    const int rightColumnLeft = storyOverviewRect_.right - 330;
+    int y = storyOverviewRect_.top + 24;
+    storyOverviewSaveRect_ = { storyOverviewRect_.right - 116, y, storyOverviewRect_.right - 30, y + 34 };
+    HBRUSH saveBrush = CreateSolidBrush(RGB(72, 118, 178));
+    FillRect(hdc, &storyOverviewSaveRect_, saveBrush);
+    DeleteObject(saveBrush);
+    FrameRect(hdc, &storyOverviewSaveRect_, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+    SetTextColor(hdc, RGB(255, 255, 255));
+    DrawWrappedText(hdc, storyOverviewSaveRect_, L"保存する", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    auto drawLabel = [&](const std::wstring& label)
+    {
+        SelectObject(hdc, titleFont);
+        SetTextColor(hdc, RGB(232, 238, 244));
+        DrawWrappedText(hdc, RECT{ left, y, rightColumnLeft - 40, y + 26 }, label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        y += 30;
+        SelectObject(hdc, bodyFont);
+    };
+    auto drawBox = [&](RECT rect, const std::wstring& text, bool dropdown)
+    {
+        HBRUSH boxBrush = CreateSolidBrush(RGB(22, 28, 36));
+        HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(70, 84, 100));
+        HGDIOBJ oldBrushObject = SelectObject(hdc, boxBrush);
+        HGDIOBJ oldPenObject = SelectObject(hdc, borderPen);
+        RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 16, 16);
+        SelectObject(hdc, oldPenObject);
+        SelectObject(hdc, oldBrushObject);
+        DeleteObject(borderPen);
+        DeleteObject(boxBrush);
+        SetTextColor(hdc, RGB(236, 242, 248));
+        const UINT textFlags = (rect.bottom - rect.top) > 60 ? (DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS) : (DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        DrawWrappedText(hdc, RECT{ rect.left + 12, rect.top + 2, rect.right - 32, rect.bottom - 2 }, text, textFlags);
+        if (dropdown)
+        {
+            DrawWrappedText(hdc, RECT{ rect.right - 28, rect.top, rect.right - 6, rect.bottom }, L"v", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        }
+    };
+
+    drawLabel(L"タイトル*");
+    storyTitleEditRect_ = { left, y, rightColumnLeft - 40, y + 40 };
+    drawBox(storyTitleEditRect_, storyTitle_, false);
+    if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == L"story_title")
+    {
+        inspectorEditRect_ = storyTitleEditRect_;
+    }
+    y += 74;
+
+    drawLabel(L"制作状況");
+    storyStatusDropdownRect_ = { left, y, left + 300, y + 38 };
+    drawBox(storyStatusDropdownRect_, storyProductionStatus_, true);
+    y += 70;
+
+    drawLabel(L"作品のカテゴリ*");
+
+    int chipX = left;
+    for (const std::wstring& category : storyCategories_)
+    {
+        RECT chip = { chipX, y, chipX + 78, y + 30 };
+        HBRUSH chipBrush = CreateSolidBrush(RGB(44, 54, 66));
+        FillRect(hdc, &chip, chipBrush);
+        DeleteObject(chipBrush);
+        SetTextColor(hdc, RGB(236, 242, 248));
+        DrawWrappedText(hdc, chip, category + L" x", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        chipX += 86;
+    }
+    y += storyCategories_.empty() ? 4 : 42;
+
+    const wchar_t* categories[] = { L"ファンタジー", L"ローファンタジー", L"異世界ファンタジー", L"異世界ロマンスファンタジー", L"現代恋愛", L"恋愛", L"ラブコメ", L"バトル", L"ミステリー", L"ホラー", L"探偵", L"ギャグ", L"冒険活劇", L"歴史もの", L"BL", L"百合", L"TL", L"官能小説", L"教育", L"児童書", L"二次創作" };
+    int cx = left;
+    int cy = y;
+    for (const wchar_t* category : categories)
+    {
+        const int width = (std::max)(72, static_cast<int>(wcslen(category)) * 15 + 22);
+        if (cx + width > rightColumnLeft - 40)
+        {
+            cx = left;
+            cy += 36;
+        }
+        RECT chip = { cx, cy, cx + width, cy + 30 };
+        const bool selected = std::find(storyCategories_.begin(), storyCategories_.end(), category) != storyCategories_.end();
+        HBRUSH chipBrush = CreateSolidBrush(selected ? RGB(72, 118, 178) : RGB(22, 28, 36));
+        FillRect(hdc, &chip, chipBrush);
+        DeleteObject(chipBrush);
+        FrameRect(hdc, &chip, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+        SetTextColor(hdc, RGB(236, 242, 248));
+        DrawWrappedText(hdc, chip, category, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        storyCategoryChipRects_.push_back(chip);
+        cx += width + 8;
+    }
+    y = cy + 42;
+    SetTextColor(hdc, RGB(156, 166, 178));
+    DrawWrappedText(hdc, RECT{ left, y, rightColumnLeft - 40, y + 22 }, L"カテゴリは3つまで選択可能です", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    y += 42;
+
+    drawLabel(L"あらすじ*");
+    storySynopsisEditRect_ = { left, y, rightColumnLeft - 40, (std::min<LONG>)(storyOverviewRect_.bottom - 28, static_cast<LONG>(y + 150)) };
+    drawBox(storySynopsisEditRect_, storySynopsis_, false);
+    if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == L"story_synopsis")
+    {
+        inspectorEditRect_ = storySynopsisEditRect_;
+    }
+
+    SelectObject(hdc, titleFont);
+    SetTextColor(hdc, RGB(232, 238, 244));
+    DrawWrappedText(hdc, RECT{ rightColumnLeft, storyOverviewRect_.top + 88, storyOverviewRect_.right - 30, storyOverviewRect_.top + 116 }, L"イメージ画像", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    storyImageDropRect_ = { rightColumnLeft, storyOverviewRect_.top + 120, storyOverviewRect_.right - 30, storyOverviewRect_.top + 360 };
+    HBRUSH imageBrush = CreateSolidBrush(RGB(26, 30, 36));
+    FillRect(hdc, &storyImageDropRect_, imageBrush);
+    DeleteObject(imageBrush);
+    FrameRect(hdc, &storyImageDropRect_, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+    if (!storyImagePath_.empty())
+    {
+        auto image = TryLoadImage(CombinePath(GetAssetsRootDirectory(), storyImagePath_));
+        if (!image)
+        {
+            image = TryLoadImage(storyImagePath_);
+        }
+        if (image)
+        {
+            Gdiplus::Graphics graphics(hdc);
+            graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            graphics.DrawImage(image.get(), Gdiplus::Rect(storyImageDropRect_.left + 8, storyImageDropRect_.top + 8, storyImageDropRect_.right - storyImageDropRect_.left - 16, storyImageDropRect_.bottom - storyImageDropRect_.top - 16));
+        }
+    }
+    else
+    {
+        SetTextColor(hdc, RGB(164, 172, 184));
+        DrawWrappedText(hdc, storyImageDropRect_, L"BOOK NAME\r\n\r\nここへ画像をドロップ", DT_CENTER | DT_WORDBREAK | DT_VCENTER);
+    }
+    storyImageBrowseRect_ = { rightColumnLeft, storyImageDropRect_.bottom, storyOverviewRect_.right - 30, storyImageDropRect_.bottom + 42 };
+    HBRUSH browseBrush = CreateSolidBrush(RGB(34, 42, 52));
+    FillRect(hdc, &storyImageBrowseRect_, browseBrush);
+    DeleteObject(browseBrush);
+    FrameRect(hdc, &storyImageBrowseRect_, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+    SelectObject(hdc, bodyFont);
+    SetTextColor(hdc, RGB(236, 242, 248));
+    DrawWrappedText(hdc, storyImageBrowseRect_, L"ローカルから選択", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    if (storyStatusDropdownVisible_)
+    {
+        const wchar_t* statuses[] = { L"制作中", L"制作完了", L"保留", L"制作中断" };
+        const int optionHeight = 34;
+        RECT menuRect =
+        {
+            storyStatusDropdownRect_.left,
+            storyStatusDropdownRect_.bottom + 6,
+            storyStatusDropdownRect_.right,
+            storyStatusDropdownRect_.bottom + 6 + optionHeight * static_cast<int>(_countof(statuses))
+        };
+        HBRUSH menuBrush = CreateSolidBrush(RGB(24, 32, 42));
+        FillRect(hdc, &menuRect, menuBrush);
+        DeleteObject(menuBrush);
+        HBRUSH menuFrameBrush = CreateSolidBrush(RGB(68, 82, 98));
+        FrameRect(hdc, &menuRect, menuFrameBrush);
+        DeleteObject(menuFrameBrush);
+
+        SelectObject(hdc, bodyFont);
+        for (size_t i = 0; i < _countof(statuses); ++i)
+        {
+            RECT optionRect =
+            {
+                menuRect.left + 4,
+                menuRect.top + 4 + static_cast<LONG>(i * optionHeight),
+                menuRect.right - 4,
+                menuRect.top + 4 + static_cast<LONG>((i + 1) * optionHeight) - 4
+            };
+            const bool selected = storyProductionStatus_ == statuses[i];
+            HBRUSH optionBrush = CreateSolidBrush(selected ? RGB(72, 118, 178) : RGB(30, 39, 50));
+            FillRect(hdc, &optionRect, optionBrush);
+            DeleteObject(optionBrush);
+            SetTextColor(hdc, selected ? RGB(255, 255, 255) : RGB(226, 234, 242));
+            DrawWrappedText(hdc, RECT{ optionRect.left + 12, optionRect.top, optionRect.right - 12, optionRect.bottom }, statuses[i], DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            storyStatusOptionRects_.push_back(optionRect);
+        }
+    }
+
+    SelectObject(hdc, oldFont);
+    DeleteObject(titleFont);
+    DeleteObject(bodyFont);
+}
+
+void NovelRuntime::DrawStoryThemePanel(HDC hdc, const RECT& clientRect)
+{
+    storyThemeFieldRects_.clear();
+    storyThemePanelRect_ = { clientRect.left + 34, clientRect.top + 34, clientRect.right - 34, clientRect.bottom - 44 };
+    HBRUSH overlay = CreateSolidBrush(RGB(12, 16, 22));
+    FillRect(hdc, &storyThemePanelRect_, overlay);
+    DeleteObject(overlay);
+    HBRUSH frame = CreateSolidBrush(RGB(48, 58, 70));
+    FrameRect(hdc, &storyThemePanelRect_, frame);
+    DeleteObject(frame);
+
+    SetBkMode(hdc, TRANSPARENT);
+    HFONT headingFont = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT bodyFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT smallFont = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, bodyFont));
+
+    const int margin = 26;
+    const int left = storyThemePanelRect_.left + margin;
+    const int right = storyThemePanelRect_.right - margin;
+    int headerY = storyThemePanelRect_.top + 22;
+    storyThemeSaveRect_ = { right - 120, headerY, right, headerY + 34 };
+    HBRUSH saveBrush = CreateSolidBrush(RGB(72, 118, 178));
+    FillRect(hdc, &storyThemeSaveRect_, saveBrush);
+    DeleteObject(saveBrush);
+    FrameRect(hdc, &storyThemeSaveRect_, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+    SetTextColor(hdc, RGB(255, 255, 255));
+    DrawWrappedText(hdc, storyThemeSaveRect_, L"変更内容を保存", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    auto drawInputBox = [&](RECT rect, int lineCount, const std::wstring& text, const std::wstring& key)
+    {
+        if (rect.bottom < storyThemePanelRect_.top + 64 || rect.top > storyThemePanelRect_.bottom - 20)
+        {
+            return;
+        }
+        HBRUSH boxBrush = CreateSolidBrush(RGB(18, 24, 32));
+        FillRect(hdc, &rect, boxBrush);
+        DeleteObject(boxBrush);
+        HBRUSH borderBrush = CreateSolidBrush(RGB(42, 50, 60));
+        FrameRect(hdc, &rect, borderBrush);
+        DeleteObject(borderBrush);
+
+        HPEN linePen = CreatePen(PS_SOLID, 1, RGB(32, 38, 46));
+        HGDIOBJ oldPen = SelectObject(hdc, linePen);
+        for (int i = 1; i < lineCount; ++i)
+        {
+            const int lineY = rect.top + (rect.bottom - rect.top) * i / lineCount;
+            MoveToEx(hdc, rect.left, lineY, nullptr);
+            LineTo(hdc, rect.right, lineY);
+        }
+        SelectObject(hdc, oldPen);
+        DeleteObject(linePen);
+        SetTextColor(hdc, RGB(230, 236, 244));
+        DrawWrappedText(hdc, RECT{ rect.left + 14, rect.top + 10, rect.right - 14, rect.bottom - 10 }, text, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+        if (!key.empty())
+        {
+            storyThemeFieldRects_.push_back({ key, rect });
+        }
+        if (!key.empty() && inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == key)
+        {
+            inspectorEditRect_ = rect;
+        }
+    };
+    int contentY = storyThemePanelRect_.top + 72 - storyThemeScrollOffset_;
+    int y = contentY;
+    auto drawSection = [&](const std::wstring& title, const std::wstring& help, int boxHeight, int lineCount, const std::wstring& text, const std::wstring& key)
+    {
+        SelectObject(hdc, headingFont);
+        SetTextColor(hdc, RGB(232, 238, 244));
+        DrawWrappedText(hdc, RECT{ left, y, right - 138, y + 26 }, title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        y += 30;
+        SelectObject(hdc, smallFont);
+        SetTextColor(hdc, RGB(154, 164, 176));
+        DrawWrappedText(hdc, RECT{ left, y, right, y + 22 }, L"◎ " + help, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        y += 28;
+        RECT boxRect = { left, y, right - 80, y + boxHeight };
+        drawInputBox(boxRect, lineCount, text, key);
+        y = boxRect.bottom + 22;
+    };
+
+    drawSection(L"この作品のテーマ", L"執筆する作品のテーマを記入しましょう。", 116, 4, storyThemeText_, L"story_theme");
+    drawSection(L"この作品の終着点", L"作品のゴールを明確にしましょう。", 126, 5, storyGoalText_, L"story_goal");
+
+    SelectObject(hdc, headingFont);
+    SetTextColor(hdc, RGB(232, 238, 244));
+    DrawWrappedText(hdc, RECT{ left, y, right, y + 26 }, L"執筆予定文字数", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    y += 30;
+    SelectObject(hdc, smallFont);
+    SetTextColor(hdc, RGB(154, 164, 176));
+    DrawWrappedText(hdc, RECT{ left, y, right, y + 22 }, L"◎ 作品の完成時の予定文字数を入力しましょう。", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    y += 30;
+    RECT numberBox = { left, y, left + 210, y + 40 };
+    drawInputBox(numberBox, 1, storyTargetWords_, L"story_target_words");
+    SelectObject(hdc, headingFont);
+    SetTextColor(hdc, RGB(232, 238, 244));
+    DrawWrappedText(hdc, RECT{ numberBox.right + 12, numberBox.top, numberBox.right + 130, numberBox.bottom }, L"文字予定", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    y += 62;
+
+    drawSection(L"この作品のターゲット層", L"どんな人に読んで欲しいのか明確にしましょう。", 84, 3, L"", L"");
+    drawSection(L"① 年齢層・性別", L"", 96, 4, storyTargetAgeGender_, L"story_target_age_gender");
+    drawSection(L"② 趣味・嗜好", L"", 96, 4, storyTargetTaste_, L"story_target_taste");
+    drawSection(L"③ その人が他に読みそうな作品", L"", 96, 4, storyTargetComparable_, L"story_target_comparable");
+
+    const int contentHeight = y - contentY + 28;
+    const int viewportHeight = storyThemePanelRect_.bottom - (storyThemePanelRect_.top + 72) - 18;
+    storyThemeScrollMax_ = (std::max)(0, contentHeight - viewportHeight);
+    if (storyThemeScrollMax_ > 0)
+    {
+        RECT track = { storyThemePanelRect_.right - 14, storyThemePanelRect_.top + 72, storyThemePanelRect_.right - 7, storyThemePanelRect_.bottom - 20 };
+        HBRUSH trackBrush = CreateSolidBrush(RGB(34, 42, 52));
+        FillRect(hdc, &track, trackBrush);
+        DeleteObject(trackBrush);
+        const int trackHeight = track.bottom - track.top;
+        const int thumbHeight = (std::max)(36, (viewportHeight * trackHeight) / (contentHeight + 1));
+        const int thumbTop = track.top + ((trackHeight - thumbHeight) * storyThemeScrollOffset_) / storyThemeScrollMax_;
+        RECT thumb = { track.left, thumbTop, track.right, thumbTop + thumbHeight };
+        HBRUSH thumbBrush = CreateSolidBrush(RGB(112, 124, 140));
+        FillRect(hdc, &thumb, thumbBrush);
+        DeleteObject(thumbBrush);
+    }
+
+    SelectObject(hdc, oldFont);
+    DeleteObject(headingFont);
+    DeleteObject(bodyFont);
+    DeleteObject(smallFont);
+}
+
+void NovelRuntime::DrawStoryPlotPanel(HDC hdc, const RECT& clientRect)
+{
+    storyPlotFieldRects_.clear();
+    storyPlotAddRects_.clear();
+    storyPlotPanelRect_ = { clientRect.left + 34, clientRect.top + 34, clientRect.right - 34, clientRect.bottom - 44 };
+    HBRUSH panelBrush = CreateSolidBrush(RGB(12, 16, 22));
+    FillRect(hdc, &storyPlotPanelRect_, panelBrush);
+    DeleteObject(panelBrush);
+    HBRUSH frameBrush = CreateSolidBrush(RGB(48, 58, 70));
+    FrameRect(hdc, &storyPlotPanelRect_, frameBrush);
+    DeleteObject(frameBrush);
+
+    SetBkMode(hdc, TRANSPARENT);
+    HFONT titleFont = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT bodyFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT smallFont = CreateFontW(13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, bodyFont));
+
+    const int margin = 18;
+    const int headerHeight = 46;
+    SetTextColor(hdc, RGB(232, 238, 244));
+    SelectObject(hdc, titleFont);
+    DrawWrappedText(hdc, RECT{ storyPlotPanelRect_.left + margin, storyPlotPanelRect_.top, storyPlotPanelRect_.right - 140, storyPlotPanelRect_.top + headerHeight }, L"全体プロット", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    auto drawButton = [&](RECT rect, const std::wstring& label, COLORREF fill)
+    {
+        HBRUSH brush = CreateSolidBrush(fill);
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(76, 90, 108));
+        HGDIOBJ oldBrush = SelectObject(hdc, brush);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 18, 18);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(pen);
+        DeleteObject(brush);
+        SelectObject(hdc, bodyFont);
+        SetTextColor(hdc, RGB(248, 250, 252));
+        DrawWrappedText(hdc, rect, label, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    };
+
+    storyPlotEditRect_ = { storyPlotPanelRect_.right - 112, storyPlotPanelRect_.top + 8, storyPlotPanelRect_.right - 28, storyPlotPanelRect_.top + 40 };
+    storyPlotSaveRect_ = storyPlotEditMode_ ? RECT{ storyPlotPanelRect_.right - 220, storyPlotPanelRect_.top + 8, storyPlotPanelRect_.right - 124, storyPlotPanelRect_.top + 40 } : RECT{};
+    if (storyPlotEditMode_)
+    {
+        drawButton(storyPlotSaveRect_, L"保存して戻る", RGB(64, 126, 86));
+    }
+    drawButton(storyPlotEditRect_, storyPlotEditMode_ ? L"編集中" : L"編集する", storyPlotEditMode_ ? RGB(58, 78, 104) : RGB(72, 118, 178));
+
+    struct PlotColumn { const wchar_t* title; const wchar_t* key; const std::wstring* value; const std::vector<std::wstring>* items; };
+    const PlotColumn columns[] =
+    {
+        { L"起", L"story_plot_intro", &storyPlotIntro_, &storyPlotIntroItems_ },
+        { L"承", L"story_plot_development", &storyPlotDevelopment_, &storyPlotDevelopmentItems_ },
+        { L"転", L"story_plot_turn", &storyPlotTurn_, &storyPlotTurnItems_ },
+        { L"結", L"story_plot_conclusion", &storyPlotConclusion_, &storyPlotConclusionItems_ },
+    };
+    auto buildPlotItems = [](const std::wstring& value)
+    {
+        std::vector<std::wstring> items;
+        std::wistringstream input(value);
+        std::wstring line;
+        while (std::getline(input, line))
+        {
+            if (!line.empty() && line.back() == L'\r')
+            {
+                line.pop_back();
+            }
+            line = Trim(line);
+            if (!line.empty())
+            {
+                items.push_back(line);
+            }
+        }
+        if (items.empty() && !Trim(value).empty())
+        {
+            items.push_back(Trim(value));
+        }
+        return items;
+    };
+    auto getPlotItems = [&](const PlotColumn& column)
+    {
+        if (column.items && !column.items->empty())
+        {
+            return *column.items;
+        }
+        return buildPlotItems(*column.value);
+    };
+    auto joinPlotItems = [](const std::vector<std::wstring>& items)
+    {
+        std::wstring joined;
+        for (const std::wstring& item : items)
+        {
+            if (!joined.empty()) joined += L"\r\n";
+            joined += item;
+        }
+        return joined;
+    };
+
+    const int contentTop = storyPlotPanelRect_.top + headerHeight - storyPlotScrollOffset_;
+    if (!storyPlotEditMode_)
+    {
+        int y = contentTop;
+        const int left = storyPlotPanelRect_.left + 18;
+        const int right = storyPlotPanelRect_.right - 18;
+        for (const PlotColumn& column : columns)
+        {
+            SelectObject(hdc, titleFont);
+            SetTextColor(hdc, RGB(232, 238, 244));
+            DrawWrappedText(hdc, RECT{ left, y, right, y + 28 }, column.title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            y += 32;
+
+            RECT summaryRect = { left, y, right, y + 56 };
+            HBRUSH summaryBrush = CreateSolidBrush(RGB(16, 22, 30));
+            FillRect(hdc, &summaryRect, summaryBrush);
+            DeleteObject(summaryBrush);
+            SelectObject(hdc, bodyFont);
+            SetTextColor(hdc, RGB(218, 226, 236));
+            const std::vector<std::wstring> columnItems = getPlotItems(column);
+            const std::wstring summaryText = column.items && !column.items->empty() ? joinPlotItems(columnItems) : *column.value;
+            DrawWrappedText(hdc, RECT{ summaryRect.left + 8, summaryRect.top, summaryRect.right - 8, summaryRect.bottom }, summaryText, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+            y += 56;
+
+            std::vector<std::wstring> items = columnItems;
+            items.insert(items.begin(), L"（時系列から自動で追加）");
+            const int itemHeight = 42;
+            const int railX = left + 18;
+            RECT rail = { railX - 2, y, railX + 2, y + static_cast<int>(items.size()) * itemHeight };
+            HBRUSH railBrush = CreateSolidBrush(RGB(72, 80, 90));
+            FillRect(hdc, &rail, railBrush);
+            DeleteObject(railBrush);
+            SelectObject(hdc, smallFont);
+            for (const std::wstring& item : items)
+            {
+                RECT dot = { railX - 7, y + 13, railX + 7, y + 27 };
+                HBRUSH dotBrush = CreateSolidBrush(RGB(156, 166, 178));
+                HPEN dotPen = CreatePen(PS_SOLID, 1, RGB(156, 166, 178));
+                HGDIOBJ oldDotBrush = SelectObject(hdc, dotBrush);
+                HGDIOBJ oldDotPen = SelectObject(hdc, dotPen);
+                Ellipse(hdc, dot.left, dot.top, dot.right, dot.bottom);
+                SelectObject(hdc, oldDotPen);
+                SelectObject(hdc, oldDotBrush);
+                DeleteObject(dotPen);
+                DeleteObject(dotBrush);
+                RECT itemRect = { railX + 28, y, right, y + itemHeight };
+                SetTextColor(hdc, item == L"（時系列から自動で追加）" ? RGB(166, 176, 190) : RGB(232, 238, 244));
+                DrawWrappedText(hdc, itemRect, item, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                y += itemHeight;
+            }
+            y += 14;
+        }
+        const int contentHeight = y - contentTop + 96;
+        const int viewportHeight = storyPlotPanelRect_.bottom - storyPlotPanelRect_.top - 24;
+        storyPlotScrollMax_ = (std::max)(0, contentHeight - viewportHeight);
+    }
+    else
+    {
+        int y = contentTop;
+        const int left = storyPlotPanelRect_.left + 20;
+        const int right = storyPlotPanelRect_.right - 24;
+        const int cardWidth = 210;
+        const int cardHeight = 112;
+        auto drawCard = [&](RECT rect, const std::wstring& text, bool inputCard, bool addCard, const std::wstring& key)
+        {
+            HBRUSH cardBrush = CreateSolidBrush(addCard ? RGB(26, 38, 50) : (inputCard ? RGB(22, 30, 40) : RGB(18, 24, 32)));
+            HPEN cardPen = CreatePen(PS_SOLID, 1, addCard ? RGB(74, 128, 176) : (inputCard ? RGB(76, 96, 118) : RGB(48, 58, 70)));
+            HGDIOBJ oldBrush = SelectObject(hdc, cardBrush);
+            HGDIOBJ oldPen = SelectObject(hdc, cardPen);
+            RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 8, 8);
+            SelectObject(hdc, oldPen);
+            SelectObject(hdc, oldBrush);
+            DeleteObject(cardPen);
+            DeleteObject(cardBrush);
+            SelectObject(hdc, bodyFont);
+            SetTextColor(hdc, addCard ? RGB(144, 198, 242) : (inputCard && text.empty() ? RGB(138, 148, 162) : RGB(226, 234, 244)));
+            DrawWrappedText(hdc, RECT{ rect.left + 14, rect.top + 14, rect.right - 14, rect.bottom - 14 }, addCard ? L"+ プロットを追加" : (text.empty() && inputCard ? L"プロットの内容をここに記入" : text), DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+            if (addCard)
+            {
+                storyPlotAddRects_.push_back({ key, rect });
+            }
+            if (inputCard)
+            {
+                storyPlotFieldRects_.push_back({ key, rect });
+                if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == key)
+                {
+                    inspectorEditRect_ = rect;
+                }
+            }
+        };
+
+        for (const PlotColumn& column : columns)
+        {
+            SelectObject(hdc, titleFont);
+            SetTextColor(hdc, RGB(232, 238, 244));
+            DrawWrappedText(hdc, RECT{ left, y, right, y + 30 }, std::wstring(L"- ") + column.title + L" -", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            y += 34;
+            HBRUSH stripBrush = CreateSolidBrush(RGB(16, 22, 30));
+            RECT stripRect = { left, y, right, y + 54 };
+            FillRect(hdc, &stripRect, stripBrush);
+            DeleteObject(stripBrush);
+            SelectObject(hdc, bodyFont);
+            SetTextColor(hdc, RGB(218, 226, 236));
+            const std::vector<std::wstring> columnItems = getPlotItems(column);
+            DrawWrappedText(hdc, RECT{ stripRect.left + 8, stripRect.top, stripRect.right - 8, stripRect.bottom }, joinPlotItems(columnItems), DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+            y += 84;
+
+            RECT autoCard = { left + 28, y, left + 28 + cardWidth, y + cardHeight };
+            RECT valueCard = { autoCard.right + 30, y, autoCard.right + 30 + cardWidth, y + cardHeight };
+            RECT inputCard = { valueCard.right + 30, y, valueCard.right + 30 + cardWidth, y + cardHeight };
+            drawCard(autoCard, L"（時系列から自動で追加）", false, false, L"");
+            std::vector<std::wstring> items = columnItems;
+            if (items.empty())
+            {
+                drawCard(valueCard, L"", false, false, L"");
+                drawCard(inputCard, L"", false, true, column.key);
+                y += cardHeight + 34;
+            }
+            else
+            {
+                int itemX = valueCard.left;
+                int itemY = y;
+                for (size_t itemIndex = 0; itemIndex < items.size(); ++itemIndex)
+                {
+                    const std::wstring& item = items[itemIndex];
+                    RECT itemCard = { itemX, itemY, itemX + cardWidth, itemY + cardHeight };
+                    drawCard(itemCard, item, false, false, L"");
+                    const std::wstring itemKey = std::wstring(column.key) + L"_item." + std::to_wstring(itemIndex);
+                    storyPlotFieldRects_.push_back({ itemKey, itemCard });
+                    if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == itemKey)
+                    {
+                        inspectorEditRect_ = itemCard;
+                    }
+                    itemX += cardWidth + 30;
+                    if (itemX + cardWidth > right)
+                    {
+                        itemX = valueCard.left;
+                        itemY += cardHeight + 18;
+                    }
+                }
+                RECT addCard = { itemX, itemY, itemX + cardWidth, itemY + cardHeight };
+                drawCard(addCard, L"", false, true, column.key);
+                y = itemY + cardHeight + 34;
+            }
+        }
+
+        const int contentHeight = y - contentTop + 96;
+        const int viewportHeight = storyPlotPanelRect_.bottom - storyPlotPanelRect_.top - 24;
+        storyPlotScrollMax_ = (std::max)(0, contentHeight - viewportHeight);
+        if (storyPlotScrollMax_ > 0)
+        {
+            RECT track = { storyPlotPanelRect_.right - 14, storyPlotPanelRect_.top + 54, storyPlotPanelRect_.right - 7, storyPlotPanelRect_.bottom - 96 };
+            HBRUSH trackBrush = CreateSolidBrush(RGB(34, 42, 52));
+            FillRect(hdc, &track, trackBrush);
+            DeleteObject(trackBrush);
+            const int trackHeight = track.bottom - track.top;
+            const int thumbHeight = (std::max)(36, (viewportHeight * trackHeight) / (contentHeight + 1));
+            const int thumbTop = track.top + ((trackHeight - thumbHeight) * storyPlotScrollOffset_) / storyPlotScrollMax_;
+            RECT thumb = { track.left, thumbTop, track.right, thumbTop + thumbHeight };
+            HBRUSH thumbBrush = CreateSolidBrush(RGB(112, 124, 140));
+            FillRect(hdc, &thumb, thumbBrush);
+            DeleteObject(thumbBrush);
+        }
+    }
+
+    if (!storyPlotEditMode_)
+    {
+        RECT hintRect = { storyPlotPanelRect_.left + 20, storyPlotPanelRect_.bottom - 64, storyPlotPanelRect_.right - 130, storyPlotPanelRect_.bottom - 30 };
+        SelectObject(hdc, smallFont);
+        SetTextColor(hdc, RGB(148, 158, 172));
+        DrawWrappedText(hdc, hintRect, L"編集するを押すと、起承転結ごとのカード入力画面に切り替わります。", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    }
+
+    SelectObject(hdc, oldFont);
+    DeleteObject(titleFont);
+    DeleteObject(bodyFont);
+    DeleteObject(smallFont);
+}
+
+void NovelRuntime::DrawStoryTimelinePanel(HDC hdc, const RECT& clientRect)
+{
+    storyTimelineFieldRects_.clear();
+    storyTimelineAddOptionRects_.clear();
+    storyTimelinePanelRect_ = { clientRect.left + 34, clientRect.top + 34, clientRect.right - 34, clientRect.bottom - 44 };
+    HBRUSH panelBrush = CreateSolidBrush(RGB(12, 16, 22));
+    FillRect(hdc, &storyTimelinePanelRect_, panelBrush);
+    DeleteObject(panelBrush);
+    HBRUSH frameBrush = CreateSolidBrush(RGB(48, 58, 70));
+    FrameRect(hdc, &storyTimelinePanelRect_, frameBrush);
+    DeleteObject(frameBrush);
+
+    SetBkMode(hdc, TRANSPARENT);
+    HFONT titleFont = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT bodyFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, bodyFont));
+    SetTextColor(hdc, RGB(232, 238, 244));
+    SelectObject(hdc, titleFont);
+    DrawWrappedText(hdc, RECT{ storyTimelinePanelRect_.left + 18, storyTimelinePanelRect_.top, storyTimelinePanelRect_.right - 240, storyTimelinePanelRect_.top + 46 }, L"時系列", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    auto drawButton = [&](RECT rect, const std::wstring& label, COLORREF fill)
+    {
+        HBRUSH brush = CreateSolidBrush(fill);
+        HPEN pen = CreatePen(PS_SOLID, 1, RGB(76, 90, 108));
+        HGDIOBJ oldBrush = SelectObject(hdc, brush);
+        HGDIOBJ oldPen = SelectObject(hdc, pen);
+        RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, 18, 18);
+        SelectObject(hdc, oldPen);
+        SelectObject(hdc, oldBrush);
+        DeleteObject(pen);
+        DeleteObject(brush);
+        SelectObject(hdc, bodyFont);
+        SetTextColor(hdc, RGB(248, 250, 252));
+        DrawWrappedText(hdc, rect, label, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    };
+    storyTimelineEditRect_ = { storyTimelinePanelRect_.right - 112, storyTimelinePanelRect_.top + 8, storyTimelinePanelRect_.right - 28, storyTimelinePanelRect_.top + 40 };
+    storyTimelineSaveRect_ = storyTimelineEditMode_ ? RECT{ storyTimelinePanelRect_.right - 222, storyTimelinePanelRect_.top + 8, storyTimelinePanelRect_.right - 124, storyTimelinePanelRect_.top + 40 } : RECT{};
+    storyTimelineAddRowRect_ = storyTimelineEditMode_ ? RECT{ storyTimelinePanelRect_.right - 332, storyTimelinePanelRect_.top + 8, storyTimelinePanelRect_.right - 234, storyTimelinePanelRect_.top + 40 } : RECT{};
+    if (storyTimelineEditMode_)
+    {
+        drawButton(storyTimelineAddRowRect_, L"+ 行追加", RGB(58, 88, 118));
+        drawButton(storyTimelineSaveRect_, L"保存して戻る", RGB(64, 126, 86));
+    }
+    drawButton(storyTimelineEditRect_, storyTimelineEditMode_ ? L"編集中" : L"編集する", storyTimelineEditMode_ ? RGB(58, 78, 104) : RGB(72, 118, 178));
+
+    auto splitItems = [](const std::vector<std::wstring>& items, const std::wstring& legacy)
+    {
+        if (!items.empty()) return items;
+        std::vector<std::wstring> result;
+        std::wistringstream input(legacy);
+        std::wstring line;
+        while (std::getline(input, line))
+        {
+            if (!line.empty() && line.back() == L'\r') line.pop_back();
+            if (!Trim(line).empty()) result.push_back(Trim(line));
+        }
+        return result;
+    };
+    std::vector<std::wstring> columns;
+    auto appendColumns = [&](const std::vector<std::wstring>& values)
+    {
+        for (const std::wstring& value : values)
+        {
+            if (!Trim(value).empty()) columns.push_back(Trim(value));
+        }
+    };
+    appendColumns(splitItems(storyPlotIntroItems_, storyPlotIntro_));
+    appendColumns(splitItems(storyPlotDevelopmentItems_, storyPlotDevelopment_));
+    appendColumns(splitItems(storyPlotTurnItems_, storyPlotTurn_));
+    appendColumns(splitItems(storyPlotConclusionItems_, storyPlotConclusion_));
+    if (columns.empty()) columns.push_back(L"（時系列から自動で追加）");
+
+    const int rowHeaderWidth = 170;
+    const int colWidth = 250;
+    const int rowHeight = 118;
+    const int headerHeight = 72;
+    const int originX = storyTimelinePanelRect_.left + 18;
+    const int originY = storyTimelinePanelRect_.top + 56 - storyTimelineScrollOffset_;
+    RECT corner = { originX, originY, originX + rowHeaderWidth, originY + headerHeight };
+    HBRUSH headerBrush = CreateSolidBrush(RGB(18, 24, 32));
+    FillRect(hdc, &corner, headerBrush);
+    DeleteObject(headerBrush);
+    SetTextColor(hdc, RGB(232, 238, 244));
+    SelectObject(hdc, titleFont);
+    DrawWrappedText(hdc, corner, L"プロット", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    for (size_t c = 0; c < columns.size(); ++c)
+    {
+        RECT cell = { originX + rowHeaderWidth + static_cast<int>(c) * colWidth, originY, originX + rowHeaderWidth + static_cast<int>(c + 1) * colWidth, originY + headerHeight };
+        HBRUSH brush = CreateSolidBrush(RGB(18, 24, 32));
+        FillRect(hdc, &cell, brush);
+        DeleteObject(brush);
+        FrameRect(hdc, &cell, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+        SelectObject(hdc, bodyFont);
+        DrawWrappedText(hdc, RECT{ cell.left + 10, cell.top + 6, cell.right - 10, cell.bottom - 6 }, columns[c], DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+    }
+    for (size_t r = 0; r < storyTimelineRows_.size(); ++r)
+    {
+        const int top = originY + headerHeight + static_cast<int>(r) * rowHeight;
+        RECT rowHeader = { originX, top, originX + rowHeaderWidth, top + rowHeight };
+        HBRUSH rowBrush = CreateSolidBrush(RGB(16, 22, 30));
+        FillRect(hdc, &rowHeader, rowBrush);
+        DeleteObject(rowBrush);
+        FrameRect(hdc, &rowHeader, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+        SelectObject(hdc, titleFont);
+        SetTextColor(hdc, RGB(232, 238, 244));
+        DrawWrappedText(hdc, RECT{ rowHeader.left + 10, rowHeader.top, rowHeader.right - 10, rowHeader.bottom }, storyTimelineRows_[r], DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        for (size_t c = 0; c < columns.size(); ++c)
+        {
+            RECT cell = { originX + rowHeaderWidth + static_cast<int>(c) * colWidth, top, originX + rowHeaderWidth + static_cast<int>(c + 1) * colWidth, top + rowHeight };
+            HBRUSH cellBrush = CreateSolidBrush(RGB(14, 20, 28));
+            FillRect(hdc, &cell, cellBrush);
+            DeleteObject(cellBrush);
+            FrameRect(hdc, &cell, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+            const std::wstring key = std::to_wstring(r) + L"." + std::to_wstring(c);
+            const std::wstring value = storyTimelineCells_.count(key) ? storyTimelineCells_.at(key) : L"";
+            SelectObject(hdc, bodyFont);
+            SetTextColor(hdc, RGB(218, 226, 236));
+            DrawWrappedText(hdc, RECT{ cell.left + 10, cell.top + 10, cell.right - 10, cell.bottom - 10 }, value, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+            if (storyTimelineEditMode_)
+            {
+                storyTimelineFieldRects_.push_back({ key, cell });
+                if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == L"story_timeline_cell." + key)
+                {
+                    inspectorEditRect_ = cell;
+                }
+            }
+        }
+    }
+    const int contentHeight = headerHeight + static_cast<int>(storyTimelineRows_.size()) * rowHeight + 96;
+    const int viewportHeight = storyTimelinePanelRect_.bottom - storyTimelinePanelRect_.top - 24;
+    storyTimelineScrollMax_ = (std::max)(0, contentHeight - viewportHeight);
+
+    if (storyTimelineAddDropdownVisible_)
+    {
+        const wchar_t* labels[] = { L"ストーリー", L"イベント", L"伏線", L"伏線回収", L"登場人物", L"備考" };
+        RECT menu = { storyTimelineAddRowRect_.left - 36, storyTimelineAddRowRect_.bottom + 8, storyTimelineAddRowRect_.right + 70, storyTimelineAddRowRect_.bottom + 8 + 34 * static_cast<int>(_countof(labels)) };
+        HBRUSH menuBrush = CreateSolidBrush(RGB(24, 32, 42));
+        FillRect(hdc, &menu, menuBrush);
+        DeleteObject(menuBrush);
+        FrameRect(hdc, &menu, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+        for (size_t i = 0; i < _countof(labels); ++i)
+        {
+            RECT option = { menu.left + 5, menu.top + 5 + static_cast<LONG>(i * 34), menu.right - 5, menu.top + 5 + static_cast<LONG>((i + 1) * 34) - 4 };
+            HBRUSH optionBrush = CreateSolidBrush(RGB(30, 39, 50));
+            FillRect(hdc, &option, optionBrush);
+            DeleteObject(optionBrush);
+            SetTextColor(hdc, RGB(226, 234, 242));
+            SelectObject(hdc, bodyFont);
+            DrawWrappedText(hdc, RECT{ option.left + 12, option.top, option.right - 12, option.bottom }, labels[i], DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            storyTimelineAddOptionRects_.push_back({ labels[i], option });
+        }
+    }
+
+    SelectObject(hdc, oldFont);
+    DeleteObject(titleFont);
+    DeleteObject(bodyFont);
+}
+
 void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
 {
     lastClientRect_ = clientRect;
@@ -11166,6 +13709,7 @@ void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
         {
             DrawProjectDialog(hdc, clientRect);
         }
+        DrawHoverHelp(hdc, clientRect);
         UpdateChildControls();
         return;
     }
@@ -11202,7 +13746,14 @@ void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
 
     if (showComponents_ && HasVisibleArea(leftPanelRect))
     {
-        DrawCommandPalette(hdc, leftPanelRect);
+        if (leftPanelTab_ == LeftPanelTab::StoryStudio)
+        {
+            DrawStoryStudioPanel(hdc, leftPanelRect);
+        }
+        else
+        {
+            DrawCommandPalette(hdc, leftPanelRect);
+        }
         DrawSplitter(hdc, leftSplitterRect_, activeDragHandle_ == DragHandle::LeftPanel);
     }
     if (showInspector_ && HasVisibleArea(rightPanelRect))
@@ -11284,6 +13835,23 @@ void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
     {
         DrawSettingsDialog(hdc, clientRect);
     }
+    if (storyOverviewVisible_)
+    {
+        DrawStoryOverviewPanel(hdc, clientRect);
+    }
+    if (storyThemeVisible_)
+    {
+        DrawStoryThemePanel(hdc, clientRect);
+    }
+    if (storyPlotVisible_)
+    {
+        DrawStoryPlotPanel(hdc, clientRect);
+    }
+    if (storyTimelineVisible_)
+    {
+        DrawStoryTimelinePanel(hdc, clientRect);
+    }
+    DrawHoverHelp(hdc, clientRect);
     DrawToast(hdc, clientRect);
     UpdateChildControls();
 }
@@ -11856,7 +14424,38 @@ void NovelRuntime::DrawVariableManagerDialog(HDC hdc, const RECT& clientRect)
 
         RECT usageRect = { detailRect.left + 18, cursorY + 4, detailRect.right - 18, cursorY + 32 };
         SetTextColor(hdc, RGB(196, 204, 212));
-        DrawWrappedText(hdc, usageRect, L"使用箇所: " + std::to_wstring(GetVariableUsageCount(definition.name)) + L" 件", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        const std::vector<std::pair<size_t, std::wstring>> usageItems = GetVariableUsageItems(definition.name);
+        DrawWrappedText(hdc, usageRect, L"使用箇所: " + std::to_wstring(usageItems.size()) + L" 件", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+        int usageY = usageRect.bottom + 8;
+        const size_t visibleUsageCount = std::min<size_t>(usageItems.size(), 8);
+        for (size_t i = 0; i < visibleUsageCount; ++i)
+        {
+            RECT rowRect = { detailRect.left + 18, usageY, detailRect.right - 18, usageY + 28 };
+            HBRUSH rowBrush = CreateSolidBrush(i % 2 == 0 ? RGB(38, 46, 56) : RGB(34, 40, 50));
+            FillRect(hdc, &rowRect, rowBrush);
+            DeleteObject(rowBrush);
+            FrameRect(hdc, &rowRect, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+            RECT textRect = { rowRect.left + 10, rowRect.top, rowRect.right - 74, rowRect.bottom };
+            RECT jumpRect = { rowRect.right - 66, rowRect.top + 3, rowRect.right - 8, rowRect.bottom - 3 };
+            SetTextColor(hdc, RGB(232, 238, 244));
+            DrawWrappedText(hdc, textRect, usageItems[i].second, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            drawButton(jumpRect, L"移動", RGB(72, 94, 124));
+            variableManagerActionTargets_.push_back(VariableManagerActionTarget{ L"usage_select:" + std::to_wstring(usageItems[i].first), selectedVariableDefinitionIndex_, rowRect });
+            usageY += 32;
+        }
+        if (usageItems.empty())
+        {
+            RECT emptyRect = { detailRect.left + 18, usageY, detailRect.right - 18, usageY + 28 };
+            SetTextColor(hdc, RGB(148, 158, 168));
+            DrawWrappedText(hdc, emptyRect, L"まだシナリオ内では使われていません。", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        }
+        else if (usageItems.size() > visibleUsageCount)
+        {
+            RECT moreRect = { detailRect.left + 18, usageY, detailRect.right - 18, usageY + 28 };
+            SetTextColor(hdc, RGB(148, 158, 168));
+            DrawWrappedText(hdc, moreRect, L"ほか " + std::to_wstring(usageItems.size() - visibleUsageCount) + L" 件", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        }
     }
     else
     {
@@ -12366,12 +14965,16 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
             { L"background", L"背景", L"ui\\material_background.png" },
             { L"picture", L"写真", L"ui\\material_picture.png" },
             { L"character", L"キャラクター", L"ui\\material_character.png" },
+            { L"ui", L"UI", L"ui\\config.png" },
+            { L"textbox", L"枠", L"ui\\menu_ui.png" },
+            { L"choice", L"選択肢", L"ui\\material_choice.png" },
             { L"se", L"SE", L"ui\\material_se.png" },
             { L"bgm", L"BGM", L"ui\\material_bgm.png" },
         };
 
         const int iconGap = 10;
-        const int iconWidth = (panelRect.right - panelRect.left - 20 - (iconGap * 4)) / 5;
+        const int categoryCount = static_cast<int>(_countof(categories));
+        const int iconWidth = (panelRect.right - panelRect.left - 20 - (iconGap * (categoryCount - 1))) / categoryCount;
         int iconX = panelRect.left + 10;
         for (const auto& category : categories)
         {
@@ -13511,6 +16114,62 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
         inspectorActionTargets_.push_back(InspectorActionTarget{ L"toggle_character_fade_wait", commandIndex, 0, waitButtonRect });
         cursorY += lineHeight;
     };
+    auto drawEffectTimeline = [&](size_t commandIndex, const ScriptCommand& command, bool hasDuration, bool hasParallel)
+    {
+        cursorY += 6;
+        drawLine(L"タイムライン調整", RGB(255, 225, 160));
+        if (hasDuration)
+        {
+            const int duration = (std::max)(0, ParseIntValue(GetCommandParameter(command, L"time"), 500));
+            RECT barRect = { panelRect.left + 20, cursorY + 6, panelRect.right - 20, cursorY + 18 };
+            HBRUSH trackBrush = CreateSolidBrush(RGB(42, 50, 60));
+            FillRect(hdc, &barRect, trackBrush);
+            DeleteObject(trackBrush);
+            FrameRect(hdc, &barRect, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+            const int fillWidth = (std::min)(barRect.right - barRect.left, (duration * (barRect.right - barRect.left)) / 3000);
+            RECT fillRect = { barRect.left, barRect.top, barRect.left + fillWidth, barRect.bottom };
+            HBRUSH fillBrush = CreateSolidBrush(RGB(72, 128, 188));
+            FillRect(hdc, &fillRect, fillBrush);
+            DeleteObject(fillBrush);
+            RECT valueRect = { panelRect.left + 20, cursorY + 22, panelRect.right - 20, cursorY + 44 };
+            SetTextColor(hdc, RGB(205, 214, 222));
+            DrawWrappedText(hdc, valueRect, L"時間: " + std::to_wstring(duration) + L"ms / 0-3000ms目安", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            cursorY += 48;
+
+            const int buttonWidth = (panelRect.right - panelRect.left - 52) / 4;
+            const struct { int value; const wchar_t* label; } presets[] =
+            {
+                { 300, L"短い" },
+                { 500, L"標準" },
+                { 1000, L"長い" },
+                { 1500, L"ゆっくり" },
+            };
+            int x = panelRect.left + 20;
+            for (const auto& preset : presets)
+            {
+                RECT presetRect = { x, cursorY, x + buttonWidth, cursorY + 28 };
+                drawActionButton(presetRect, preset.label, duration == preset.value ? RGB(72, 128, 188) : RGB(72, 82, 96));
+                inspectorActionTargets_.push_back(InspectorActionTarget{ L"effect_time:" + std::to_wstring(preset.value), commandIndex, 0, presetRect });
+                x += buttonWidth + 4;
+            }
+            cursorY += 36;
+        }
+        if (hasParallel)
+        {
+            const bool parallel = ParseBoolValue(GetCommandParameter(command, L"parallel"), false);
+            RECT parallelTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+            RECT parallelButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+            SetTextColor(hdc, RGB(205, 214, 222));
+            DrawWrappedText(hdc, parallelTextRect, L"実行: " + std::wstring(parallel ? L"並列" : L"完了待ち"), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            drawActionButton(parallelButtonRect, parallel ? L"待つ" : L"並列", parallel ? RGB(90, 92, 112) : RGB(76, 108, 76));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"effect_parallel_toggle", commandIndex, 0, parallelButtonRect });
+            cursorY += lineHeight;
+        }
+        RECT previewRect = { panelRect.left + 20, cursorY, panelRect.left + 188, cursorY + 30 };
+        drawActionButton(previewRect, L"ここからプレビュー", RGB(58, 88, 118));
+        inspectorActionTargets_.push_back(InspectorActionTarget{ L"effect_preview", commandIndex, 0, previewRect });
+        cursorY += 40;
+    };
 
     if (!scenario_.commands.empty() && selectedCommandIndex_ < scenario_.commands.size())
     {
@@ -13679,6 +16338,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawEditable(selectedCommandIndex_, L"時間(ms)", L"time", GetCommandParameter(command, L"time"));
             drawEditable(selectedCommandIndex_, L"強さ", L"power", GetCommandParameter(command, L"power"));
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
+            drawEffectTimeline(selectedCommandIndex_, command, true, true);
         }
         else if (command.type == ScriptCommand::Type::Fade)
         {
@@ -13693,6 +16353,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"fade_cycle_target", selectedCommandIndex_, 0, targetButtonRect });
             cursorY += lineHeight;
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
+            drawEffectTimeline(selectedCommandIndex_, command, true, true);
         }
         else if (command.type == ScriptCommand::Type::Transition)
         {
@@ -13707,12 +16368,14 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"fade_cycle_target", selectedCommandIndex_, 0, targetButtonRect });
             cursorY += lineHeight;
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
+            drawEffectTimeline(selectedCommandIndex_, command, true, true);
         }
         else if (command.type == ScriptCommand::Type::Zoom)
         {
             drawEditable(selectedCommandIndex_, L"時間(ms)", L"time", GetCommandParameter(command, L"time"));
             drawEditable(selectedCommandIndex_, L"拡大率(%)", L"scale", GetCommandParameter(command, L"scale"));
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
+            drawEffectTimeline(selectedCommandIndex_, command, true, true);
         }
         else if (command.type == ScriptCommand::Type::Pan)
         {
@@ -13720,6 +16383,11 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawEditable(selectedCommandIndex_, L"横位置", L"x", GetCommandParameter(command, L"x"));
             drawEditable(selectedCommandIndex_, L"縦位置", L"y", GetCommandParameter(command, L"y"));
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
+            RECT toolButtonRect = { panelRect.left + 20, cursorY, panelRect.left + 188, cursorY + 30 };
+            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"調整中" : L"パン位置調整ツール", RGB(92, 102, 116));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"character_adjust", selectedCommandIndex_, 0, toolButtonRect });
+            cursorY += 40;
+            drawEffectTimeline(selectedCommandIndex_, command, true, true);
         }
         else if (command.type == ScriptCommand::Type::Flash)
         {
@@ -13727,11 +16395,13 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawEditable(selectedCommandIndex_, L"色", L"color", GetCommandParameter(command, L"color"));
             drawEditable(selectedCommandIndex_, L"不透明度", L"opacity", GetCommandParameter(command, L"opacity"));
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
+            drawEffectTimeline(selectedCommandIndex_, command, true, true);
         }
         else if (command.type == ScriptCommand::Type::Tint)
         {
             drawEditable(selectedCommandIndex_, L"色", L"color", GetCommandParameter(command, L"color"));
             drawEditable(selectedCommandIndex_, L"不透明度", L"opacity", GetCommandParameter(command, L"opacity"));
+            drawEffectTimeline(selectedCommandIndex_, command, false, false);
         }
         else if (command.type == ScriptCommand::Type::Choice)
         {
@@ -13742,6 +16412,14 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"調整中" : L"位置調整ツールを開く", RGB(92, 102, 116));
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"character_adjust", selectedCommandIndex_, 0, toolButtonRect });
             cursorY += 40;
+            drawEditable(selectedCommandIndex_, L"ボタン画像", L"button_image", GetCommandParameter(command, L"button_image"));
+            RECT browseButtonImageRect = { panelRect.left + 20, cursorY, panelRect.left + 92, cursorY + 28 };
+            RECT clearButtonImageRect = { panelRect.left + 100, cursorY, panelRect.left + 172, cursorY + 28 };
+            drawActionButton(browseButtonImageRect, L"参照", RGB(58, 88, 118));
+            drawActionButton(clearButtonImageRect, L"解除", RGB(112, 62, 70));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"browse_choice_button_image", selectedCommandIndex_, 0, browseButtonImageRect });
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"clear_choice_button_image", selectedCommandIndex_, 0, clearButtonImageRect });
+            cursorY += 36;
             cursorY += 8;
             drawLine(L"\u9078\u629e\u80a2GUI", RGB(255, 225, 160));
             for (size_t linkIndex = 0; linkIndex < command.links.size(); ++linkIndex)
