@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "Scenario.h"
 
@@ -255,6 +255,7 @@ public:
         Components,
         Materials,
         Scenario,
+        StoryStudio,
     };
 
     enum class DragHandle
@@ -365,6 +366,16 @@ private:
     void PushVariableHistory(const std::wstring& entry);
     void DrawToolbar(HDC hdc, const RECT& previewRect);
     void DrawCommandPalette(HDC hdc, const RECT& panelRect);
+    void DrawStoryStudioPanel(HDC hdc, const RECT& panelRect);
+    void DrawStoryOverviewPanel(HDC hdc, const RECT& clientRect);
+    void DrawStoryThemePanel(HDC hdc, const RECT& clientRect);
+    void DrawStoryPlotPanel(HDC hdc, const RECT& clientRect);
+    void DrawStoryTimelinePanel(HDC hdc, const RECT& clientRect);
+    bool HandleStoryOverviewClick(POINT point);
+    bool HandleStoryThemeClick(POINT point);
+    bool HandleStoryPlotClick(POINT point);
+    bool HandleStoryTimelineClick(POINT point);
+    bool BrowseStoryImage();
     void DrawCommandList(HDC hdc, const RECT& panelRect);
     void DrawInspector(HDC hdc, const RECT& panelRect);
     void DrawNodeGraph(HDC hdc, const RECT& panelRect);
@@ -518,6 +529,7 @@ private:
     std::wstring ShowVariableSelectionMenu(POINT point, const std::wstring& currentName) const;
     std::wstring ShowFontSelectionMenu(POINT point, const std::wstring& currentName) const;
     size_t GetVariableUsageCount(const std::wstring& name) const;
+    std::vector<std::pair<size_t, std::wstring>> GetVariableUsageItems(const std::wstring& name) const;
     void SyncDocumentMetadata();
     void PushUndoSnapshot();
     bool RestoreSnapshot(const EditorSnapshot& snapshot);
@@ -534,6 +546,14 @@ private:
     std::wstring ResolveMaterialIconPath(const std::wstring& baseRelativePath) const;
     void StopAssetPreviewAudio();
     void StartAssetPreview(const AssetListItem& item);
+    std::wstring GetHoverHelpText(POINT point) const;
+    std::wstring GetToolbarHelpText(const std::wstring& id) const;
+    std::wstring GetPaletteHelpText(ScriptCommand::Type type) const;
+    std::wstring GetInspectorActionHelpText(const std::wstring& action) const;
+    std::wstring GetSettingsActionHelpText(const std::wstring& action) const;
+    std::wstring GetVariableActionHelpText(const std::wstring& action) const;
+    std::wstring GetCharacterActionHelpText(const std::wstring& action) const;
+    void DrawHoverHelp(HDC hdc, const RECT& clientRect) const;
     std::wstring EscapeSaveValue(const std::wstring& value) const;
     std::wstring UnescapeSaveValue(const std::wstring& value) const;
     std::wstring BrowseForFolder(const std::wstring& title, const std::wstring& initialPath) const;
@@ -561,6 +581,7 @@ private:
     std::wstring currentText_ = L"Loading scenario...";
     std::wstring displayedText_;
     std::wstring statusText_;
+    std::wstring hoverHelpText_;
     std::wstring scenarioBaseDir_;
     std::wstring scenarioPath_;
     std::wstring projectPath_;
@@ -569,10 +590,12 @@ private:
     std::wstring messageFontFace_ = L"Yu Gothic UI";
     std::wstring messageWindowImagePath_;
     std::wstring nameWindowImagePath_;
+    std::wstring choiceButtonImagePath_;
     std::wstring backgroundPath_;
     std::wstring backgroundDisplayName_;
     std::unique_ptr<Gdiplus::Image> messageWindowImage_;
     std::unique_ptr<Gdiplus::Image> nameWindowImage_;
+    std::unique_ptr<Gdiplus::Image> choiceButtonImage_;
     std::unique_ptr<Gdiplus::Image> backgroundImage_;
     COLORREF backgroundColor_ = RGB(28, 36, 48);
     COLORREF messageWindowColor_ = RGB(8, 10, 14);
@@ -656,6 +679,40 @@ private:
     RECT projectLauncherPanelRect_ = {};
     RECT projectLauncherCreateRect_ = {};
     RECT projectLauncherOpenRect_ = {};
+    RECT storyStructureToggleRect_ = {};
+    RECT storyMaterialsToggleRect_ = {};
+    RECT storyThemeRect_ = {};
+    RECT storyHeaderRect_ = {};
+    RECT storyStatusPillRect_ = {};
+    RECT storyWritingRect_ = {};
+    RECT storyMemoRect_ = {};
+    RECT storyAddMaterialTypeRect_ = {};
+    RECT storyOverviewRect_ = {};
+    RECT storyOverviewSaveRect_ = {};
+    RECT storyTitleEditRect_ = {};
+    RECT storyStatusDropdownRect_ = {};
+    RECT storyImageDropRect_ = {};
+    RECT storyImageBrowseRect_ = {};
+    RECT storySynopsisEditRect_ = {};
+    RECT storyThemePanelRect_ = {};
+    RECT storyThemeSaveRect_ = {};
+    RECT storyPlotPanelRect_ = {};
+    RECT storyPlotEditRect_ = {};
+    RECT storyPlotSaveRect_ = {};
+    RECT storyTimelinePanelRect_ = {};
+    RECT storyTimelineEditRect_ = {};
+    RECT storyTimelineSaveRect_ = {};
+    RECT storyTimelineAddRowRect_ = {};
+    std::vector<RECT> storyStructureItemRects_;
+    std::vector<RECT> storyMaterialItemRects_;
+    std::vector<RECT> storyCategoryChipRects_;
+    std::vector<RECT> storyStatusOptionRects_;
+    std::vector<RECT> storyPanelStatusOptionRects_;
+    std::vector<std::pair<std::wstring, RECT>> storyThemeFieldRects_;
+    std::vector<std::pair<std::wstring, RECT>> storyPlotFieldRects_;
+    std::vector<std::pair<std::wstring, RECT>> storyPlotAddRects_;
+    std::vector<std::pair<std::wstring, RECT>> storyTimelineFieldRects_;
+    std::vector<std::pair<std::wstring, RECT>> storyTimelineAddOptionRects_;
     RECT characterDialogRect_ = {};
     RECT characterDialogAddRect_ = {};
     RECT characterDialogDeleteRect_ = {};
@@ -693,6 +750,7 @@ private:
     RECT previewMenuSkipRect_ = {};
     RECT previewMenuAutoRect_ = {};
     RECT previewMenuConfigRect_ = {};
+    RECT previewMenuDebugRect_ = {};
     RECT previewMenuFullscreenRect_ = {};
     RECT previewMenuCloseRect_ = {};
     RECT previewMenuTitleRect_ = {};
@@ -730,6 +788,12 @@ private:
     int inspectorScrollMax_ = 0;
     int settingsScrollOffset_ = 0;
     int settingsScrollMax_ = 0;
+    int storyThemeScrollOffset_ = 0;
+    int storyThemeScrollMax_ = 0;
+    int storyPlotScrollOffset_ = 0;
+    int storyPlotScrollMax_ = 0;
+    int storyTimelineScrollOffset_ = 0;
+    int storyTimelineScrollMax_ = 0;
     DragHandle activeDragHandle_ = DragHandle::None;
     size_t editingCommandIndex_ = 0;
     std::wstring editingKey_;
@@ -808,6 +872,7 @@ private:
     bool previewVisible_ = false;
     bool previewSkipMode_ = false;
     bool previewAutoMode_ = false;
+    bool previewDebugVisible_ = false;
     bool previewFullscreen_ = false;
     bool waitingForChoice_ = false;
     bool reachedEnd_ = false;
@@ -822,6 +887,38 @@ private:
     bool variableManagerVisible_ = false;
     bool variableFieldDialogVisible_ = false;
     bool settingsDialogVisible_ = false;
+    bool storyStructureExpanded_ = true;
+    bool storyMaterialsExpanded_ = true;
+    bool storyOverviewVisible_ = false;
+    bool storyThemeVisible_ = false;
+    bool storyPlotVisible_ = false;
+    bool storyTimelineVisible_ = false;
+    bool storyPlotEditMode_ = false;
+    bool storyTimelineEditMode_ = false;
+    bool storyTimelineAddDropdownVisible_ = false;
+    bool storyStatusDropdownVisible_ = false;
+    bool storyPanelStatusDropdownVisible_ = false;
+    std::wstring storyProductionStatus_ = L"\u5236\u4f5c\u4e2d";
+    std::wstring storyGenre_ = L"\u30b2\u30fc\u30e0\u30b7\u30ca\u30ea\u30aa";
+    std::vector<std::wstring> storyCategories_;
+    std::wstring storyImagePath_;
+    std::wstring storySynopsis_;
+    std::wstring storyThemeText_;
+    std::wstring storyGoalText_;
+    std::wstring storyTargetWords_;
+    std::wstring storyTargetAgeGender_;
+    std::wstring storyTargetTaste_;
+    std::wstring storyTargetComparable_;
+    std::wstring storyPlotIntro_ = L"\u8d77";
+    std::wstring storyPlotDevelopment_ = L"\u627f";
+    std::wstring storyPlotTurn_ = L"\u8ee2";
+    std::wstring storyPlotConclusion_ = L"\u7d50";
+    std::vector<std::wstring> storyPlotIntroItems_;
+    std::vector<std::wstring> storyPlotDevelopmentItems_;
+    std::vector<std::wstring> storyPlotTurnItems_;
+    std::vector<std::wstring> storyPlotConclusionItems_;
+    std::vector<std::wstring> storyTimelineRows_ = { L"\u30d7\u30ed\u30c3\u30c8", L"\u30b9\u30c8\u30fc\u30ea\u30fc", L"\u4f0f\u7dda" };
+    std::unordered_map<std::wstring, std::wstring> storyTimelineCells_;
     LeftPanelTab leftPanelTab_ = LeftPanelTab::Components;
     std::wstring selectedAssetCategory_ = L"background";
     size_t adjustCharacterCommandIndex_ = static_cast<size_t>(-1);
