@@ -4240,6 +4240,14 @@ bool NovelRuntime::HandleMouseDown(POINT point)
         return true;
     }
 
+    if (storyTimelineVisible_ && storyTimelineHorizontalMax_ > 0 && PtInRect(&storyTimelineHScrollThumbRect_, point))
+    {
+        storyTimelineHorizontalDragging_ = true;
+        storyTimelineHorizontalDragStartX_ = point.x;
+        storyTimelineHorizontalDragStartOffset_ = storyTimelineHorizontalOffset_;
+        return true;
+    }
+
     if (leftPanelTab_ == LeftPanelTab::Materials)
     {
         for (size_t i = 0; i < assetItems_.size(); ++i)
@@ -4422,6 +4430,17 @@ bool NovelRuntime::HandleMouseMove(POINT point)
         return true;
     }
 
+    if (storyTimelineHorizontalDragging_)
+    {
+        const int trackWidth = storyTimelineHScrollTrackRect_.right - storyTimelineHScrollTrackRect_.left;
+        const int thumbWidth = storyTimelineHScrollThumbRect_.right - storyTimelineHScrollThumbRect_.left;
+        const int movableWidth = (std::max)(1, trackWidth - thumbWidth);
+        const int deltaX = point.x - storyTimelineHorizontalDragStartX_;
+        storyTimelineHorizontalOffset_ = storyTimelineHorizontalDragStartOffset_ + (deltaX * storyTimelineHorizontalMax_) / movableWidth;
+        storyTimelineHorizontalOffset_ = (std::max)(0, (std::min)(storyTimelineHorizontalOffset_, storyTimelineHorizontalMax_));
+        return true;
+    }
+
     int newHoveredToolbarIndex = -1;
     for (size_t i = 0; i < toolbarButtonRects_.size(); ++i)
     {
@@ -4489,6 +4508,7 @@ bool NovelRuntime::HandleMouseUp(POINT point)
         assetDragActive_ = false;
         paletteDragActive_ = false;
         eventReorderDragActive_ = false;
+        storyTimelineHorizontalDragging_ = false;
         eventEffectDropTargetIndex_ = static_cast<size_t>(-1);
         activeDragHandle_ = DragHandle::None;
         return false;
@@ -4622,6 +4642,11 @@ bool NovelRuntime::HandleMouseUp(POINT point)
     }
 
     UNREFERENCED_PARAMETER(point);
+    if (storyTimelineHorizontalDragging_)
+    {
+        storyTimelineHorizontalDragging_ = false;
+        return true;
+    }
     const bool wasDragging = activeDragHandle_ != DragHandle::None;
     activeDragHandle_ = DragHandle::None;
     return wasDragging;
@@ -8565,6 +8590,17 @@ bool NovelRuntime::HandleStoryTimelineClick(POINT point)
     if (storyTimelineEditMode_ && PtInRect(&storyTimelineAddRowRect_, point))
     {
         storyTimelineAddDropdownVisible_ = !storyTimelineAddDropdownVisible_;
+        return true;
+    }
+    if (PtInRect(&storyTimelineHScrollTrackRect_, point))
+    {
+        const int step = 250;
+        if (PtInRect(&storyTimelineHScrollThumbRect_, point))
+        {
+            return true;
+        }
+        storyTimelineHorizontalOffset_ += point.x < storyTimelineHScrollThumbRect_.left ? -step : step;
+        storyTimelineHorizontalOffset_ = (std::max)(0, (std::min)(storyTimelineHorizontalOffset_, storyTimelineHorizontalMax_));
         return true;
     }
     if (storyTimelineAddDropdownVisible_)
@@ -13341,7 +13377,17 @@ void NovelRuntime::DrawStoryPlotPanel(HDC hdc, const RECT& clientRect)
         return joined;
     };
 
-    const int contentTop = storyPlotPanelRect_.top + headerHeight - storyPlotScrollOffset_;
+    const int contentViewportBottom = storyPlotEditMode_ ? storyPlotPanelRect_.bottom - 22 : storyPlotPanelRect_.bottom - 78;
+    const RECT contentViewport =
+    {
+        storyPlotPanelRect_.left + 10,
+        storyPlotPanelRect_.top + headerHeight,
+        storyPlotPanelRect_.right - 18,
+        static_cast<LONG>((std::max)(static_cast<int>(storyPlotPanelRect_.top + headerHeight + 1), contentViewportBottom))
+    };
+    const int contentTop = contentViewport.top - storyPlotScrollOffset_;
+    const int savedPlotDc = SaveDC(hdc);
+    IntersectClipRect(hdc, contentViewport.left, contentViewport.top, contentViewport.right, contentViewport.bottom);
     if (!storyPlotEditMode_)
     {
         int y = contentTop;
@@ -13354,16 +13400,7 @@ void NovelRuntime::DrawStoryPlotPanel(HDC hdc, const RECT& clientRect)
             DrawWrappedText(hdc, RECT{ left, y, right, y + 28 }, column.title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             y += 32;
 
-            RECT summaryRect = { left, y, right, y + 56 };
-            HBRUSH summaryBrush = CreateSolidBrush(RGB(16, 22, 30));
-            FillRect(hdc, &summaryRect, summaryBrush);
-            DeleteObject(summaryBrush);
-            SelectObject(hdc, bodyFont);
-            SetTextColor(hdc, RGB(218, 226, 236));
             const std::vector<std::wstring> columnItems = getPlotItems(column);
-            const std::wstring summaryText = column.items && !column.items->empty() ? joinPlotItems(columnItems) : *column.value;
-            DrawWrappedText(hdc, RECT{ summaryRect.left + 8, summaryRect.top, summaryRect.right - 8, summaryRect.bottom }, summaryText, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
-            y += 56;
 
             std::vector<std::wstring> items = columnItems;
             items.insert(items.begin(), L"（時系列から自動で追加）");
@@ -13394,8 +13431,9 @@ void NovelRuntime::DrawStoryPlotPanel(HDC hdc, const RECT& clientRect)
             y += 14;
         }
         const int contentHeight = y - contentTop + 96;
-        const int viewportHeight = storyPlotPanelRect_.bottom - storyPlotPanelRect_.top - 24;
+        const int viewportHeight = (std::max)(1, static_cast<int>(contentViewport.bottom - contentViewport.top));
         storyPlotScrollMax_ = (std::max)(0, contentHeight - viewportHeight);
+        storyPlotScrollOffset_ = (std::max)(0, (std::min)(storyPlotScrollOffset_, storyPlotScrollMax_));
     }
     else
     {
@@ -13488,22 +13526,27 @@ void NovelRuntime::DrawStoryPlotPanel(HDC hdc, const RECT& clientRect)
         }
 
         const int contentHeight = y - contentTop + 96;
-        const int viewportHeight = storyPlotPanelRect_.bottom - storyPlotPanelRect_.top - 24;
+        const int viewportHeight = (std::max)(1, static_cast<int>(contentViewport.bottom - contentViewport.top));
         storyPlotScrollMax_ = (std::max)(0, contentHeight - viewportHeight);
-        if (storyPlotScrollMax_ > 0)
-        {
-            RECT track = { storyPlotPanelRect_.right - 14, storyPlotPanelRect_.top + 54, storyPlotPanelRect_.right - 7, storyPlotPanelRect_.bottom - 96 };
-            HBRUSH trackBrush = CreateSolidBrush(RGB(34, 42, 52));
-            FillRect(hdc, &track, trackBrush);
-            DeleteObject(trackBrush);
-            const int trackHeight = track.bottom - track.top;
-            const int thumbHeight = (std::max)(36, (viewportHeight * trackHeight) / (contentHeight + 1));
-            const int thumbTop = track.top + ((trackHeight - thumbHeight) * storyPlotScrollOffset_) / storyPlotScrollMax_;
-            RECT thumb = { track.left, thumbTop, track.right, thumbTop + thumbHeight };
-            HBRUSH thumbBrush = CreateSolidBrush(RGB(112, 124, 140));
-            FillRect(hdc, &thumb, thumbBrush);
-            DeleteObject(thumbBrush);
-        }
+        storyPlotScrollOffset_ = (std::max)(0, (std::min)(storyPlotScrollOffset_, storyPlotScrollMax_));
+    }
+    RestoreDC(hdc, savedPlotDc);
+
+    if (storyPlotScrollMax_ > 0)
+    {
+        RECT track = { storyPlotPanelRect_.right - 14, contentViewport.top + 8, storyPlotPanelRect_.right - 7, contentViewport.bottom - 8 };
+        HBRUSH trackBrush = CreateSolidBrush(RGB(34, 42, 52));
+        FillRect(hdc, &track, trackBrush);
+        DeleteObject(trackBrush);
+        const int trackHeight = (std::max)(1, static_cast<int>(track.bottom - track.top));
+        const int viewportHeight = (std::max)(1, static_cast<int>(contentViewport.bottom - contentViewport.top));
+        const int contentHeight = viewportHeight + storyPlotScrollMax_;
+        const int thumbHeight = (std::max)(36, (viewportHeight * trackHeight) / (contentHeight + 1));
+        const int thumbTop = track.top + ((trackHeight - thumbHeight) * storyPlotScrollOffset_) / storyPlotScrollMax_;
+        RECT thumb = { track.left, thumbTop, track.right, thumbTop + thumbHeight };
+        HBRUSH thumbBrush = CreateSolidBrush(RGB(112, 124, 140));
+        FillRect(hdc, &thumb, thumbBrush);
+        DeleteObject(thumbBrush);
     }
 
     if (!storyPlotEditMode_)
@@ -13578,26 +13621,42 @@ void NovelRuntime::DrawStoryTimelinePanel(HDC hdc, const RECT& clientRect)
         }
         return result;
     };
-    std::vector<std::wstring> columns;
-    auto appendColumns = [&](const std::vector<std::wstring>& values)
+    struct TimelineColumn { std::wstring group; std::wstring text; };
+    std::vector<TimelineColumn> columns;
+    auto appendColumns = [&](const std::wstring& group, const std::vector<std::wstring>& values)
     {
         for (const std::wstring& value : values)
         {
-            if (!Trim(value).empty()) columns.push_back(Trim(value));
+            if (!Trim(value).empty()) columns.push_back({ group, Trim(value) });
         }
     };
-    appendColumns(splitItems(storyPlotIntroItems_, storyPlotIntro_));
-    appendColumns(splitItems(storyPlotDevelopmentItems_, storyPlotDevelopment_));
-    appendColumns(splitItems(storyPlotTurnItems_, storyPlotTurn_));
-    appendColumns(splitItems(storyPlotConclusionItems_, storyPlotConclusion_));
-    if (columns.empty()) columns.push_back(L"（時系列から自動で追加）");
+    appendColumns(L"起", splitItems(storyPlotIntroItems_, storyPlotIntro_));
+    appendColumns(L"承", splitItems(storyPlotDevelopmentItems_, storyPlotDevelopment_));
+    appendColumns(L"転", splitItems(storyPlotTurnItems_, storyPlotTurn_));
+    appendColumns(L"結", splitItems(storyPlotConclusionItems_, storyPlotConclusion_));
+    if (columns.empty()) columns.push_back({ L"プロット", L"（時系列から自動で追加）" });
 
     const int rowHeaderWidth = 170;
     const int colWidth = 250;
     const int rowHeight = 118;
-    const int headerHeight = 72;
+    const int groupHeaderHeight = 32;
+    const int itemHeaderHeight = 64;
+    const int headerHeight = groupHeaderHeight + itemHeaderHeight;
+    const RECT gridViewport = { storyTimelinePanelRect_.left + 18, storyTimelinePanelRect_.top + 56, storyTimelinePanelRect_.right - 18, storyTimelinePanelRect_.bottom - 26 };
     const int originX = storyTimelinePanelRect_.left + 18;
-    const int originY = storyTimelinePanelRect_.top + 56 - storyTimelineScrollOffset_;
+
+    const int contentHeight = headerHeight + static_cast<int>(storyTimelineRows_.size()) * rowHeight + 24;
+    const int viewportHeight = (std::max)(1, static_cast<int>(gridViewport.bottom - gridViewport.top));
+    storyTimelineScrollMax_ = (std::max)(0, contentHeight - viewportHeight);
+    storyTimelineScrollOffset_ = (std::max)(0, (std::min)(storyTimelineScrollOffset_, storyTimelineScrollMax_));
+    const int contentWidth = rowHeaderWidth + static_cast<int>(columns.size()) * colWidth;
+    const int viewportWidth = (std::max)(1, static_cast<int>(gridViewport.right - gridViewport.left));
+    storyTimelineHorizontalMax_ = (std::max)(0, contentWidth - viewportWidth);
+    storyTimelineHorizontalOffset_ = (std::max)(0, (std::min)(storyTimelineHorizontalOffset_, storyTimelineHorizontalMax_));
+    const int originY = gridViewport.top - storyTimelineScrollOffset_;
+
+    const int savedGridDc = SaveDC(hdc);
+    IntersectClipRect(hdc, gridViewport.left, gridViewport.top, gridViewport.right, gridViewport.bottom);
     RECT corner = { originX, originY, originX + rowHeaderWidth, originY + headerHeight };
     HBRUSH headerBrush = CreateSolidBrush(RGB(18, 24, 32));
     FillRect(hdc, &corner, headerBrush);
@@ -13607,13 +13666,28 @@ void NovelRuntime::DrawStoryTimelinePanel(HDC hdc, const RECT& clientRect)
     DrawWrappedText(hdc, corner, L"プロット", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     for (size_t c = 0; c < columns.size(); ++c)
     {
-        RECT cell = { originX + rowHeaderWidth + static_cast<int>(c) * colWidth, originY, originX + rowHeaderWidth + static_cast<int>(c + 1) * colWidth, originY + headerHeight };
-        HBRUSH brush = CreateSolidBrush(RGB(18, 24, 32));
+        RECT groupCell = { originX + rowHeaderWidth + static_cast<int>(c) * colWidth - storyTimelineHorizontalOffset_, originY, originX + rowHeaderWidth + static_cast<int>(c + 1) * colWidth - storyTimelineHorizontalOffset_, originY + groupHeaderHeight };
+        RECT cell = { groupCell.left, groupCell.bottom, groupCell.right, originY + headerHeight };
+        if (cell.right <= originX + rowHeaderWidth || cell.left >= gridViewport.right)
+        {
+            continue;
+        }
+        if (groupCell.left < originX + rowHeaderWidth) groupCell.left = originX + rowHeaderWidth;
+        if (cell.left < originX + rowHeaderWidth) cell.left = originX + rowHeaderWidth;
+        HBRUSH brush = CreateSolidBrush(RGB(20, 28, 38));
+        FillRect(hdc, &groupCell, brush);
+        DeleteObject(brush);
+        FrameRect(hdc, &groupCell, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+        SelectObject(hdc, titleFont);
+        SetTextColor(hdc, RGB(232, 238, 244));
+        DrawWrappedText(hdc, groupCell, columns[c].group, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        brush = CreateSolidBrush(RGB(18, 24, 32));
         FillRect(hdc, &cell, brush);
         DeleteObject(brush);
         FrameRect(hdc, &cell, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
         SelectObject(hdc, bodyFont);
-        DrawWrappedText(hdc, RECT{ cell.left + 10, cell.top + 6, cell.right - 10, cell.bottom - 6 }, columns[c], DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+        SetTextColor(hdc, RGB(218, 226, 236));
+        DrawWrappedText(hdc, RECT{ cell.left + 10, cell.top + 6, cell.right - 10, cell.bottom - 6 }, columns[c].text, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
     }
     for (size_t r = 0; r < storyTimelineRows_.size(); ++r)
     {
@@ -13628,7 +13702,12 @@ void NovelRuntime::DrawStoryTimelinePanel(HDC hdc, const RECT& clientRect)
         DrawWrappedText(hdc, RECT{ rowHeader.left + 10, rowHeader.top, rowHeader.right - 10, rowHeader.bottom }, storyTimelineRows_[r], DT_LEFT | DT_SINGLELINE | DT_VCENTER);
         for (size_t c = 0; c < columns.size(); ++c)
         {
-            RECT cell = { originX + rowHeaderWidth + static_cast<int>(c) * colWidth, top, originX + rowHeaderWidth + static_cast<int>(c + 1) * colWidth, top + rowHeight };
+            RECT cell = { originX + rowHeaderWidth + static_cast<int>(c) * colWidth - storyTimelineHorizontalOffset_, top, originX + rowHeaderWidth + static_cast<int>(c + 1) * colWidth - storyTimelineHorizontalOffset_, top + rowHeight };
+            if (cell.bottom <= gridViewport.top || cell.top >= gridViewport.bottom || cell.right <= originX + rowHeaderWidth || cell.left >= gridViewport.right)
+            {
+                continue;
+            }
+            if (cell.left < originX + rowHeaderWidth) cell.left = originX + rowHeaderWidth;
             HBRUSH cellBrush = CreateSolidBrush(RGB(14, 20, 28));
             FillRect(hdc, &cell, cellBrush);
             DeleteObject(cellBrush);
@@ -13648,9 +13727,25 @@ void NovelRuntime::DrawStoryTimelinePanel(HDC hdc, const RECT& clientRect)
             }
         }
     }
-    const int contentHeight = headerHeight + static_cast<int>(storyTimelineRows_.size()) * rowHeight + 96;
-    const int viewportHeight = storyTimelinePanelRect_.bottom - storyTimelinePanelRect_.top - 24;
-    storyTimelineScrollMax_ = (std::max)(0, contentHeight - viewportHeight);
+    RestoreDC(hdc, savedGridDc);
+    storyTimelineHScrollTrackRect_ = { storyTimelinePanelRect_.left + 18, storyTimelinePanelRect_.bottom - 18, storyTimelinePanelRect_.right - 18, storyTimelinePanelRect_.bottom - 10 };
+    HBRUSH hTrackBrush = CreateSolidBrush(RGB(34, 42, 52));
+    FillRect(hdc, &storyTimelineHScrollTrackRect_, hTrackBrush);
+    DeleteObject(hTrackBrush);
+    if (storyTimelineHorizontalMax_ > 0)
+    {
+        const int trackWidth = storyTimelineHScrollTrackRect_.right - storyTimelineHScrollTrackRect_.left;
+        const int thumbWidth = (std::max)(44, (viewportWidth * trackWidth) / (contentWidth + 1));
+        const int thumbLeft = storyTimelineHScrollTrackRect_.left + ((trackWidth - thumbWidth) * storyTimelineHorizontalOffset_) / storyTimelineHorizontalMax_;
+        storyTimelineHScrollThumbRect_ = { thumbLeft, storyTimelineHScrollTrackRect_.top - 2, thumbLeft + thumbWidth, storyTimelineHScrollTrackRect_.bottom + 2 };
+    }
+    else
+    {
+        storyTimelineHScrollThumbRect_ = storyTimelineHScrollTrackRect_;
+    }
+    HBRUSH hThumbBrush = CreateSolidBrush(RGB(112, 124, 140));
+    FillRect(hdc, &storyTimelineHScrollThumbRect_, hThumbBrush);
+    DeleteObject(hThumbBrush);
 
     if (storyTimelineAddDropdownVisible_)
     {

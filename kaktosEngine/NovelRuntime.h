@@ -703,6 +703,8 @@ private:
     RECT storyTimelineEditRect_ = {};
     RECT storyTimelineSaveRect_ = {};
     RECT storyTimelineAddRowRect_ = {};
+    RECT storyTimelineHScrollTrackRect_ = {};
+    RECT storyTimelineHScrollThumbRect_ = {};
     std::vector<RECT> storyStructureItemRects_;
     std::vector<RECT> storyMaterialItemRects_;
     std::vector<RECT> storyCategoryChipRects_;
@@ -794,6 +796,10 @@ private:
     int storyPlotScrollMax_ = 0;
     int storyTimelineScrollOffset_ = 0;
     int storyTimelineScrollMax_ = 0;
+    int storyTimelineHorizontalOffset_ = 0;
+    int storyTimelineHorizontalMax_ = 0;
+    int storyTimelineHorizontalDragStartX_ = 0;
+    int storyTimelineHorizontalDragStartOffset_ = 0;
     DragHandle activeDragHandle_ = DragHandle::None;
     size_t editingCommandIndex_ = 0;
     std::wstring editingKey_;
@@ -896,6 +902,7 @@ private:
     bool storyPlotEditMode_ = false;
     bool storyTimelineEditMode_ = false;
     bool storyTimelineAddDropdownVisible_ = false;
+    bool storyTimelineHorizontalDragging_ = false;
     bool storyStatusDropdownVisible_ = false;
     bool storyPanelStatusDropdownVisible_ = false;
     std::wstring storyProductionStatus_ = L"\u5236\u4f5c\u4e2d";
