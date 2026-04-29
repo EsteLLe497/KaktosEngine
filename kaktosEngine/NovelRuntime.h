@@ -7,6 +7,7 @@
 #include <xaudio2.h>
 #include <gdiplus.h>
 #include <memory>
+#include <unordered_map>
 #include <windows.h>
 
 struct EditorSnapshot
@@ -37,6 +38,12 @@ struct AssetListItem
     int depth = 0;
     bool isDirectory = false;
     RECT rect = {};
+};
+
+struct StoryWritingDraft
+{
+    std::wstring title;
+    std::wstring body;
 };
 
 struct CharacterSlot
@@ -127,6 +134,21 @@ struct CharacterDefinition
     std::wstring displayName;
     std::wstring baseImagePath;
     std::wstring color = L"#ffffff";
+    std::wstring nickname;
+    std::wstring role;
+    std::wstring gender;
+    std::wstring age;
+    std::wstring birthday;
+    std::wstring bloodType;
+    std::wstring height;
+    std::wstring weight;
+    std::wstring personality;
+    std::wstring individuality;
+    std::wstring specialty;
+    std::wstring skills;
+    std::wstring upbringing;
+    std::wstring background;
+    std::wstring other;
     std::vector<CharacterExpressionDefinition> expressions;
 };
 
@@ -358,6 +380,7 @@ private:
     COLORREF ShowColorPresetMenu(POINT point, COLORREF currentColor) const;
     bool TryGetNumber(const std::wstring& value, long long& number) const;
     std::unique_ptr<Gdiplus::Image> TryLoadImage(const std::wstring& fullPath) const;
+    std::shared_ptr<Gdiplus::Image> GetCachedImage(const std::wstring& path) const;
     void DrawWrappedText(HDC hdc, const RECT& bounds, const std::wstring& text, UINT format) const;
     void DrawVerticalText(HDC hdc, const RECT& bounds, const std::wstring& text, int lineHeight) const;
     void DrawCharacterSlot(HDC hdc, const RECT& stageRect, const CharacterSlot& slot, int centerX) const;
@@ -371,10 +394,16 @@ private:
     void DrawStoryThemePanel(HDC hdc, const RECT& clientRect);
     void DrawStoryPlotPanel(HDC hdc, const RECT& clientRect);
     void DrawStoryTimelinePanel(HDC hdc, const RECT& clientRect);
+    void DrawStoryWritingPanel(HDC hdc, const RECT& clientRect);
+    void DrawStoryCharacterPanel(HDC hdc, const RECT& clientRect);
+    void DrawStoryInlineEditControls(HDC hdc, const RECT& clientRect);
+    bool HandleStoryInlineEditControlClick(POINT point);
     bool HandleStoryOverviewClick(POINT point);
     bool HandleStoryThemeClick(POINT point);
     bool HandleStoryPlotClick(POINT point);
     bool HandleStoryTimelineClick(POINT point);
+    bool HandleStoryWritingClick(POINT point);
+    bool HandleStoryCharacterClick(POINT point);
     bool BrowseStoryImage();
     void DrawCommandList(HDC hdc, const RECT& panelRect);
     void DrawInspector(HDC hdc, const RECT& panelRect);
@@ -415,6 +444,7 @@ private:
     void InsertChoiceTemplateAfterSelection();
 public:
     bool ExecuteEditorCommand(UINT commandId);
+    bool HandleInlineEditKeyDown(HWND editHandle, WPARAM key);
 private:
     bool CopySelectedCommand();
     bool CutSelectedCommand();
@@ -576,6 +606,9 @@ private:
     HWND sceneNameEdit_ = nullptr;
     HWND characterFieldEdit_ = nullptr;
     HWND variableFieldEdit_ = nullptr;
+    WNDPROC inspectorEditProc_ = nullptr;
+    WNDPROC eventTextEditProc_ = nullptr;
+    HFONT storyThemeEditFont_ = nullptr;
     std::wstring storyTitle_ = L"Kaktos Engine";
     std::wstring speakerName_;
     std::wstring currentText_ = L"Loading scenario...";
@@ -597,6 +630,7 @@ private:
     std::unique_ptr<Gdiplus::Image> nameWindowImage_;
     std::unique_ptr<Gdiplus::Image> choiceButtonImage_;
     std::unique_ptr<Gdiplus::Image> backgroundImage_;
+    mutable std::unordered_map<std::wstring, std::shared_ptr<Gdiplus::Image>> imageCache_;
     COLORREF backgroundColor_ = RGB(28, 36, 48);
     COLORREF messageWindowColor_ = RGB(8, 10, 14);
     COLORREF messageWindowBorderColor_ = RGB(122, 128, 138);
@@ -705,6 +739,22 @@ private:
     RECT storyTimelineAddRowRect_ = {};
     RECT storyTimelineHScrollTrackRect_ = {};
     RECT storyTimelineHScrollThumbRect_ = {};
+    RECT storyWritingPanelRect_ = {};
+    RECT storyWritingListRect_ = {};
+    RECT storyWritingEditorRect_ = {};
+    RECT storyWritingAddRect_ = {};
+    RECT storyWritingDeleteRect_ = {};
+    RECT storyWritingTitleRect_ = {};
+    RECT storyWritingBodyRect_ = {};
+    RECT storyCharacterPanelRect_ = {};
+    RECT storyCharacterListRect_ = {};
+    RECT storyCharacterDetailRect_ = {};
+    RECT storyCharacterAddRect_ = {};
+    RECT storyCharacterEditRect_ = {};
+    RECT storyCharacterImageRect_ = {};
+    RECT storyCharacterImageBrowseRect_ = {};
+    RECT storyInlineCommitRect_ = {};
+    RECT storyInlineCancelRect_ = {};
     std::vector<RECT> storyStructureItemRects_;
     std::vector<RECT> storyMaterialItemRects_;
     std::vector<RECT> storyCategoryChipRects_;
@@ -715,6 +765,10 @@ private:
     std::vector<std::pair<std::wstring, RECT>> storyPlotAddRects_;
     std::vector<std::pair<std::wstring, RECT>> storyTimelineFieldRects_;
     std::vector<std::pair<std::wstring, RECT>> storyTimelineAddOptionRects_;
+    std::vector<RECT> storyWritingDraftRects_;
+    std::vector<RECT> storyWritingDeleteCheckRects_;
+    std::vector<RECT> storyCharacterListItemRects_;
+    std::vector<std::pair<std::wstring, RECT>> storyCharacterFieldRects_;
     RECT characterDialogRect_ = {};
     RECT characterDialogAddRect_ = {};
     RECT characterDialogDeleteRect_ = {};
@@ -800,6 +854,12 @@ private:
     int storyTimelineHorizontalMax_ = 0;
     int storyTimelineHorizontalDragStartX_ = 0;
     int storyTimelineHorizontalDragStartOffset_ = 0;
+    int storyWritingListScrollOffset_ = 0;
+    int storyWritingListScrollMax_ = 0;
+    int storyCharacterListScrollOffset_ = 0;
+    int storyCharacterListScrollMax_ = 0;
+    int storyCharacterDetailScrollOffset_ = 0;
+    int storyCharacterDetailScrollMax_ = 0;
     DragHandle activeDragHandle_ = DragHandle::None;
     size_t editingCommandIndex_ = 0;
     std::wstring editingKey_;
@@ -899,10 +959,16 @@ private:
     bool storyThemeVisible_ = false;
     bool storyPlotVisible_ = false;
     bool storyTimelineVisible_ = false;
+    bool storyWritingVisible_ = false;
+    bool storyCharacterVisible_ = false;
     bool storyPlotEditMode_ = false;
     bool storyTimelineEditMode_ = false;
     bool storyTimelineAddDropdownVisible_ = false;
     bool storyTimelineHorizontalDragging_ = false;
+    bool storyWritingDeleteMode_ = false;
+    bool storyWritingDraftDragging_ = false;
+    bool storyWritingDraftMoved_ = false;
+    bool storyCharacterEditMode_ = false;
     bool storyStatusDropdownVisible_ = false;
     bool storyPanelStatusDropdownVisible_ = false;
     std::wstring storyProductionStatus_ = L"\u5236\u4f5c\u4e2d";
@@ -926,6 +992,13 @@ private:
     std::vector<std::wstring> storyPlotConclusionItems_;
     std::vector<std::wstring> storyTimelineRows_ = { L"\u30d7\u30ed\u30c3\u30c8", L"\u30b9\u30c8\u30fc\u30ea\u30fc", L"\u4f0f\u7dda" };
     std::unordered_map<std::wstring, std::wstring> storyTimelineCells_;
+    std::vector<StoryWritingDraft> storyWritingDrafts_;
+    std::vector<bool> storyWritingDeleteChecks_;
+    size_t selectedWritingDraftIndex_ = 0;
+    size_t selectedStoryCharacterIndex_ = static_cast<size_t>(-1);
+    size_t storyWritingDragSourceIndex_ = static_cast<size_t>(-1);
+    size_t storyWritingDragInsertIndex_ = static_cast<size_t>(-1);
+    POINT storyWritingDragStartPoint_ = {};
     LeftPanelTab leftPanelTab_ = LeftPanelTab::Components;
     std::wstring selectedAssetCategory_ = L"background";
     size_t adjustCharacterCommandIndex_ = static_cast<size_t>(-1);
