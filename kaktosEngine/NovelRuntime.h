@@ -46,6 +46,15 @@ struct StoryWritingDraft
     std::wstring body;
 };
 
+struct StoryWorldEntry
+{
+    std::wstring title;
+    std::wstring category;
+    std::wstring imagePath;
+    std::wstring summary;
+    std::wstring detail;
+};
+
 struct CharacterSlot
 {
     std::wstring slotName;
@@ -396,6 +405,7 @@ private:
     void DrawStoryTimelinePanel(HDC hdc, const RECT& clientRect);
     void DrawStoryWritingPanel(HDC hdc, const RECT& clientRect);
     void DrawStoryCharacterPanel(HDC hdc, const RECT& clientRect);
+    void DrawStoryWorldPanel(HDC hdc, const RECT& clientRect);
     void DrawStoryInlineEditControls(HDC hdc, const RECT& clientRect);
     bool HandleStoryInlineEditControlClick(POINT point);
     bool HandleStoryOverviewClick(POINT point);
@@ -404,6 +414,7 @@ private:
     bool HandleStoryTimelineClick(POINT point);
     bool HandleStoryWritingClick(POINT point);
     bool HandleStoryCharacterClick(POINT point);
+    bool HandleStoryWorldClick(POINT point);
     bool BrowseStoryImage();
     void DrawCommandList(HDC hdc, const RECT& panelRect);
     void DrawInspector(HDC hdc, const RECT& panelRect);
@@ -717,12 +728,14 @@ private:
     RECT storyMaterialsToggleRect_ = {};
     RECT storyThemeRect_ = {};
     RECT storyHeaderRect_ = {};
+    RECT storyStudioCloseRect_ = {};
     RECT storyStatusPillRect_ = {};
     RECT storyWritingRect_ = {};
     RECT storyMemoRect_ = {};
     RECT storyAddMaterialTypeRect_ = {};
     RECT storyOverviewRect_ = {};
     RECT storyOverviewSaveRect_ = {};
+    RECT storyOverviewCloseRect_ = {};
     RECT storyTitleEditRect_ = {};
     RECT storyStatusDropdownRect_ = {};
     RECT storyImageDropRect_ = {};
@@ -730,12 +743,15 @@ private:
     RECT storySynopsisEditRect_ = {};
     RECT storyThemePanelRect_ = {};
     RECT storyThemeSaveRect_ = {};
+    RECT storyThemeCloseRect_ = {};
     RECT storyPlotPanelRect_ = {};
     RECT storyPlotEditRect_ = {};
     RECT storyPlotSaveRect_ = {};
+    RECT storyPlotCloseRect_ = {};
     RECT storyTimelinePanelRect_ = {};
     RECT storyTimelineEditRect_ = {};
     RECT storyTimelineSaveRect_ = {};
+    RECT storyTimelineCloseRect_ = {};
     RECT storyTimelineAddRowRect_ = {};
     RECT storyTimelineHScrollTrackRect_ = {};
     RECT storyTimelineHScrollThumbRect_ = {};
@@ -746,13 +762,23 @@ private:
     RECT storyWritingDeleteRect_ = {};
     RECT storyWritingTitleRect_ = {};
     RECT storyWritingBodyRect_ = {};
+    RECT storyWritingCloseRect_ = {};
     RECT storyCharacterPanelRect_ = {};
     RECT storyCharacterListRect_ = {};
     RECT storyCharacterDetailRect_ = {};
     RECT storyCharacterAddRect_ = {};
     RECT storyCharacterEditRect_ = {};
+    RECT storyCharacterCloseRect_ = {};
     RECT storyCharacterImageRect_ = {};
     RECT storyCharacterImageBrowseRect_ = {};
+    RECT storyWorldPanelRect_ = {};
+    RECT storyWorldListRect_ = {};
+    RECT storyWorldDetailRect_ = {};
+    RECT storyWorldAddRect_ = {};
+    RECT storyWorldEditRect_ = {};
+    RECT storyWorldCloseRect_ = {};
+    RECT storyWorldImageRect_ = {};
+    RECT storyWorldImageBrowseRect_ = {};
     RECT storyInlineCommitRect_ = {};
     RECT storyInlineCancelRect_ = {};
     std::vector<RECT> storyStructureItemRects_;
@@ -769,6 +795,8 @@ private:
     std::vector<RECT> storyWritingDeleteCheckRects_;
     std::vector<RECT> storyCharacterListItemRects_;
     std::vector<std::pair<std::wstring, RECT>> storyCharacterFieldRects_;
+    std::vector<RECT> storyWorldListItemRects_;
+    std::vector<std::pair<std::wstring, RECT>> storyWorldFieldRects_;
     RECT characterDialogRect_ = {};
     RECT characterDialogAddRect_ = {};
     RECT characterDialogDeleteRect_ = {};
@@ -860,6 +888,10 @@ private:
     int storyCharacterListScrollMax_ = 0;
     int storyCharacterDetailScrollOffset_ = 0;
     int storyCharacterDetailScrollMax_ = 0;
+    int storyWorldListScrollOffset_ = 0;
+    int storyWorldListScrollMax_ = 0;
+    int storyWorldDetailScrollOffset_ = 0;
+    int storyWorldDetailScrollMax_ = 0;
     DragHandle activeDragHandle_ = DragHandle::None;
     size_t editingCommandIndex_ = 0;
     std::wstring editingKey_;
@@ -969,6 +1001,8 @@ private:
     bool storyWritingDraftDragging_ = false;
     bool storyWritingDraftMoved_ = false;
     bool storyCharacterEditMode_ = false;
+    bool storyWorldVisible_ = false;
+    bool storyWorldEditMode_ = false;
     bool storyStatusDropdownVisible_ = false;
     bool storyPanelStatusDropdownVisible_ = false;
     std::wstring storyProductionStatus_ = L"\u5236\u4f5c\u4e2d";
@@ -994,8 +1028,10 @@ private:
     std::unordered_map<std::wstring, std::wstring> storyTimelineCells_;
     std::vector<StoryWritingDraft> storyWritingDrafts_;
     std::vector<bool> storyWritingDeleteChecks_;
+    std::vector<StoryWorldEntry> storyWorldEntries_;
     size_t selectedWritingDraftIndex_ = 0;
     size_t selectedStoryCharacterIndex_ = static_cast<size_t>(-1);
+    size_t selectedStoryWorldIndex_ = static_cast<size_t>(-1);
     size_t storyWritingDragSourceIndex_ = static_cast<size_t>(-1);
     size_t storyWritingDragInsertIndex_ = static_cast<size_t>(-1);
     POINT storyWritingDragStartPoint_ = {};
