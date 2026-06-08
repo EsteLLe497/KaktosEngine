@@ -131,6 +131,15 @@ struct InspectorActionTarget
     RECT buttonRect = {};
 };
 
+struct InspectorSliderTarget
+{
+    size_t commandIndex = 0;
+    std::wstring key;
+    RECT trackRect = {};
+    int minValue = 0;
+    int maxValue = 100;
+};
+
 struct CharacterExpressionDefinition
 {
     std::wstring name;
@@ -328,7 +337,12 @@ public:
     bool IsPlayerMode() const;
     void SetHostWindow(HWND hWnd);
     void NotifyPreviewWindowDestroyed();
+    void NotifyFlowGraphWindowDestroyed();
     void RefreshPreviewWindow();
+    void RefreshFlowGraphWindow();
+    void DrawFlowGraphWindow(HDC hdc, const RECT& clientRect);
+    bool HandleFlowGraphWindowClick(POINT point);
+    bool HandleFlowGraphMouseWheel(short delta);
     void ShowProjectLauncher();
 
     const std::wstring& GetWindowTitle() const;
@@ -422,6 +436,8 @@ private:
     void DrawEventList(HDC hdc, const RECT& panelRect);
     COLORREF GetCommandAccentColor(const ScriptCommand& command) const;
     bool HandleGraphNodeSelection(size_t commandIndex);
+    bool EnsureFlowGraphWindow();
+    static LRESULT CALLBACK FlowGraphWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam);
     bool HandleToolbarClick(POINT point);
     void InitializeToolbarItems();
     void LoadToolbarIcons();
@@ -430,6 +446,8 @@ private:
     bool IsLabelNode(size_t commandIndex) const;
     void RewireSelectedSourceToLabel(size_t labelCommandIndex);
     std::wstring MakeUniqueLabelName(const std::wstring& prefix) const;
+    bool EnsureChoiceBranchesAreIsolated(size_t choiceIndex);
+    bool EnsureAllChoiceBranchesAreIsolated();
     std::wstring GetCommandTypeLabel(const ScriptCommand& command) const;
     std::wstring GetCommandSummary(const ScriptCommand& command) const;
     bool TrySelectCommandFromPoint(POINT point, const RECT& clientRect);
@@ -514,6 +532,7 @@ private:
     void DrawProjectDialog(HDC hdc, const RECT& clientRect);
     void DrawCharacterManagerDialog(HDC hdc, const RECT& clientRect);
     void DrawVariableManagerDialog(HDC hdc, const RECT& clientRect);
+    void UpdateVariableDialogLayoutRects(const RECT& clientRect);
     void DrawSettingsDialog(HDC hdc, const RECT& clientRect);
     void UpdateChildControls();
     void EnsureChildControls();
@@ -546,6 +565,7 @@ private:
     void CancelInspectorEdit();
     bool HandleInspectorClick(POINT point);
     bool BrowseCommandAsset(size_t commandIndex, const std::wstring& key, bool audio);
+    bool UpdateInspectorSliderFromPoint(size_t sliderIndex, POINT point);
     std::vector<ScenarioIssue> ValidateScenario() const;
     std::wstring GetFirstIssueForCommand(size_t commandIndex) const;
     bool SelectFirstScenarioIssue();
@@ -611,6 +631,7 @@ private:
     AudioPlaybackState previewPlayback_;
     HWND hostWindow_ = nullptr;
     HWND previewWindow_ = nullptr;
+    HWND flowGraphWindow_ = nullptr;
     HWND eventSearchEdit_ = nullptr;
     HWND inspectorEdit_ = nullptr;
     HWND eventTextEdit_ = nullptr;
@@ -695,6 +716,8 @@ private:
     std::vector<size_t> commandRowIndices_;
     std::vector<RECT> graphNodeRects_;
     std::vector<size_t> graphNodeIndices_;
+    std::vector<RECT> flowGraphNodeRects_;
+    std::vector<size_t> flowGraphNodeIndices_;
     std::vector<RECT> eventRowRects_;
     std::vector<size_t> eventRowIndices_;
     std::vector<RECT> eventExpandRects_;
@@ -703,6 +726,7 @@ private:
     std::vector<ProjectLauncherRow> projectLauncherRows_;
     std::vector<InspectorEditTarget> inspectorEditTargets_;
     std::vector<InspectorActionTarget> inspectorActionTargets_;
+    std::vector<InspectorSliderTarget> inspectorSliderTargets_;
     RECT eventAddTextRect_ = {};
     RECT eventAddChoiceRect_ = {};
     RECT eventValidateRect_ = {};
@@ -808,6 +832,7 @@ private:
     RECT characterDialogFieldCancelRect_ = {};
     RECT variableDialogRect_ = {};
     RECT variableDialogAddRect_ = {};
+    RECT variableDialogAddSwitchRect_ = {};
     RECT variableDialogDeleteRect_ = {};
     RECT variableDialogCloseRect_ = {};
     RECT variableDialogEditRect_ = {};
@@ -854,6 +879,7 @@ private:
     RECT lastClientRect_ = { 0, 0, 1280, 720 };
     size_t selectedCommandIndex_ = 0;
     size_t selectedChoiceLinkIndex_ = 0;
+    size_t activeInspectorSliderIndex_ = static_cast<size_t>(-1);
     size_t expandedTextCommandIndex_ = static_cast<size_t>(-1);
     size_t dragInsertIndex_ = 0;
     size_t eventDragSourceIndex_ = static_cast<size_t>(-1);
@@ -864,6 +890,14 @@ private:
     int leftPanelWidth_ = 280;
     int rightPanelWidth_ = 320;
     int graphHeight_ = 162;
+    int flowGraphScrollOffset_ = 0;
+    int flowGraphScrollMax_ = 0;
+    int flowGraphOffsetY_ = 0;
+    int flowGraphVerticalMax_ = 0;
+    int flowGraphZoomPercent_ = 100;
+    bool flowGraphDragging_ = false;
+    bool flowGraphDragMoved_ = false;
+    POINT flowGraphLastDragPoint_ = {};
     int eventListHeight_ = 208;
     int eventListScrollOffset_ = 0;
     int componentScrollOffset_ = 0;
@@ -957,6 +991,9 @@ private:
     bool showPreviewPanel_ = false;
     bool showEventList_ = true;
     bool inspectorEditing_ = false;
+    bool inspectorSliderDragging_ = false;
+    bool inspectorSliderUndoCaptured_ = false;
+    bool suppressNextModalClick_ = false;
     bool paletteDragActive_ = false;
     bool paletteDropValid_ = false;
     bool eventReorderDragActive_ = false;

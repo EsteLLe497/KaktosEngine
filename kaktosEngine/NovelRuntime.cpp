@@ -1,4 +1,4 @@
-﻿#include "framework.h"
+#include "framework.h"
 #include "NovelRuntime.h"
 #include "resource.h"
 
@@ -18,6 +18,7 @@
 #include <iterator>
 #include <sstream>
 #include <unordered_set>
+
 
 #define STB_VORBIS_HEADER_ONLY
 #include "stb_vorbis.c"
@@ -42,6 +43,22 @@ namespace
     void DebugTrace(const std::wstring& message)
     {
         OutputDebugStringW((message + L"\n").c_str());
+    }
+
+    std::string WideToUtf8ForImGui(const std::wstring& text)
+    {
+        if (text.empty())
+        {
+            return std::string{};
+        }
+        const int requiredBytes = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+        if (requiredBytes <= 0)
+        {
+            return std::string{};
+        }
+        std::string utf8(requiredBytes, '\0');
+        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), &utf8[0], requiredBytes, nullptr, nullptr);
+        return utf8;
     }
 
     constexpr const wchar_t* kRuntimeEditProp = L"KaktosRuntimeEditOwner";
@@ -893,6 +910,11 @@ void NovelRuntime::Shutdown()
         DestroyWindow(previewWindow_);
         previewWindow_ = nullptr;
     }
+    if (flowGraphWindow_)
+    {
+        DestroyWindow(flowGraphWindow_);
+        flowGraphWindow_ = nullptr;
+    }
 
     ShutdownAudioEngine();
     backgroundImage_.reset();
@@ -989,6 +1011,12 @@ void NovelRuntime::NotifyPreviewWindowDestroyed()
     previewVisible_ = false;
 }
 
+void NovelRuntime::NotifyFlowGraphWindowDestroyed()
+{
+    flowGraphWindow_ = nullptr;
+    showFlowGraph_ = false;
+}
+
 void NovelRuntime::RefreshPreviewWindow()
 {
     if (previewWindow_ && IsWindow(previewWindow_) && IsWindowVisible(previewWindow_))
@@ -996,6 +1024,168 @@ void NovelRuntime::RefreshPreviewWindow()
         SetWindowTextW(previewWindow_, storyTitle_.c_str());
         InvalidateRect(previewWindow_, nullptr, TRUE);
     }
+    RefreshFlowGraphWindow();
+}
+
+void NovelRuntime::RefreshFlowGraphWindow()
+{
+    if (flowGraphWindow_ && IsWindow(flowGraphWindow_) && IsWindowVisible(flowGraphWindow_))
+    {
+        InvalidateRect(flowGraphWindow_, nullptr, TRUE);
+    }
+}
+
+bool NovelRuntime::EnsureFlowGraphWindow()
+{
+    if (flowGraphWindow_ && IsWindow(flowGraphWindow_))
+    {
+        ShowWindow(flowGraphWindow_, SW_SHOWNORMAL);
+        SetForegroundWindow(flowGraphWindow_);
+        showFlowGraph_ = true;
+        return true;
+    }
+
+    static bool classRegistered = false;
+    const wchar_t* className = L"KaktosFlowGraphWindow";
+    HINSTANCE instance = GetModuleHandleW(nullptr);
+    if (!classRegistered)
+    {
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(WNDCLASSEXW);
+        wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+        wc.lpfnWndProc = NovelRuntime::FlowGraphWndProc;
+        wc.hInstance = instance;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = nullptr;
+        wc.lpszClassName = className;
+        classRegistered = RegisterClassExW(&wc) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+    if (!classRegistered)
+    {
+        return false;
+    }
+
+    flowGraphWindow_ = CreateWindowExW(
+        0,
+        className,
+        L"フローグラフ",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        980,
+        620,
+        hostWindow_,
+        nullptr,
+        instance,
+        this);
+    showFlowGraph_ = flowGraphWindow_ != nullptr;
+    return showFlowGraph_;
+}
+
+LRESULT CALLBACK NovelRuntime::FlowGraphWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    NovelRuntime* runtime = reinterpret_cast<NovelRuntime*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+    if (message == WM_NCCREATE)
+    {
+        CREATESTRUCTW* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        runtime = reinterpret_cast<NovelRuntime*>(create ? create->lpCreateParams : nullptr);
+        SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(runtime));
+    }
+
+    switch (message)
+    {
+    case WM_LBUTTONDOWN:
+        if (runtime)
+        {
+            runtime->flowGraphDragging_ = true;
+            runtime->flowGraphDragMoved_ = false;
+            runtime->flowGraphLastDragPoint_ = POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            SetCapture(hWnd);
+            return 0;
+        }
+        break;
+    case WM_MOUSEMOVE:
+        if (runtime && runtime->flowGraphDragging_ && (wParam & MK_LBUTTON))
+        {
+            const POINT point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            const int dx = point.x - runtime->flowGraphLastDragPoint_.x;
+            const int dy = point.y - runtime->flowGraphLastDragPoint_.y;
+            if (dx != 0 || dy != 0)
+            {
+                runtime->flowGraphScrollOffset_ = (std::max)(0, (std::min)(runtime->flowGraphScrollOffset_ - dx, runtime->flowGraphScrollMax_));
+                runtime->flowGraphOffsetY_ = (std::max)(0, (std::min)(runtime->flowGraphOffsetY_ - dy, runtime->flowGraphVerticalMax_));
+                runtime->flowGraphLastDragPoint_ = point;
+                runtime->flowGraphDragMoved_ = true;
+                InvalidateRect(hWnd, nullptr, TRUE);
+            }
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (runtime && runtime->flowGraphDragging_)
+        {
+            if (GetCapture() == hWnd)
+            {
+                ReleaseCapture();
+            }
+            runtime->flowGraphDragging_ = false;
+            if (!runtime->flowGraphDragMoved_)
+            {
+                if (runtime->HandleFlowGraphWindowClick(POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) }))
+                {
+                    InvalidateRect(hWnd, nullptr, TRUE);
+                    if (runtime->hostWindow_)
+                    {
+                        InvalidateRect(runtime->hostWindow_, nullptr, TRUE);
+                    }
+                }
+            }
+            return 0;
+        }
+        break;
+    case WM_MOUSEWHEEL:
+        if (runtime && runtime->HandleFlowGraphMouseWheel(GET_WHEEL_DELTA_WPARAM(wParam)))
+        {
+            InvalidateRect(hWnd, nullptr, TRUE);
+            return 0;
+        }
+        break;
+    case WM_SIZE:
+        InvalidateRect(hWnd, nullptr, TRUE);
+        return 0;
+    case WM_PAINT:
+        if (runtime)
+        {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hWnd, &ps);
+            RECT clientRect = {};
+            GetClientRect(hWnd, &clientRect);
+            const int width = (std::max)(1, static_cast<int>(clientRect.right - clientRect.left));
+            const int height = (std::max)(1, static_cast<int>(clientRect.bottom - clientRect.top));
+            HDC memoryDc = CreateCompatibleDC(hdc);
+            HBITMAP backBuffer = CreateCompatibleBitmap(hdc, width, height);
+            HGDIOBJ oldBitmap = SelectObject(memoryDc, backBuffer);
+            runtime->DrawFlowGraphWindow(memoryDc, clientRect);
+            BitBlt(hdc, 0, 0, width, height, memoryDc, 0, 0, SRCCOPY);
+            SelectObject(memoryDc, oldBitmap);
+            DeleteObject(backBuffer);
+            DeleteDC(memoryDc);
+            EndPaint(hWnd, &ps);
+            return 0;
+        }
+        break;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_DESTROY:
+        if (runtime)
+        {
+            runtime->NotifyFlowGraphWindowDestroyed();
+        }
+        return 0;
+    default:
+        break;
+    }
+    return DefWindowProcW(hWnd, message, wParam, lParam);
 }
 
 void NovelRuntime::EnsureChildControls()
@@ -1214,10 +1404,6 @@ RECT NovelRuntime::GetPreviewRect(const RECT& clientRect) const
 int NovelRuntime::GetPreviewContentTop(const RECT& previewRect) const
 {
     int currentTop = GetToolbarRect(previewRect).bottom + 12;
-    if (showFlowGraph_)
-    {
-        currentTop += graphHeight_ + 18;
-    }
     if (showEventList_)
     {
         currentTop += eventListHeight_ + 18;
@@ -1232,15 +1418,9 @@ bool NovelRuntime::HasVisibleArea(const RECT& rect) const
 
 RECT NovelRuntime::GetGraphRect(const RECT& previewRect) const
 {
-    if (!showFlowGraph_)
-    {
-        const int top = GetToolbarRect(previewRect).bottom + 12;
-        return RECT{ previewRect.left + 16, top, previewRect.right - 16, top };
-    }
     const RECT toolbarRect = GetToolbarRect(previewRect);
     const int top = toolbarRect.bottom + 12;
-    const int bottom = top + (std::max)(120, graphHeight_);
-    return RECT{ previewRect.left + 16, top, previewRect.right - 16, bottom };
+    return RECT{ previewRect.left + 16, top, previewRect.right - 16, top };
 }
 
 RECT NovelRuntime::GetStageRect(const RECT& previewRect) const
@@ -3179,6 +3359,7 @@ void NovelRuntime::LoadScenario(const std::wstring& requestedPath)
     }
 
     scenario_ = std::move(document);
+    EnsureAllChoiceBranchesAreIsolated();
     storyTitle_ = scenario_.title;
     statusText_ = L"loaded: " + loadedPath;
     scenarioPath_ = loadedPath;
@@ -3452,6 +3633,12 @@ void NovelRuntime::Advance()
 
 bool NovelRuntime::HandleClick(POINT point)
 {
+    if (suppressNextModalClick_)
+    {
+        suppressNextModalClick_ = false;
+        return true;
+    }
+
     if (projectDialogVisible_)
     {
         if (PtInRect(&projectDialogCreateRect_, point))
@@ -3528,15 +3715,39 @@ bool NovelRuntime::HandleClick(POINT point)
             return true;
         }
 
-        if (PtInRect(&variableDialogAddRect_, point))
+        if (PtInRect(&variableDialogAddRect_, point) || PtInRect(&variableDialogAddSwitchRect_, point))
         {
             if (sceneNameEdit_)
             {
+                const bool addSwitch = PtInRect(&variableDialogAddSwitchRect_, point);
                 const int length = GetWindowTextLengthW(sceneNameEdit_);
                 std::wstring value(static_cast<size_t>(length) + 1, L'\0');
                 GetWindowTextW(sceneNameEdit_, &value[0], length + 1);
                 value.resize(length);
                 value = Trim(value);
+                if (value.empty())
+                {
+                    // 空入力でもすぐ試せるよう、用途別の連番名を自動生成します。
+                    const std::wstring prefix = addSwitch ? L"switch_" : L"var_";
+                    for (int suffix = 1; suffix < 10000; ++suffix)
+                    {
+                        const std::wstring candidate = prefix + std::to_wstring(suffix);
+                        bool nameExists = false;
+                        for (const VariableDefinition& definition : variableDefinitions_)
+                        {
+                            if (definition.name == candidate)
+                            {
+                                nameExists = true;
+                                break;
+                            }
+                        }
+                        if (!nameExists)
+                        {
+                            value = candidate;
+                            break;
+                        }
+                    }
+                }
                 if (!value.empty())
                 {
                     bool exists = false;
@@ -3552,14 +3763,18 @@ bool NovelRuntime::HandleClick(POINT point)
                     {
                         VariableDefinition definition;
                         definition.name = value;
-                        definition.type = VariableType::Integer;
-                        definition.initialValue = L"0";
+                        definition.type = addSwitch ? VariableType::Bool : VariableType::Integer;
+                        definition.initialValue = definition.type == VariableType::Bool ? L"false" : L"0";
                         variableDefinitions_.push_back(definition);
                         variables_[value] = definition.initialValue;
                         selectedVariableDefinitionIndex_ = variableDefinitions_.size() - 1;
                         SetWindowTextW(sceneNameEdit_, L"");
                         SaveProject();
                         statusText_ = L"変数を追加しました";
+                    }
+                    else
+                    {
+                        statusText_ = L"同じ名前の変数があります";
                     }
                 }
             }
@@ -4203,6 +4418,12 @@ bool NovelRuntime::HandleClick(POINT point)
 
 bool NovelRuntime::HandleDoubleClick(POINT point)
 {
+    if (variableManagerVisible_ || characterManagerVisible_ || projectDialogVisible_ || settingsDialogVisible_)
+    {
+        // ダブルクリック後の WM_LBUTTONUP を吸収して、切替系ボタンの二重実行を防ぎます。
+        suppressNextModalClick_ = true;
+        return true;
+    }
     if (projectLauncherVisible_)
     {
         return HandleClick(point);
@@ -4384,6 +4605,27 @@ bool NovelRuntime::HandleMouseDown(POINT point)
         return true;
     }
 
+    if (variableManagerVisible_ || characterManagerVisible_ || sceneDialogVisible_ || projectDialogVisible_ || settingsDialogVisible_)
+    {
+        return false;
+    }
+
+    if (showInspector_ && HasVisibleArea(currentInspectorRect_))
+    {
+        for (size_t i = 0; i < inspectorSliderTargets_.size(); ++i)
+        {
+            RECT hitRect = inspectorSliderTargets_[i].trackRect;
+            InflateRect(&hitRect, 8, 12);
+            if (PtInRect(&hitRect, point))
+            {
+                inspectorSliderDragging_ = true;
+                inspectorSliderUndoCaptured_ = false;
+                activeInspectorSliderIndex_ = i;
+                return UpdateInspectorSliderFromPoint(i, point);
+            }
+        }
+    }
+
     if (storyWritingVisible_)
     {
         for (size_t i = 0; i < storyWritingDraftRects_.size(); ++i)
@@ -4487,6 +4729,28 @@ bool NovelRuntime::HandleMouseMove(POINT point)
     if (projectLauncherVisible_)
     {
         return !newHoverHelp.empty();
+    }
+
+    if (inspectorSliderDragging_)
+    {
+        if (activeInspectorSliderIndex_ < inspectorSliderTargets_.size())
+        {
+            return UpdateInspectorSliderFromPoint(activeInspectorSliderIndex_, point);
+        }
+        inspectorSliderDragging_ = false;
+        activeInspectorSliderIndex_ = static_cast<size_t>(-1);
+        return false;
+    }
+
+    if (inspectorSliderDragging_)
+    {
+        const bool changed = activeInspectorSliderIndex_ < inspectorSliderTargets_.size()
+            ? UpdateInspectorSliderFromPoint(activeInspectorSliderIndex_, point)
+            : false;
+        inspectorSliderDragging_ = false;
+        inspectorSliderUndoCaptured_ = false;
+        activeInspectorSliderIndex_ = static_cast<size_t>(-1);
+        return changed;
     }
 
     if (assetDragActive_)
@@ -4699,6 +4963,9 @@ bool NovelRuntime::HandleMouseUp(POINT point)
         storyTimelineHorizontalDragging_ = false;
         storyWritingDraftDragging_ = false;
         storyWritingDraftMoved_ = false;
+        inspectorSliderDragging_ = false;
+        inspectorSliderUndoCaptured_ = false;
+        activeInspectorSliderIndex_ = static_cast<size_t>(-1);
         eventEffectDropTargetIndex_ = static_cast<size_t>(-1);
         activeDragHandle_ = DragHandle::None;
         return false;
@@ -5061,6 +5328,179 @@ void NovelRuntime::NormalizePlaybackStateAfterScenarioMutation()
     }
 }
 
+bool NovelRuntime::EnsureAllChoiceBranchesAreIsolated()
+{
+    bool changed = false;
+    for (size_t i = 0; i < scenario_.commands.size(); ++i)
+    {
+        if (scenario_.commands[i].type == ScriptCommand::Type::Choice)
+        {
+            changed = EnsureChoiceBranchesAreIsolated(i) || changed;
+        }
+    }
+    if (changed)
+    {
+        RebuildScenarioLabels(scenario_);
+    }
+    return changed;
+}
+
+bool NovelRuntime::EnsureChoiceBranchesAreIsolated(size_t choiceIndex)
+{
+    if (choiceIndex >= scenario_.commands.size() ||
+        scenario_.commands[choiceIndex].type != ScriptCommand::Type::Choice ||
+        scenario_.commands[choiceIndex].links.empty())
+    {
+        return false;
+    }
+
+    RebuildScenarioLabels(scenario_);
+
+    const ScriptCommand& choice = scenario_.commands[choiceIndex];
+    std::vector<std::pair<size_t, std::wstring>> branchStarts;
+    std::unordered_set<std::wstring> branchLabels;
+    for (const auto& link : choice.links)
+    {
+        const auto labelIt = scenario_.labels.find(link.second);
+        if (labelIt == scenario_.labels.end())
+        {
+            continue;
+        }
+        if (labelIt->second <= choiceIndex)
+        {
+            continue;
+        }
+        branchStarts.push_back({ labelIt->second, link.second });
+        branchLabels.insert(link.second);
+    }
+
+    std::sort(branchStarts.begin(), branchStarts.end(), [](const auto& lhs, const auto& rhs)
+    {
+        return lhs.first < rhs.first;
+    });
+    branchStarts.erase(std::unique(branchStarts.begin(), branchStarts.end(), [](const auto& lhs, const auto& rhs)
+    {
+        return lhs.first == rhs.first;
+    }), branchStarts.end());
+    if (branchStarts.size() < 2)
+    {
+        return false;
+    }
+
+    auto nextBranchStart = [&](size_t branchOrder) -> size_t
+    {
+        return branchOrder + 1 < branchStarts.size() ? branchStarts[branchOrder + 1].first : scenario_.commands.size();
+    };
+    auto findNextUnrelatedLabel = [&](size_t startIndex) -> size_t
+    {
+        for (size_t i = startIndex + 1; i < scenario_.commands.size(); ++i)
+        {
+            if (scenario_.commands[i].type != ScriptCommand::Type::Label)
+            {
+                continue;
+            }
+            const std::wstring name = GetCommandParameter(scenario_.commands[i], L"name");
+            if (branchLabels.find(name) == branchLabels.end())
+            {
+                return i;
+            }
+        }
+        return scenario_.commands.size();
+    };
+
+    std::wstring mergeLabelName;
+    size_t mergeLabelIndex = scenario_.commands.size();
+
+    for (size_t branchOrder = 0; branchOrder < branchStarts.size() && mergeLabelName.empty(); ++branchOrder)
+    {
+        const size_t start = branchStarts[branchOrder].first;
+        const size_t scanEnd = nextBranchStart(branchOrder);
+        for (size_t scan = start + 1; scan < scanEnd && scan < scenario_.commands.size(); ++scan)
+        {
+            const ScriptCommand& scanned = scenario_.commands[scan];
+            if (scanned.type != ScriptCommand::Type::Jump)
+            {
+                continue;
+            }
+            const std::wstring target = GetCommandParameter(scanned, L"target");
+            if (!target.empty() && branchLabels.find(target) == branchLabels.end())
+            {
+                mergeLabelName = target;
+                const auto mergeIt = scenario_.labels.find(mergeLabelName);
+                mergeLabelIndex = mergeIt != scenario_.labels.end() ? mergeIt->second : scenario_.commands.size();
+                break;
+            }
+        }
+    }
+
+    if (mergeLabelName.empty())
+    {
+        const size_t nextLabel = findNextUnrelatedLabel(branchStarts.back().first);
+        if (nextLabel < scenario_.commands.size())
+        {
+            mergeLabelName = GetCommandParameter(scenario_.commands[nextLabel], L"name");
+            mergeLabelIndex = nextLabel;
+        }
+    }
+
+    bool changed = false;
+    if (mergeLabelName.empty())
+    {
+        mergeLabelName = MakeUniqueLabelName(L"choice_end");
+        ScriptCommand mergeLabel = CreateDefaultCommand(ScriptCommand::Type::Label);
+        mergeLabel.parameters[L"name"] = mergeLabelName;
+        scenario_.commands.push_back(std::move(mergeLabel));
+        mergeLabelIndex = scenario_.commands.size() - 1;
+        changed = true;
+    }
+
+    // 後ろの枝から直すと、前側の挿入位置がずれず軽量です。
+    for (size_t reverseOrder = branchStarts.size(); reverseOrder > 0; --reverseOrder)
+    {
+        const size_t branchOrder = reverseOrder - 1;
+        const size_t start = branchStarts[branchOrder].first;
+        size_t branchEnd = nextBranchStart(branchOrder);
+        if (branchOrder + 1 == branchStarts.size())
+        {
+            branchEnd = mergeLabelIndex < scenario_.commands.size() && mergeLabelIndex > start
+                ? mergeLabelIndex
+                : findNextUnrelatedLabel(start);
+        }
+        branchEnd = (std::min)(branchEnd, scenario_.commands.size());
+        if (branchEnd <= start + 1)
+        {
+            continue;
+        }
+
+        const ScriptCommand& terminal = scenario_.commands[branchEnd - 1];
+        if (terminal.type == ScriptCommand::Type::Jump)
+        {
+            continue;
+        }
+
+        ScriptCommand branchJump = CreateDefaultCommand(ScriptCommand::Type::Jump);
+        branchJump.parameters[L"target"] = mergeLabelName;
+        scenario_.commands.insert(
+            scenario_.commands.begin() + static_cast<std::ptrdiff_t>(branchEnd),
+            std::move(branchJump));
+        if (branchEnd <= selectedCommandIndex_)
+        {
+            ++selectedCommandIndex_;
+        }
+        if (mergeLabelIndex >= branchEnd && mergeLabelIndex < scenario_.commands.size())
+        {
+            ++mergeLabelIndex;
+        }
+        changed = true;
+    }
+
+    if (changed)
+    {
+        RebuildScenarioLabels(scenario_);
+    }
+    return changed;
+}
+
 ScriptCommand NovelRuntime::CreateDefaultCommand(ScriptCommand::Type type) const
 {
     ScriptCommand command;
@@ -5278,6 +5718,8 @@ void NovelRuntime::InsertChoiceTemplateAfterSelection()
     secondLabel.parameters[L"name"] = secondLabelName;
     ScriptCommand secondText = CreateDefaultCommand(ScriptCommand::Type::Text);
     secondText.parameters[L"value"] = L"選択肢2の本文";
+    ScriptCommand secondJump = CreateDefaultCommand(ScriptCommand::Type::Jump);
+    secondJump.parameters[L"target"] = endLabelName;
     ScriptCommand endLabel = CreateDefaultCommand(ScriptCommand::Type::Label);
     endLabel.parameters[L"name"] = endLabelName;
 
@@ -5288,6 +5730,7 @@ void NovelRuntime::InsertChoiceTemplateAfterSelection()
     commands.push_back(std::move(firstJump));
     commands.push_back(std::move(secondLabel));
     commands.push_back(std::move(secondText));
+    commands.push_back(std::move(secondJump));
     commands.push_back(std::move(endLabel));
 
     scenario_.commands.insert(
@@ -5823,8 +6266,30 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
         if (StartsWithText(target.action, L"var_edit:"))
         {
             const std::wstring variableName = target.action.substr(9);
+            for (const VariableDefinition& definition : variableDefinitions_)
+            {
+                if (definition.name == variableName && definition.type == VariableType::Bool)
+                {
+                    const bool current = ParseBoolValue(variables_[variableName], false);
+                    variables_[variableName] = current ? L"false" : L"true";
+                    PushVariableHistory(L"EDIT " + variableName + L" = " + variables_[variableName]);
+                    statusText_ = variableName + L" を更新しました";
+                    RefreshPreviewIfActive();
+                    return true;
+                }
+            }
             const auto found = variables_.find(variableName);
             BeginInspectorEdit(static_cast<size_t>(-1), variableName, L"変数 " + variableName, found == variables_.end() ? L"" : found->second);
+            return true;
+        }
+        if (StartsWithText(target.action, L"var_toggle_bool:"))
+        {
+            const std::wstring variableName = target.action.substr(16);
+            const bool current = ParseBoolValue(variables_[variableName], false);
+            variables_[variableName] = current ? L"false" : L"true";
+            PushVariableHistory(L"EDIT " + variableName + L" = " + variables_[variableName]);
+            statusText_ = variableName + L" を更新しました";
+            RefreshPreviewIfActive();
             return true;
         }
         if (StartsWithText(target.action, L"var_nudge:"))
@@ -5835,6 +6300,19 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             {
                 const std::wstring dir = target.action.substr(firstColon + 1, secondColon - firstColon - 1);
                 const std::wstring variableName = target.action.substr(secondColon + 1);
+                bool canNudge = true;
+                for (const VariableDefinition& definition : variableDefinitions_)
+                {
+                    if (definition.name == variableName)
+                    {
+                        canNudge = definition.type == VariableType::Integer;
+                        break;
+                    }
+                }
+                if (!canNudge)
+                {
+                    return true;
+                }
                 long long current = 0;
                 TryGetNumber(variables_[variableName], current);
                 current += (dir == L"-" ? -1 : 1);
@@ -6254,6 +6732,7 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             {
                 selectedCommandIndex_ += insertedCount;
             }
+            EnsureChoiceBranchesAreIsolated(selectedCommandIndex_);
             SyncDocumentMetadata();
             statusText_ = mergeLabelName.empty() ? L"選択肢の枝を追加しました" : L"選択肢の枝を合流付きで追加しました";
             RefreshPreviewIfActive();
@@ -6365,7 +6844,10 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
             RefreshPreviewIfActive();
             return true;
         }
-        if (target.action == L"if_cycle_var" && command.type == ScriptCommand::Type::IfJump)
+        if (target.action == L"if_cycle_var" &&
+            (command.type == ScriptCommand::Type::IfJump ||
+                command.type == ScriptCommand::Type::SetValue ||
+                command.type == ScriptCommand::Type::AddValue))
         {
             SyncVariableDefinitions();
             if (!variableDefinitions_.empty())
@@ -6380,6 +6862,21 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
                     RefreshPreviewIfActive();
                 }
             }
+            return true;
+        }
+        if (target.action == L"toggle_bool_value" &&
+            (command.type == ScriptCommand::Type::IfJump || command.type == ScriptCommand::Type::SetValue))
+        {
+            PushUndoSnapshot();
+            const bool current = ParseBoolValue(GetCommandParameter(command, L"value"), command.type == ScriptCommand::Type::IfJump);
+            command.parameters[L"value"] = current ? L"false" : L"true";
+            if (command.type == ScriptCommand::Type::IfJump && GetCommandParameter(command, L"op").empty())
+            {
+                command.parameters[L"op"] = L"eq";
+            }
+            SyncDocumentMetadata();
+            statusText_ = L"スイッチ値を切り替えました";
+            RefreshPreviewIfActive();
             return true;
         }
     }
@@ -6420,6 +6917,53 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
         }
     }
     return false;
+}
+
+bool NovelRuntime::UpdateInspectorSliderFromPoint(size_t sliderIndex, POINT point)
+{
+    if (sliderIndex >= inspectorSliderTargets_.size())
+    {
+        return false;
+    }
+
+    const InspectorSliderTarget& slider = inspectorSliderTargets_[sliderIndex];
+    if (slider.commandIndex >= scenario_.commands.size() || slider.maxValue <= slider.minValue)
+    {
+        return false;
+    }
+
+    const int trackWidth = (std::max)(1, static_cast<int>(slider.trackRect.right - slider.trackRect.left));
+    const int clampedX = (std::max)(slider.trackRect.left, (std::min)(point.x, slider.trackRect.right));
+    int newValue = slider.minValue + ((clampedX - slider.trackRect.left) * (slider.maxValue - slider.minValue)) / trackWidth;
+
+    // Editor-facing sliders snap to practical increments so repeated tuning stays stable.
+    if (slider.key == L"time" || slider.key == L"fadein" || slider.key == L"fadeout" || slider.key == L"fade_time")
+    {
+        newValue = ((newValue + 25) / 50) * 50;
+    }
+    else if (slider.key == L"x" || slider.key == L"y" || slider.key == L"name_x" || slider.key == L"name_y")
+    {
+        newValue = ((newValue + (newValue >= 0 ? 5 : -5)) / 10) * 10;
+    }
+
+    ScriptCommand& command = scenario_.commands[slider.commandIndex];
+    const std::wstring oldValue = GetCommandParameter(command, slider.key);
+    const std::wstring valueText = std::to_wstring((std::max)(slider.minValue, (std::min)(newValue, slider.maxValue)));
+    if (oldValue == valueText)
+    {
+        return true;
+    }
+
+    if (!inspectorSliderUndoCaptured_)
+    {
+        PushUndoSnapshot();
+        inspectorSliderUndoCaptured_ = true;
+    }
+    command.parameters[slider.key] = valueText;
+    SyncDocumentMetadata();
+    RefreshPreviewIfActive();
+    statusText_ = slider.key + L" = " + valueText;
+    return true;
 }
 
 bool NovelRuntime::BrowseCommandAsset(size_t commandIndex, const std::wstring& key, bool audio)
@@ -7475,6 +8019,7 @@ void NovelRuntime::UpdateChildControls()
         }
         else if (variableManagerVisible_)
         {
+            UpdateVariableDialogLayoutRects(lastClientRect_);
             SetWindowPos(sceneNameEdit_, nullptr, variableDialogEditRect_.left, variableDialogEditRect_.top, variableDialogEditRect_.right - variableDialogEditRect_.left, variableDialogEditRect_.bottom - variableDialogEditRect_.top, SWP_NOZORDER | SWP_SHOWWINDOW);
             if (!variableFieldDialogVisible_ && GetFocus() != sceneNameEdit_)
             {
@@ -7605,6 +8150,7 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
         else if (key == L"event_list_height") eventListHeight_ = _wtoi(value.c_str());
         else if (key == L"show_components") showComponents_ = value == L"1";
         else if (key == L"show_inspector") showInspector_ = value == L"1";
+        else if (key == L"show_legacy_inspector" && value == L"1") showInspector_ = true;
         else if (key == L"show_flow_graph") showFlowGraph_ = value == L"1";
         else if (key == L"show_preview_panel") showPreviewPanel_ = value == L"1";
         else if (key == L"show_event_list") showEventList_ = value == L"1";
@@ -11724,6 +12270,9 @@ std::wstring NovelRuntime::ShowCharacterTagSelectionMenu(POINT point, const std:
 
 std::wstring NovelRuntime::GetVariableTypeLabel(VariableType type) const
 {
+    if (type == VariableType::Bool) return L"スイッチ";
+    if (type == VariableType::Integer) return L"数値";
+    if (type == VariableType::String) return L"文字";
     switch (type)
     {
     case VariableType::Bool: return L"フラグ";
@@ -11863,7 +12412,8 @@ std::wstring NovelRuntime::ShowVariableSelectionMenu(POINT point, const std::wst
         {
             flags |= MF_CHECKED;
         }
-        AppendMenuW(menu, flags, kBaseId + static_cast<UINT>(i), variableDefinitions_[i].name.c_str());
+        const std::wstring label = variableDefinitions_[i].name + L" [" + GetVariableTypeLabel(variableDefinitions_[i].type) + L"]";
+        AppendMenuW(menu, flags, kBaseId + static_cast<UINT>(i), label.c_str());
     }
 
     POINT screenPoint = point;
@@ -11919,6 +12469,12 @@ void NovelRuntime::ShowVariableManagerDialog()
 {
     SyncVariableDefinitions();
     variableManagerVisible_ = true;
+    RECT clientRect = lastClientRect_;
+    if (hostWindow_)
+    {
+        GetClientRect(hostWindow_, &clientRect);
+    }
+    UpdateVariableDialogLayoutRects(clientRect);
     if (selectedVariableDefinitionIndex_ >= variableDefinitions_.size())
     {
         selectedVariableDefinitionIndex_ = variableDefinitions_.empty() ? static_cast<size_t>(-1) : 0;
@@ -12628,6 +13184,7 @@ void NovelRuntime::ResetLayout()
     rightPanelWidth_ = 320;
     graphHeight_ = 162;
     eventListHeight_ = 208;
+    showInspector_ = true;
     activeDragHandle_ = DragHandle::None;
     statusText_ = L"\u30ec\u30a4\u30a2\u30a6\u30c8\u3092\u521d\u671f\u5316\u3057\u307e\u3057\u305f";
 }
@@ -12645,8 +13202,19 @@ bool NovelRuntime::HandleViewMenuCommand(UINT commandId)
         statusText_ = showInspector_ ? L"\u30a4\u30f3\u30b9\u30da\u30af\u30bf\u3092\u8868\u793a" : L"\u30a4\u30f3\u30b9\u30da\u30af\u30bf\u3092\u975e\u8868\u793a";
         return true;
     case IDM_VIEW_FLOWGRAPH:
-        showFlowGraph_ = !showFlowGraph_;
-        statusText_ = showFlowGraph_ ? L"\u30d5\u30ed\u30fc\u30b0\u30e9\u30d5\u3092\u8868\u793a" : L"\u30d5\u30ed\u30fc\u30b0\u30e9\u30d5\u3092\u975e\u8868\u793a";
+        if (flowGraphWindow_ && IsWindow(flowGraphWindow_))
+        {
+            DestroyWindow(flowGraphWindow_);
+            flowGraphWindow_ = nullptr;
+            showFlowGraph_ = false;
+            statusText_ = L"\u30d5\u30ed\u30fc\u30b0\u30e9\u30d5\u3092\u9589\u3058\u307e\u3057\u305f";
+        }
+        else
+        {
+            flowGraphScrollOffset_ = 0;
+            showFlowGraph_ = EnsureFlowGraphWindow();
+            statusText_ = showFlowGraph_ ? L"\u30d5\u30ed\u30fc\u30b0\u30e9\u30d5\u3092\u5225\u30a6\u30a3\u30f3\u30c9\u30a6\u3067\u8868\u793a" : L"\u30d5\u30ed\u30fc\u30b0\u30e9\u30d5\u30a6\u30a3\u30f3\u30c9\u30a6\u3092\u958b\u3051\u307e\u305b\u3093\u3067\u3057\u305f";
+        }
         return true;
     case IDM_VIEW_PREVIEW:
         showPreviewPanel_ = !showPreviewPanel_;
@@ -12673,7 +13241,7 @@ bool NovelRuntime::IsViewMenuChecked(UINT commandId) const
     {
     case IDM_VIEW_COMPONENTS: return showComponents_;
     case IDM_VIEW_INSPECTOR: return showInspector_;
-    case IDM_VIEW_FLOWGRAPH: return showFlowGraph_;
+    case IDM_VIEW_FLOWGRAPH: return flowGraphWindow_ && IsWindow(flowGraphWindow_);
     case IDM_VIEW_PREVIEW: return showPreviewPanel_;
     case IDM_VIEW_EVENTLIST: return showEventList_;
     default: return false;
@@ -12989,6 +13557,7 @@ bool NovelRuntime::HandleGraphNodeSelection(size_t commandIndex)
     if (IsLabelNode(commandIndex) && IsEditableSourceNode(selectedCommandIndex_))
     {
         RewireSelectedSourceToLabel(commandIndex);
+        RefreshFlowGraphWindow();
         return true;
     }
 
@@ -12998,6 +13567,7 @@ bool NovelRuntime::HandleGraphNodeSelection(size_t commandIndex)
     {
         selectedChoiceLinkIndex_ = 0;
     }
+    RefreshFlowGraphWindow();
     return true;
 }
 
@@ -14960,7 +15530,7 @@ void NovelRuntime::DrawStoryWritingPanel(HDC hdc, const RECT& clientRect)
                 if (i < storyWritingDeleteChecks_.size() && storyWritingDeleteChecks_[i])
                 {
                     SetTextColor(hdc, RGB(132, 204, 150));
-                    DrawWrappedText(hdc, checkRect, L"✓", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                    DrawWrappedText(hdc, checkRect, L"?", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                 }
                 textLeft = checkRect.right + 10;
             }
@@ -15674,7 +16244,7 @@ void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
 
     leftSplitterRect_ = showComponents_ ? RECT{ leftPanelRect.right, clientRect.top + 12, leftPanelRect.right + 6, clientRect.bottom - 12 } : RECT{};
     rightSplitterRect_ = showInspector_ ? RECT{ rightPanelRect.left - 6, clientRect.top + 12, rightPanelRect.left, clientRect.bottom - 12 } : RECT{};
-    graphSplitterRect_ = showFlowGraph_ ? RECT{ graphRect.left, graphRect.bottom + 6, graphRect.right, graphRect.bottom + 10 } : RECT{};
+    graphSplitterRect_ = {};
     eventSplitterRect_ = showEventList_ ? RECT{ eventRect.left, eventRect.bottom + 6, eventRect.right, eventRect.bottom + 10 } : RECT{};
 
     if (showComponents_ && HasVisibleArea(leftPanelRect))
@@ -15698,11 +16268,6 @@ void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
     if (HasVisibleArea(previewRect))
     {
         DrawToolbar(hdc, previewRect);
-        if (showFlowGraph_ && HasVisibleArea(graphRect))
-        {
-            DrawNodeGraph(hdc, graphRect);
-            DrawSplitter(hdc, graphSplitterRect_, activeDragHandle_ == DragHandle::GraphHeight);
-        }
         if (showEventList_ && HasVisibleArea(eventRect))
         {
             DrawEventList(hdc, eventRect);
@@ -16271,11 +16836,23 @@ void NovelRuntime::DrawCharacterManagerDialog(HDC hdc, const RECT& clientRect)
     }
 }
 
+void NovelRuntime::UpdateVariableDialogLayoutRects(const RECT& clientRect)
+{
+    variableDialogRect_ = { clientRect.left + 40, clientRect.top + 36, clientRect.right - 40, clientRect.top + 620 };
+    RECT listRect = { variableDialogRect_.left + 16, variableDialogRect_.top + 56, variableDialogRect_.left + 320, variableDialogRect_.bottom - 16 };
+    RECT headerRect = { variableDialogRect_.left, variableDialogRect_.top, variableDialogRect_.right, variableDialogRect_.top + 40 };
+    variableDialogCloseRect_ = { headerRect.right - 30, headerRect.top + 8, headerRect.right - 10, headerRect.top + 28 };
+    variableDialogEditRect_ = { listRect.left + 8, listRect.top + 8, listRect.right - 8, listRect.top + 34 };
+    variableDialogAddRect_ = { listRect.left + 8, listRect.top + 42, listRect.left + 142, listRect.top + 68 };
+    variableDialogAddSwitchRect_ = { listRect.left + 150, listRect.top + 42, listRect.right - 8, listRect.top + 68 };
+    variableDialogDeleteRect_ = { listRect.left + 8, listRect.bottom - 34, listRect.left + 120, listRect.bottom - 8 };
+}
+
 void NovelRuntime::DrawVariableManagerDialog(HDC hdc, const RECT& clientRect)
 {
     variableDefinitionRects_.clear();
     variableManagerActionTargets_.clear();
-    variableDialogRect_ = { clientRect.left + 40, clientRect.top + 36, clientRect.right - 40, clientRect.top + 620 };
+    UpdateVariableDialogLayoutRects(clientRect);
     HBRUSH overlayBrush = CreateSolidBrush(RGB(24, 28, 34));
     FillRect(hdc, &clientRect, overlayBrush);
     DeleteObject(overlayBrush);
@@ -16294,7 +16871,6 @@ void NovelRuntime::DrawVariableManagerDialog(HDC hdc, const RECT& clientRect)
     RECT titleRect = { headerRect.left + 10, headerRect.top, headerRect.right - 50, headerRect.bottom };
     SetTextColor(hdc, RGB(255, 255, 255));
     DrawWrappedText(hdc, titleRect, L"変数管理", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-    variableDialogCloseRect_ = { headerRect.right - 30, headerRect.top + 8, headerRect.right - 10, headerRect.top + 28 };
     DrawWrappedText(hdc, variableDialogCloseRect_, L"×", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 
     auto drawButton = [&](const RECT& rect, const std::wstring& label, COLORREF fill)
@@ -16316,13 +16892,11 @@ void NovelRuntime::DrawVariableManagerDialog(HDC hdc, const RECT& clientRect)
     FrameRect(hdc, &listRect, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
     FrameRect(hdc, &detailRect, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
 
-    variableDialogEditRect_ = { listRect.left + 8, listRect.top + 8, listRect.right - 96, listRect.top + 34 };
-    variableDialogAddRect_ = { listRect.right - 82, listRect.top + 8, listRect.right - 8, listRect.top + 34 };
-    variableDialogDeleteRect_ = { listRect.left + 8, listRect.bottom - 34, listRect.left + 120, listRect.bottom - 8 };
-    drawButton(variableDialogAddRect_, L"追加", RGB(70, 118, 178));
-    drawButton(variableDialogDeleteRect_, L"変数削除", RGB(120, 70, 78));
+    drawButton(variableDialogAddRect_, L"+ 数値変数", RGB(70, 118, 178));
+    drawButton(variableDialogAddSwitchRect_, L"+ スイッチ", RGB(72, 126, 86));
+    drawButton(variableDialogDeleteRect_, L"削除", RGB(120, 70, 78));
 
-    int rowY = listRect.top + 46;
+    int rowY = listRect.top + 80;
     for (size_t i = 0; i < variableDefinitions_.size(); ++i)
     {
         RECT rowRect = { listRect.left + 8, rowY, listRect.right - 8, rowY + 30 };
@@ -17331,170 +17905,1233 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
 
 void NovelRuntime::DrawNodeGraph(HDC hdc, const RECT& panelRect)
 {
+    flowGraphNodeRects_.clear();
+    flowGraphNodeIndices_.clear();
+
     HBRUSH backgroundBrush = CreateSolidBrush(RGB(16, 20, 28));
     FillRect(hdc, &panelRect, backgroundBrush);
     DeleteObject(backgroundBrush);
-    FrameRect(hdc, &panelRect, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
 
     SetBkMode(hdc, TRANSPARENT);
-    HFONT headerFont = CreateFontW(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
-    HFONT nodeFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT headerFont = CreateFontW(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT nodeFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT smallFont = CreateFontW(12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
     HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, headerFont));
 
-    RECT titleRect = { panelRect.left + 16, panelRect.top + 12, panelRect.right - 16, panelRect.top + 40 };
+    RECT titleRect = { panelRect.left + 18, panelRect.top + 12, panelRect.right - 18, panelRect.top + 40 };
     SetTextColor(hdc, RGB(245, 247, 250));
     DrawWrappedText(hdc, titleRect, L"\u30d5\u30ed\u30fc\u30b0\u30e9\u30d5", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
 
-    SelectObject(hdc, nodeFont);
-    const int topY = panelRect.top + 56;
-    const int labelY = panelRect.top + 150;
-    const int nodeWidth = 170;
-    const int nodeHeight = 52;
-    const int labelWidth = 150;
-    const int labelHeight = 44;
-    const int leftMargin = panelRect.left + 20;
-    const int horizontalGap = 24;
+    SelectObject(hdc, smallFont);
+    SetTextColor(hdc, RGB(164, 176, 190));
+    const std::wstring status =
+        L"イベント " + std::to_wstring(scenario_.commands.size()) +
+        L" / 現在 " + std::to_wstring((std::min)(currentCommandIndex_ + 1, scenario_.commands.size())) +
+        L" / 選択 " + std::to_wstring(scenario_.commands.empty() ? 0 : selectedCommandIndex_ + 1) +
+        L" / 拡大率 " + std::to_wstring(flowGraphZoomPercent_) + L"%";
+    RECT statusRect = { panelRect.left + 18, panelRect.top + 42, panelRect.right - 18, panelRect.top + 62 };
+    DrawWrappedText(hdc, statusRect, status, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    if (scenario_.commands.empty())
+    {
+        SelectObject(hdc, nodeFont);
+        SetTextColor(hdc, RGB(180, 188, 198));
+        RECT emptyRect = { panelRect.left + 24, panelRect.top + 86, panelRect.right - 24, panelRect.top + 140 };
+        DrawWrappedText(hdc, emptyRect, L"シナリオにイベントがありません。", DT_LEFT | DT_WORDBREAK);
+        SelectObject(hdc, oldFont);
+        DeleteObject(headerFont);
+        DeleteObject(nodeFont);
+        DeleteObject(smallFont);
+        flowGraphScrollMax_ = 0;
+        flowGraphScrollOffset_ = 0;
+        flowGraphVerticalMax_ = 0;
+        flowGraphOffsetY_ = 0;
+        return;
+    }
+
+    const int viewportTop = panelRect.top + 76;
+    const int scrollbarHeight = 22;
+    const int viewportBottom = panelRect.bottom - scrollbarHeight - 12;
+    const int viewportHeight = (std::max)(1, viewportBottom - viewportTop);
+    const int viewportWidth = (std::max)(1, static_cast<int>(panelRect.right - panelRect.left));
+    const double zoom = static_cast<double>(flowGraphZoomPercent_) / 100.0;
+    const int baseNodeWidth = 230;
+    const int baseNodeHeight = 74;
+    const int baseGapX = 84;
+    const int baseMargin = 32;
+    const int nodeWidth = (std::max)(120, static_cast<int>(baseNodeWidth * zoom));
+    const int nodeHeight = (std::max)(44, static_cast<int>(baseNodeHeight * zoom));
+    const int gapX = (std::max)(34, static_cast<int>(baseGapX * zoom));
+    const int margin = (std::max)(16, static_cast<int>(baseMargin * zoom));
+    const int contentWidth = margin * 2 + static_cast<int>(scenario_.commands.size()) * nodeWidth + static_cast<int>((scenario_.commands.size() - 1) * gapX);
+    flowGraphScrollMax_ = (std::max)(0, contentWidth - viewportWidth);
+    flowGraphScrollOffset_ = (std::max)(0, (std::min)(flowGraphScrollOffset_, flowGraphScrollMax_));
+
+    std::unordered_map<std::wstring, size_t> labelToIndex;
+    for (size_t i = 0; i < scenario_.commands.size(); ++i)
+    {
+        if (scenario_.commands[i].type == ScriptCommand::Type::Label)
+        {
+            const std::wstring label = GetCommandParameter(scenario_.commands[i], L"name");
+            if (!label.empty())
+            {
+                labelToIndex[label] = i;
+            }
+        }
+    }
+
+    std::vector<int> nodeLanes(scenario_.commands.size(), 0);
+    int maxLane = 0;
+    for (size_t choiceIndex = 0; choiceIndex < scenario_.commands.size(); ++choiceIndex)
+    {
+        const ScriptCommand& choice = scenario_.commands[choiceIndex];
+        if (choice.type != ScriptCommand::Type::Choice || choice.links.empty())
+        {
+            continue;
+        }
+
+        std::vector<std::pair<size_t, size_t>> branchStarts;
+        for (size_t linkIndex = 0; linkIndex < choice.links.size(); ++linkIndex)
+        {
+            const auto labelIt = labelToIndex.find(choice.links[linkIndex].second);
+            if (labelIt != labelToIndex.end() && labelIt->second > choiceIndex)
+            {
+                branchStarts.push_back({ labelIt->second, linkIndex });
+            }
+        }
+        std::sort(branchStarts.begin(), branchStarts.end(), [](const auto& lhs, const auto& rhs)
+        {
+            return lhs.first < rhs.first;
+        });
+
+        for (size_t branchOrder = 0; branchOrder < branchStarts.size(); ++branchOrder)
+        {
+            const size_t start = branchStarts[branchOrder].first;
+            size_t end = branchOrder + 1 < branchStarts.size()
+                ? branchStarts[branchOrder + 1].first
+                : scenario_.commands.size();
+            for (size_t scan = start + 1; scan < end && scan < scenario_.commands.size(); ++scan)
+            {
+                // ジャンプで枝が閉じる場所までを同じレーンにして、枝同士の重なりを防ぎます。
+                if (scenario_.commands[scan].type == ScriptCommand::Type::Jump)
+                {
+                    end = scan + 1;
+                    break;
+                }
+                if (scenario_.commands[scan].type == ScriptCommand::Type::Label)
+                {
+                    end = scan;
+                    break;
+                }
+            }
+
+            const int lane = static_cast<int>(branchStarts[branchOrder].second);
+            maxLane = (std::max)(maxLane, lane);
+            for (size_t nodeIndex = start; nodeIndex < end && nodeIndex < nodeLanes.size(); ++nodeIndex)
+            {
+                nodeLanes[nodeIndex] = (std::max)(nodeLanes[nodeIndex], lane);
+            }
+        }
+    }
+
+    const int rowGapY = (std::max)(72, nodeHeight + static_cast<int>(42 * zoom));
+    const int contentHeight = 48 + (maxLane + 1) * nodeHeight + maxLane * (rowGapY - nodeHeight) + 40;
+    flowGraphVerticalMax_ = (std::max)(0, contentHeight - viewportHeight);
+    flowGraphOffsetY_ = (std::max)(0, (std::min)(flowGraphOffsetY_, flowGraphVerticalMax_));
 
     std::unordered_map<size_t, RECT> nodeRects;
-    std::unordered_map<std::wstring, RECT> labelRects;
-    std::vector<size_t> sourceIndices;
-    std::vector<size_t> labelIndices;
+    auto getNodeRect = [&](size_t index) -> RECT
+    {
+        const int x = panelRect.left + margin + static_cast<int>(index) * (nodeWidth + gapX) - flowGraphScrollOffset_;
+        const int y = viewportTop + 24 + nodeLanes[index] * rowGapY - flowGraphOffsetY_;
+        RECT rect = {
+            x,
+            y,
+            x + nodeWidth,
+            y + nodeHeight
+        };
+        return rect;
+    };
+
+    for (size_t i = 0; i < scenario_.commands.size(); ++i)
+    {
+        nodeRects[i] = getNodeRect(i);
+    }
+
+    const int savedDc = SaveDC(hdc);
+    IntersectClipRect(hdc, panelRect.left, viewportTop, panelRect.right, viewportBottom);
+
+    auto rightCenter = [](const RECT& rect) -> POINT { return POINT{ rect.right, (rect.top + rect.bottom) / 2 }; };
+    auto leftCenter = [](const RECT& rect) -> POINT { return POINT{ rect.left, (rect.top + rect.bottom) / 2 }; };
+    auto drawArrow = [&](POINT from, POINT to, COLORREF color, int width, const std::wstring& label, int lane)
+    {
+        HPEN pen = CreatePen(PS_SOLID, width, color);
+        HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, pen));
+        const int arrow = 7;
+        if (to.x >= from.x && from.y == to.y)
+        {
+            MoveToEx(hdc, from.x, from.y, nullptr);
+            LineTo(hdc, to.x, to.y);
+        }
+        else if (to.x >= from.x)
+        {
+            const int midX = static_cast<int>(from.x) + (std::max)(24, static_cast<int>((to.x - from.x) / 2));
+            MoveToEx(hdc, from.x, from.y, nullptr);
+            LineTo(hdc, midX, from.y);
+            LineTo(hdc, midX, to.y);
+            LineTo(hdc, to.x, to.y);
+        }
+        else
+        {
+            const int routeY = from.y + (lane % 2 == 0 ? nodeHeight + 28 + lane * 10 : -28 - lane * 10);
+            MoveToEx(hdc, from.x, from.y, nullptr);
+            LineTo(hdc, from.x + 18, routeY);
+            LineTo(hdc, to.x - 18, routeY);
+            LineTo(hdc, to.x, to.y);
+        }
+        MoveToEx(hdc, to.x, to.y, nullptr);
+        LineTo(hdc, to.x - arrow, to.y - arrow);
+        MoveToEx(hdc, to.x, to.y, nullptr);
+        LineTo(hdc, to.x - arrow, to.y + arrow);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+        if (!label.empty())
+        {
+            SelectObject(hdc, smallFont);
+            SetTextColor(hdc, color);
+            const int labelX = (from.x + to.x) / 2;
+            const int labelY = to.x >= from.x
+                ? (std::min)(from.y, to.y) - 22 - (lane % 3) * 14
+                : from.y + nodeHeight + 16 + lane * 10;
+            RECT labelRect = { labelX - 78, labelY - 10, labelX + 78, labelY + 12 };
+            DrawWrappedText(hdc, labelRect, label, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        }
+    };
+
+    auto targetIndexForLabel = [&](const std::wstring& target, size_t& index) -> bool
+    {
+        const auto found = labelToIndex.find(target);
+        if (found == labelToIndex.end())
+        {
+            return false;
+        }
+        index = found->second;
+        return true;
+    };
 
     for (size_t i = 0; i < scenario_.commands.size(); ++i)
     {
         const ScriptCommand& command = scenario_.commands[i];
-        if (command.type == ScriptCommand::Type::Choice || command.type == ScriptCommand::Type::Jump || command.type == ScriptCommand::Type::IfJump)
+        const RECT fromRect = nodeRects[i];
+        if (fromRect.right < panelRect.left - 320 || fromRect.left > panelRect.right + 320)
         {
-            sourceIndices.push_back(i);
+            continue;
         }
-        if (command.type == ScriptCommand::Type::Label)
+
+        if (i + 1 < scenario_.commands.size() && command.type != ScriptCommand::Type::Jump && command.type != ScriptCommand::Type::Choice)
         {
-            labelIndices.push_back(i);
+            drawArrow(rightCenter(fromRect), leftCenter(nodeRects[i + 1]), command.type == ScriptCommand::Type::IfJump ? RGB(118, 128, 142) : RGB(72, 84, 98), 1, command.type == ScriptCommand::Type::IfJump ? L"不成立" : L"次", 0);
         }
-    }
 
-    for (size_t i = 0; i < sourceIndices.size(); ++i)
-    {
-        RECT rect = {
-            leftMargin + static_cast<int>(i) * (nodeWidth + horizontalGap),
-            topY,
-            leftMargin + static_cast<int>(i) * (nodeWidth + horizontalGap) + nodeWidth,
-            topY + nodeHeight
-        };
-        nodeRects[sourceIndices[i]] = rect;
-        graphNodeRects_.push_back(rect);
-        graphNodeIndices_.push_back(sourceIndices[i]);
-    }
-
-    for (size_t i = 0; i < labelIndices.size(); ++i)
-    {
-        RECT rect = {
-            leftMargin + static_cast<int>(i) * (labelWidth + horizontalGap),
-            labelY,
-            leftMargin + static_cast<int>(i) * (labelWidth + horizontalGap) + labelWidth,
-            labelY + labelHeight
-        };
-        const std::wstring name = GetCommandParameter(scenario_.commands[labelIndices[i]], L"name");
-        labelRects[name] = rect;
-        graphNodeRects_.push_back(rect);
-        graphNodeIndices_.push_back(labelIndices[i]);
-    }
-
-    HPEN linePen = CreatePen(PS_SOLID, 2, RGB(120, 190, 255));
-    HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, linePen));
-    for (size_t sourceIndex : sourceIndices)
-    {
-        const ScriptCommand& command = scenario_.commands[sourceIndex];
-        RECT fromRect = nodeRects[sourceIndex];
-        POINT from = { (fromRect.left + fromRect.right) / 2, fromRect.bottom };
-
+        if (command.type == ScriptCommand::Type::Jump || command.type == ScriptCommand::Type::IfJump)
+        {
+            size_t targetIndex = 0;
+            if (targetIndexForLabel(GetCommandParameter(command, L"target"), targetIndex))
+            {
+                drawArrow(rightCenter(fromRect), leftCenter(nodeRects[targetIndex]), command.type == ScriptCommand::Type::IfJump ? RGB(255, 176, 92) : RGB(188, 148, 255), 2, command.type == ScriptCommand::Type::IfJump ? L"成立" : L"ジャンプ", static_cast<int>((targetIndex > i ? targetIndex - i : i - targetIndex) % 5));
+            }
+        }
         if (command.type == ScriptCommand::Type::Choice)
         {
             for (size_t linkIndex = 0; linkIndex < command.links.size(); ++linkIndex)
             {
-                const auto& link = command.links[linkIndex];
-                const auto found = labelRects.find(link.second);
-                if (found == labelRects.end())
+                size_t targetIndex = 0;
+                if (targetIndexForLabel(command.links[linkIndex].second, targetIndex))
                 {
-                    continue;
+                    const bool selectedLink = i == selectedCommandIndex_ && linkIndex == selectedChoiceLinkIndex_;
+                    drawArrow(rightCenter(fromRect), leftCenter(nodeRects[targetIndex]), selectedLink ? RGB(255, 215, 120) : RGB(100, 190, 255), selectedLink ? 3 : 2, command.links[linkIndex].first, static_cast<int>(linkIndex + 1));
                 }
-
-                RECT toRect = found->second;
-                HPEN choicePen = CreatePen(
-                    PS_SOLID,
-                    sourceIndex == selectedCommandIndex_ && linkIndex == selectedChoiceLinkIndex_ ? 3 : 2,
-                    sourceIndex == selectedCommandIndex_ && linkIndex == selectedChoiceLinkIndex_ ? RGB(255, 215, 120) : RGB(120, 190, 255));
-                HPEN previousPen = static_cast<HPEN>(SelectObject(hdc, choicePen));
-                MoveToEx(hdc, from.x, from.y, nullptr);
-                LineTo(hdc, (toRect.left + toRect.right) / 2, toRect.top);
-                SelectObject(hdc, previousPen);
-                DeleteObject(choicePen);
-            }
-        }
-        else
-        {
-            const std::wstring target = GetCommandParameter(command, L"target");
-            const auto found = labelRects.find(target);
-            if (found != labelRects.end())
-            {
-                RECT toRect = found->second;
-                MoveToEx(hdc, from.x, from.y, nullptr);
-                LineTo(hdc, (toRect.left + toRect.right) / 2, toRect.top);
             }
         }
     }
-    SelectObject(hdc, oldPen);
-    DeleteObject(linePen);
 
-    for (size_t sourceIndex : sourceIndices)
+    for (size_t i = 0; i < scenario_.commands.size(); ++i)
     {
-        const ScriptCommand& command = scenario_.commands[sourceIndex];
-        RECT rect = nodeRects[sourceIndex];
-        COLORREF fill = sourceIndex == selectedCommandIndex_ ? RGB(84, 105, 70) : RGB(38, 48, 64);
+        const ScriptCommand& command = scenario_.commands[i];
+        RECT rect = nodeRects[i];
+        if (rect.right < panelRect.left || rect.left > panelRect.right || rect.bottom < viewportTop || rect.top > viewportBottom)
+        {
+            continue;
+        }
+
+        const bool selected = i == selectedCommandIndex_;
+        const bool current = i == currentCommandIndex_ && currentCommandIndex_ < scenario_.commands.size();
+        COLORREF fill = RGB(34, 44, 58);
+        if (command.type == ScriptCommand::Type::Label) fill = RGB(58, 54, 44);
+        else if (command.type == ScriptCommand::Type::Choice) fill = RGB(38, 54, 78);
+        else if (command.type == ScriptCommand::Type::Jump) fill = RGB(48, 42, 72);
+        else if (command.type == ScriptCommand::Type::IfJump) fill = RGB(62, 46, 38);
+        if (selected) fill = RGB(78, 96, 54);
+        if (current) fill = RGB(44, 92, 72);
+
         HBRUSH brush = CreateSolidBrush(fill);
         FillRect(hdc, &rect, brush);
         DeleteObject(brush);
-        FrameRect(hdc, &rect, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+        HBRUSH frameBrush = CreateSolidBrush(current ? RGB(108, 255, 178) : (selected ? RGB(255, 215, 120) : RGB(112, 126, 142)));
+        FrameRect(hdc, &rect, frameBrush);
+        DeleteObject(frameBrush);
 
-        RECT typeRect = { rect.left + 8, rect.top + 6, rect.right - 8, rect.top + 24 };
-        SetTextColor(hdc, RGB(255, 225, 160));
-        DrawWrappedText(hdc, typeRect, GetCommandTypeLabel(command), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        SelectObject(hdc, nodeFont);
+        RECT typeRect = { rect.left + 9, rect.top + 6, rect.right - 9, rect.top + 27 };
+        SetTextColor(hdc, RGB(255, 226, 158));
+        DrawWrappedText(hdc, typeRect, L"#" + std::to_wstring(i + 1) + L" " + GetCommandTypeLabel(command), DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 
-        RECT textRect = { rect.left + 8, rect.top + 24, rect.right - 8, rect.bottom - 6 };
+        RECT textRect = { rect.left + 9, rect.top + 29, rect.right - 9, rect.bottom - 8 };
         SetTextColor(hdc, RGB(232, 238, 244));
-        DrawWrappedText(hdc, textRect, GetCommandSummary(command), DT_LEFT | DT_END_ELLIPSIS | DT_WORDBREAK);
-
-        if (command.type == ScriptCommand::Type::Choice && sourceIndex == selectedCommandIndex_)
+        std::wstring summary = GetCommandSummary(command);
+        if (command.type == ScriptCommand::Type::Choice && !command.links.empty())
         {
-            RECT badgeRect = { rect.right - 28, rect.top + 6, rect.right - 8, rect.top + 22 };
-            HBRUSH badgeBrush = CreateSolidBrush(RGB(255, 215, 120));
+            summary = L"分岐数: " + std::to_wstring(command.links.size());
+        }
+        if (command.type == ScriptCommand::Type::Label)
+        {
+            summary = L"*" + GetCommandParameter(command, L"name");
+        }
+        DrawWrappedText(hdc, textRect, summary.empty() ? L"(未設定)" : summary, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+
+        if (current || selected)
+        {
+            RECT badgeRect = { rect.right - 52, rect.top + 7, rect.right - 8, rect.top + 25 };
+            HBRUSH badgeBrush = CreateSolidBrush(current ? RGB(108, 255, 178) : RGB(255, 215, 120));
             FillRect(hdc, &badgeRect, badgeBrush);
             DeleteObject(badgeBrush);
-            SetTextColor(hdc, RGB(20, 24, 28));
-            DrawTextW(hdc, std::to_wstring(selectedChoiceLinkIndex_ + 1).c_str(), -1, &badgeRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            SetTextColor(hdc, RGB(16, 20, 26));
+            DrawTextW(hdc, current ? L"現在" : L"選択", -1, &badgeRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
+
+        flowGraphNodeRects_.push_back(rect);
+        flowGraphNodeIndices_.push_back(i);
     }
+    RestoreDC(hdc, savedDc);
 
-    for (size_t labelIndex : labelIndices)
     {
-        const ScriptCommand& command = scenario_.commands[labelIndex];
-        const std::wstring name = GetCommandParameter(command, L"name");
-        RECT rect = labelRects[name];
-        COLORREF fill = labelIndex == selectedCommandIndex_ ? RGB(96, 92, 52) : RGB(58, 54, 44);
-        HBRUSH brush = CreateSolidBrush(fill);
-        FillRect(hdc, &rect, brush);
-        DeleteObject(brush);
-        FrameRect(hdc, &rect, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
-
-        RECT textRect = { rect.left + 8, rect.top + 8, rect.right - 8, rect.bottom - 8 };
-        SetTextColor(hdc, RGB(245, 238, 216));
-        DrawWrappedText(hdc, textRect, L"*" + name, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        RECT track = { panelRect.left + 18, panelRect.bottom - scrollbarHeight, panelRect.right - 18, panelRect.bottom - 8 };
+        HBRUSH trackBrush = CreateSolidBrush(RGB(30, 38, 48));
+        FillRect(hdc, &track, trackBrush);
+        DeleteObject(trackBrush);
+        HBRUSH frameBrush = CreateSolidBrush(RGB(68, 78, 90));
+        FrameRect(hdc, &track, frameBrush);
+        DeleteObject(frameBrush);
+        const int trackWidth = (std::max)(1, static_cast<int>(track.right - track.left));
+        const int thumbWidth = flowGraphScrollMax_ > 0
+            ? (std::max)(42, (viewportWidth * trackWidth) / (contentWidth + viewportWidth))
+            : trackWidth;
+        const int thumbLeft = flowGraphScrollMax_ > 0
+            ? track.left + ((trackWidth - thumbWidth) * flowGraphScrollOffset_) / flowGraphScrollMax_
+            : track.left;
+        RECT thumb = { thumbLeft, track.top + 2, thumbLeft + thumbWidth, track.bottom - 2 };
+        HBRUSH thumbBrush = CreateSolidBrush(RGB(112, 126, 142));
+        FillRect(hdc, &thumb, thumbBrush);
+        DeleteObject(thumbBrush);
     }
 
     SelectObject(hdc, oldFont);
     DeleteObject(headerFont);
     DeleteObject(nodeFont);
+    DeleteObject(smallFont);
 }
+
+void NovelRuntime::DrawFlowGraphWindow(HDC hdc, const RECT& clientRect)
+{
+    DrawNodeGraph(hdc, clientRect);
+}
+
+bool NovelRuntime::HandleFlowGraphWindowClick(POINT point)
+{
+    for (size_t i = 0; i < flowGraphNodeRects_.size() && i < flowGraphNodeIndices_.size(); ++i)
+    {
+        if (PtInRect(&flowGraphNodeRects_[i], point))
+        {
+            return HandleGraphNodeSelection(flowGraphNodeIndices_[i]);
+        }
+    }
+    return false;
+}
+
+bool NovelRuntime::HandleFlowGraphMouseWheel(short delta)
+{
+    const int previousZoom = flowGraphZoomPercent_;
+    flowGraphZoomPercent_ = (std::max)(50, (std::min)(flowGraphZoomPercent_ + (delta > 0 ? 10 : -10), 220));
+    if (previousZoom == flowGraphZoomPercent_)
+    {
+        return false;
+    }
+    flowGraphScrollOffset_ = (flowGraphScrollOffset_ * flowGraphZoomPercent_) / (std::max)(1, previousZoom);
+    flowGraphScrollOffset_ = (std::max)(0, (std::min)(flowGraphScrollOffset_, flowGraphScrollMax_));
+    return true;
+}
+
+#if 0
+void NovelRuntime::DrawDebugInspectorImGui()
+{
+    if (scenario_.commands.empty() || selectedCommandIndex_ >= scenario_.commands.size())
+    {
+        ImGui::TextUnformatted("イベントが選択されていません。");
+        return;
+    }
+
+    static size_t activeCommandIndex = static_cast<size_t>(-1);
+    static std::string activeFieldId;
+    static bool activeUndoPushed = false;
+
+    auto beginTrackedEdit = [&](const std::string& fieldId)
+    {
+        if (activeCommandIndex != selectedCommandIndex_ || activeFieldId != fieldId)
+        {
+            activeCommandIndex = selectedCommandIndex_;
+            activeFieldId = fieldId;
+            activeUndoPushed = false;
+        }
+        if (!activeUndoPushed)
+        {
+            PushUndoSnapshot();
+            activeUndoPushed = true;
+        }
+    };
+    auto finishTrackedEdit = [&]()
+    {
+        activeCommandIndex = static_cast<size_t>(-1);
+        activeFieldId.clear();
+        activeUndoPushed = false;
+    };
+    auto refreshAfterEdit = [&]()
+    {
+        SyncDocumentMetadata();
+        RefreshPreviewIfActive();
+        RefreshFlowGraphWindow();
+        if (hostWindow_)
+        {
+            InvalidateRect(hostWindow_, nullptr, TRUE);
+        }
+    };
+
+    ScriptCommand& command = scenario_.commands[selectedCommandIndex_];
+    auto setParameter = [&](const std::wstring& key, const std::wstring& value)
+    {
+        PushUndoSnapshot();
+        command.parameters[key] = value;
+        refreshAfterEdit();
+    };
+    auto drawBoolParam = [&](const char* label, const std::wstring& key, bool fallback)
+    {
+        bool value = ParseBoolValue(GetCommandParameter(command, key), fallback);
+        if (ImGui::Checkbox(label, &value))
+        {
+            setParameter(key, value ? L"true" : L"false");
+        }
+    };
+    auto drawIntParam = [&](const char* label, const std::wstring& key, int fallback, int minValue, int maxValue)
+    {
+        int value = ParseIntValue(GetCommandParameter(command, key), fallback);
+        if (ImGui::InputInt(label, &value))
+        {
+            value = (std::max)(minValue, (std::min)(maxValue, value));
+            setParameter(key, std::to_wstring(value));
+        }
+    };
+    auto drawTextParam = [&](const char* label, const std::wstring& key)
+    {
+        std::string value = WideToUtf8ForImGui(GetCommandParameter(command, key));
+        if (ImGui::InputText(label, &value))
+        {
+            beginTrackedEdit(std::string("quick:") + label);
+            command.parameters[key] = Utf8ToWide(value);
+            refreshAfterEdit();
+        }
+        if (ImGui::IsItemDeactivated())
+        {
+            finishTrackedEdit();
+        }
+    };
+    auto drawVariableCombo = [&](const char* label, const std::wstring& key)
+    {
+        SyncVariableDefinitions();
+        std::wstring current = GetCommandParameter(command, key);
+        const std::string preview = current.empty() ? "(未設定)" : WideToUtf8ForImGui(current);
+        if (ImGui::BeginCombo(label, preview.c_str()))
+        {
+            if (ImGui::Selectable("(未設定)", current.empty()))
+            {
+                setParameter(key, L"");
+            }
+            for (const VariableDefinition& definition : variableDefinitions_)
+            {
+                const bool selected = definition.name == current;
+                if (ImGui::Selectable(WideToUtf8ForImGui(definition.name).c_str(), selected))
+                {
+                    setParameter(key, definition.name);
+                }
+                if (selected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+    };
+    auto drawLabelCombo = [&](const char* label, const std::wstring& key)
+    {
+        std::wstring current = GetCommandParameter(command, key);
+        const std::string preview = current.empty() ? "(未設定)" : WideToUtf8ForImGui(current);
+        if (ImGui::BeginCombo(label, preview.c_str()))
+        {
+            if (ImGui::Selectable("(未設定)", current.empty()))
+            {
+                setParameter(key, L"");
+            }
+            std::vector<std::wstring> labels;
+            labels.reserve(scenario_.labels.size());
+            for (const auto& item : scenario_.labels)
+            {
+                labels.push_back(item.first);
+            }
+            std::sort(labels.begin(), labels.end());
+            for (const std::wstring& labelName : labels)
+            {
+                const bool selected = labelName == current;
+                if (ImGui::Selectable(WideToUtf8ForImGui(labelName).c_str(), selected))
+                {
+                    setParameter(key, labelName);
+                }
+                if (selected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+    };
+    auto drawTargetCombo = [&](const char* label, const std::wstring& key)
+    {
+        std::wstring current = GetCommandParameter(command, key);
+        if (current.empty())
+        {
+            current = L"stage";
+        }
+        const std::wstring targets[] = { L"stage", L"message", L"left", L"center", L"right" };
+        if (ImGui::BeginCombo(label, WideToUtf8ForImGui(GetEffectTargetLabel(current)).c_str()))
+        {
+            for (const std::wstring& target : targets)
+            {
+                const bool selected = target == current;
+                if (ImGui::Selectable(WideToUtf8ForImGui(GetEffectTargetLabel(target)).c_str(), selected))
+                {
+                    setParameter(key, target);
+                }
+                if (selected)
+                {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            for (const CharacterDefinition& definition : characterDefinitions_)
+            {
+                const bool selected = definition.id == current;
+                if (ImGui::Selectable(WideToUtf8ForImGui(GetCharacterDefinitionLabel(definition)).c_str(), selected))
+                {
+                    setParameter(key, definition.id);
+                }
+            }
+            ImGui::EndCombo();
+        }
+    };
+    auto drawCharacterCombo = [&](const char* label, const std::wstring& key)
+    {
+        std::wstring current = GetCommandParameter(command, key);
+        const std::string preview = current.empty() ? "(未設定)" : WideToUtf8ForImGui(current);
+        if (ImGui::BeginCombo(label, preview.c_str()))
+        {
+            if (ImGui::Selectable("(未設定)", current.empty()))
+            {
+                setParameter(key, L"");
+            }
+            for (const CharacterDefinition& definition : characterDefinitions_)
+            {
+                const bool selected = definition.id == current;
+                if (ImGui::Selectable(WideToUtf8ForImGui(GetCharacterDefinitionLabel(definition)).c_str(), selected))
+                {
+                    setParameter(key, definition.id);
+                }
+            }
+            ImGui::EndCombo();
+        }
+    };
+    auto drawFontCombo = [&]()
+    {
+        RefreshAvailableFonts();
+        std::wstring current = GetCommandParameter(command, L"face");
+        const std::string preview = current.empty() ? "(未設定)" : WideToUtf8ForImGui(current);
+        if (ImGui::BeginCombo("フォント", preview.c_str()))
+        {
+            for (const FontAssetItem& font : availableFonts_)
+            {
+                const bool selected = font.family == current;
+                if (ImGui::Selectable(WideToUtf8ForImGui(font.family).c_str(), selected))
+                {
+                    setParameter(L"face", font.family);
+                    ApplyMessageFontCommand(command);
+                }
+            }
+            ImGui::EndCombo();
+        }
+    };
+    auto drawBrowseButtons = [&](const char* label, const std::wstring& key, bool audio)
+    {
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine();
+        if (ImGui::Button((std::string("参照##") + WideToUtf8ForImGui(key)).c_str()))
+        {
+            BrowseCommandAsset(selectedCommandIndex_, key, audio);
+            refreshAfterEdit();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button((std::string("解除##") + WideToUtf8ForImGui(key)).c_str()))
+        {
+            setParameter(key, L"");
+        }
+    };
+
+    ImGui::Text("選択: #%zu", selectedCommandIndex_ + 1);
+    ImGui::SameLine();
+    ImGui::TextUnformatted(WideToUtf8ForImGui(GetCommandTypeLabel(command)).c_str());
+    const std::wstring summary = GetCommandSummary(command);
+    if (!summary.empty())
+    {
+        ImGui::TextWrapped("%s", WideToUtf8ForImGui(summary).c_str());
+    }
+
+    const std::wstring issue = GetFirstIssueForCommand(selectedCommandIndex_);
+    if (!issue.empty())
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 190, 95, 255));
+        ImGui::TextWrapped("警告: %s", WideToUtf8ForImGui(issue).c_str());
+        ImGui::PopStyleColor();
+    }
+
+    if (ImGui::Button("ここからプレビュー"))
+    {
+        StartPreviewFromIndex(selectedCommandIndex_);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("選択イベントを複製"))
+    {
+        DuplicateSelectedCommand();
+        refreshAfterEdit();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("削除"))
+    {
+        DeleteSelectedCommand();
+        refreshAfterEdit();
+        return;
+    }
+
+    if (ImGui::Button("変数管理を開く"))
+    {
+        ImGui::SetScrollHereY(0.0f);
+        statusText_ = L"上部の Variables タブで変数管理を開けます";
+    }
+
+    ImGui::SeparatorText("旧インスペクタ互換");
+    if (command.type == ScriptCommand::Type::Text)
+    {
+        drawBoolParam("名前表示", L"name_visible", false);
+        drawCharacterCombo("名前タグ", L"name_target");
+        drawIntParam("名前X", L"name_x", 0, -4000, 4000);
+        drawIntParam("名前Y", L"name_y", 0, -4000, 4000);
+        drawBrowseButtons("名前画像", L"name_image", false);
+    }
+    else if (command.type == ScriptCommand::Type::Background || command.type == ScriptCommand::Type::Character)
+    {
+        drawTextParam("表示名", L"name");
+        drawBrowseButtons("画像", L"storage", false);
+        drawBoolParam("表示", L"visible", true);
+        drawIntParam("X", L"x", 0, -4000, 4000);
+        drawIntParam("Y", L"y", 0, -4000, 4000);
+        drawIntParam("拡大率", L"scale", 100, 1, 1000);
+        drawIntParam("不透明度", L"opacity", 255, 0, 255);
+        if (command.type == ScriptCommand::Type::Character)
+        {
+            drawTextParam("位置", L"pos");
+            drawBoolParam("フェード", L"fade", true);
+            drawIntParam("フェード時間", L"fade_time", 500, 0, 60000);
+            drawBoolParam("完了待ち", L"fade_wait", true);
+        }
+    }
+    else if (command.type == ScriptCommand::Type::HideCharacter)
+    {
+        drawTextParam("対象位置", L"pos");
+        drawBoolParam("フェード", L"fade", true);
+        drawIntParam("フェード時間", L"fade_time", 500, 0, 60000);
+        drawBoolParam("完了待ち", L"fade_wait", true);
+    }
+    else if (command.type == ScriptCommand::Type::Bgm || command.type == ScriptCommand::Type::Se || command.type == ScriptCommand::Type::Voice)
+    {
+        drawBrowseButtons("音声", L"storage", true);
+        drawIntParam("音量", L"volume", 100, 0, 100);
+        drawBoolParam("ループ", L"loop", command.type == ScriptCommand::Type::Bgm);
+        drawIntParam("フェードイン", L"fadein", 0, 0, 60000);
+        drawIntParam("フェードアウト", L"fadeout", 0, 0, 60000);
+    }
+    else if (command.type == ScriptCommand::Type::Wait)
+    {
+        drawIntParam("時間(ms)", L"time", 1000, 0, 600000);
+    }
+    else if (command.type == ScriptCommand::Type::Fade || command.type == ScriptCommand::Type::Transition ||
+        command.type == ScriptCommand::Type::Shake || command.type == ScriptCommand::Type::Zoom ||
+        command.type == ScriptCommand::Type::Pan || command.type == ScriptCommand::Type::Flash ||
+        command.type == ScriptCommand::Type::Tint)
+    {
+        if (command.type != ScriptCommand::Type::Tint)
+        {
+            drawIntParam("時間(ms)", L"time", 500, 0, 600000);
+        }
+        if (command.type == ScriptCommand::Type::Fade || command.type == ScriptCommand::Type::Transition)
+        {
+            drawTargetCombo("対象", L"target");
+            drawTextParam("色", L"color");
+            drawIntParam("不透明度", L"opacity", 255, 0, 255);
+        }
+        if (command.type == ScriptCommand::Type::Shake)
+        {
+            drawIntParam("強さ", L"power", 6, 0, 200);
+        }
+        if (command.type == ScriptCommand::Type::Zoom)
+        {
+            drawIntParam("拡大率", L"scale", 100, 1, 1000);
+        }
+        if (command.type == ScriptCommand::Type::Pan)
+        {
+            drawIntParam("X", L"x", 0, -4000, 4000);
+            drawIntParam("Y", L"y", 0, -4000, 4000);
+        }
+        drawBoolParam("並列", L"parallel", false);
+    }
+    else if (command.type == ScriptCommand::Type::MessageWindow || command.type == ScriptCommand::Type::NameWindow)
+    {
+        drawBoolParam("表示", L"visible", true);
+        drawIntParam("X", L"x", 0, -4000, 4000);
+        drawIntParam("Y", L"y", 0, -4000, 4000);
+        drawIntParam("幅", L"width", 220, 1, 4000);
+        drawIntParam("高さ", L"height", 36, 1, 4000);
+        drawTextParam("背景色", L"color");
+        drawTextParam("枠線色", L"border");
+        drawIntParam("透明度", L"opacity", 84, 0, 255);
+        drawBrowseButtons("画像", L"image", false);
+    }
+    else if (command.type == ScriptCommand::Type::MessageFont)
+    {
+        drawFontCombo();
+    }
+    else if (command.type == ScriptCommand::Type::Choice)
+    {
+        drawTextParam("選択肢文", L"prompt");
+        drawIntParam("X", L"x", 0, -4000, 4000);
+        drawIntParam("Y", L"y", 0, -4000, 4000);
+        drawBrowseButtons("ボタン画像", L"button_image", false);
+    }
+    else if (command.type == ScriptCommand::Type::IfJump)
+    {
+        drawVariableCombo("変数", L"name");
+        drawTextParam("条件値", L"value");
+        drawTextParam("演算子", L"op");
+        drawLabelCombo("成立時ジャンプ先", L"target");
+    }
+    else if (command.type == ScriptCommand::Type::SetValue || command.type == ScriptCommand::Type::AddValue)
+    {
+        drawVariableCombo("変数", L"name");
+        drawTextParam(command.type == ScriptCommand::Type::SetValue ? "代入値" : "加算値", L"value");
+    }
+    else if (command.type == ScriptCommand::Type::Jump)
+    {
+        drawLabelCombo("ジャンプ先", L"target");
+    }
+
+    ImGui::SeparatorText("パラメータ");
+    std::vector<std::wstring> keys;
+    keys.reserve(command.parameters.size());
+    for (const auto& item : command.parameters)
+    {
+        keys.push_back(item.first);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    if (keys.empty())
+    {
+        ImGui::TextDisabled("このイベントにはパラメータがありません。");
+    }
+    for (const std::wstring& key : keys)
+    {
+        std::string label = WideToUtf8ForImGui(key);
+        std::string value = WideToUtf8ForImGui(GetCommandParameter(command, key));
+        ImGui::PushID(label.c_str());
+        const bool multiline =
+            key == L"value" ||
+            key == L"prompt" ||
+            key == L"image" ||
+            key == L"storage" ||
+            value.size() > 72;
+        bool changed = false;
+        if (multiline)
+        {
+            changed = ImGui::InputTextMultiline(label.c_str(), &value, ImVec2(-1.0f, 72.0f));
+        }
+        else
+        {
+            changed = ImGui::InputText(label.c_str(), &value);
+        }
+        if (ImGui::IsItemActivated())
+        {
+            beginTrackedEdit("param:" + label);
+        }
+        if (changed)
+        {
+            command.parameters[key] = Utf8ToWide(value);
+            refreshAfterEdit();
+        }
+        if (ImGui::IsItemDeactivated())
+        {
+            finishTrackedEdit();
+        }
+        ImGui::PopID();
+    }
+
+    if (command.type == ScriptCommand::Type::Choice)
+    {
+        ImGui::SeparatorText("選択肢");
+        for (size_t linkIndex = 0; linkIndex < command.links.size(); ++linkIndex)
+        {
+            ImGui::PushID(static_cast<int>(linkIndex));
+            ImGui::Text("枝 %zu", linkIndex + 1);
+            std::string text = WideToUtf8ForImGui(command.links[linkIndex].first);
+            if (ImGui::InputText("表示文", &text))
+            {
+                beginTrackedEdit("choice_text:" + std::to_string(linkIndex));
+                command.links[linkIndex].first = Utf8ToWide(text);
+                refreshAfterEdit();
+            }
+            if (ImGui::IsItemDeactivated())
+            {
+                finishTrackedEdit();
+            }
+
+            std::string target = WideToUtf8ForImGui(command.links[linkIndex].second);
+            if (ImGui::InputText("遷移先ラベル", &target))
+            {
+                beginTrackedEdit("choice_target:" + std::to_string(linkIndex));
+                command.links[linkIndex].second = Utf8ToWide(target);
+                refreshAfterEdit();
+            }
+            if (ImGui::IsItemDeactivated())
+            {
+                finishTrackedEdit();
+            }
+
+            if (command.links.size() > 1 && ImGui::Button("この枝を削除"))
+            {
+                beginTrackedEdit("choice_remove:" + std::to_string(linkIndex));
+                command.links.erase(command.links.begin() + static_cast<std::ptrdiff_t>(linkIndex));
+                selectedChoiceLinkIndex_ = (std::min)(selectedChoiceLinkIndex_, command.links.empty() ? 0 : command.links.size() - 1);
+                refreshAfterEdit();
+                finishTrackedEdit();
+                ImGui::PopID();
+                break;
+            }
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+        if (ImGui::Button("+ 枝を追加"))
+        {
+            beginTrackedEdit("choice_add");
+            const std::wstring branchLabelName = MakeUniqueLabelName(L"choice_branch_" + std::to_wstring(command.links.size() + 1));
+            const size_t newLinkIndex = command.links.size();
+            command.links.push_back({ L"新しい選択肢", branchLabelName });
+            ScriptCommand branchLabel = CreateDefaultCommand(ScriptCommand::Type::Label);
+            branchLabel.parameters[L"name"] = branchLabelName;
+            ScriptCommand branchText = CreateDefaultCommand(ScriptCommand::Type::Text);
+            branchText.parameters[L"value"] = L"新しい選択肢の本文";
+            const size_t insertIndex = (std::min)(selectedCommandIndex_ + 1, scenario_.commands.size());
+            scenario_.commands.insert(scenario_.commands.begin() + static_cast<std::ptrdiff_t>(insertIndex), std::move(branchText));
+            scenario_.commands.insert(scenario_.commands.begin() + static_cast<std::ptrdiff_t>(insertIndex), std::move(branchLabel));
+            EnsureChoiceBranchesAreIsolated(selectedCommandIndex_);
+            selectedChoiceLinkIndex_ = newLinkIndex;
+            refreshAfterEdit();
+            finishTrackedEdit();
+        }
+    }
+
+    ImGui::SeparatorText("開発メモ");
+    ImGui::TextWrapped("このウィンドウは Dear ImGui 製です。まず開発用パラメータ編集を置き換え、右パネル統合は次段階で進めます。");
+}
+
+void NovelRuntime::DrawDebugVariablesImGui()
+{
+    const std::wstring previousSelection = selectedVariableDefinitionIndex_ < variableDefinitions_.size()
+        ? variableDefinitions_[selectedVariableDefinitionIndex_].name
+        : L"";
+    SyncVariableDefinitions();
+    if (!previousSelection.empty())
+    {
+        for (size_t i = 0; i < variableDefinitions_.size(); ++i)
+        {
+            if (variableDefinitions_[i].name == previousSelection)
+            {
+                selectedVariableDefinitionIndex_ = i;
+                break;
+            }
+        }
+    }
+    if (selectedVariableDefinitionIndex_ >= variableDefinitions_.size())
+    {
+        selectedVariableDefinitionIndex_ = variableDefinitions_.empty() ? static_cast<size_t>(-1) : 0;
+    }
+
+    static size_t activeVariableIndex = static_cast<size_t>(-1);
+    static std::string activeFieldId;
+    static bool activeUndoPushed = false;
+    auto beginTrackedEdit = [&](size_t variableIndex, const std::string& fieldId)
+    {
+        if (activeVariableIndex != variableIndex || activeFieldId != fieldId)
+        {
+            activeVariableIndex = variableIndex;
+            activeFieldId = fieldId;
+            activeUndoPushed = false;
+        }
+        if (!activeUndoPushed)
+        {
+            PushUndoSnapshot();
+            activeUndoPushed = true;
+        }
+    };
+    auto finishTrackedEdit = [&]()
+    {
+        activeVariableIndex = static_cast<size_t>(-1);
+        activeFieldId.clear();
+        activeUndoPushed = false;
+        SaveProject();
+    };
+    auto refreshEditor = [&]()
+    {
+        SyncDocumentMetadata();
+        RefreshPreviewIfActive();
+        RefreshFlowGraphWindow();
+        if (hostWindow_)
+        {
+            InvalidateRect(hostWindow_, nullptr, TRUE);
+        }
+    };
+    auto isDuplicateName = [&](const std::wstring& name, size_t selfIndex) -> bool
+    {
+        for (size_t i = 0; i < variableDefinitions_.size(); ++i)
+        {
+            if (i != selfIndex && variableDefinitions_[i].name == name)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto renameVariable = [&](size_t variableIndex, const std::wstring& nextName) -> bool
+    {
+        if (variableIndex >= variableDefinitions_.size())
+        {
+            return false;
+        }
+        const std::wstring trimmed = Trim(nextName);
+        if (trimmed.empty() || isDuplicateName(trimmed, variableIndex))
+        {
+            statusText_ = trimmed.empty() ? L"変数名は空にできません" : L"同じ変数名は使えません";
+            return false;
+        }
+        VariableDefinition& definition = variableDefinitions_[variableIndex];
+        if (definition.name == trimmed)
+        {
+            return false;
+        }
+
+        const std::wstring previousName = definition.name;
+        definition.name = trimmed;
+        const auto currentIt = variables_.find(previousName);
+        if (currentIt != variables_.end())
+        {
+            variables_[trimmed] = currentIt->second;
+            variables_.erase(currentIt);
+        }
+        else
+        {
+            variables_[trimmed] = definition.initialValue;
+        }
+
+        for (ScriptCommand& command : scenario_.commands)
+        {
+            if ((command.type == ScriptCommand::Type::SetValue ||
+                command.type == ScriptCommand::Type::AddValue ||
+                command.type == ScriptCommand::Type::IfJump) &&
+                GetCommandParameter(command, L"name") == previousName)
+            {
+                command.parameters[L"name"] = trimmed;
+            }
+            if (command.type == ScriptCommand::Type::Choice)
+            {
+                for (size_t i = 0; i < command.links.size(); ++i)
+                {
+                    const std::wstring key = GetChoiceParamKey(L"__choice_cond_name_", i);
+                    if (GetCommandParameter(command, key) == previousName)
+                    {
+                        command.parameters[key] = trimmed;
+                    }
+                }
+            }
+        }
+        statusText_ = L"変数名を更新しました";
+        return true;
+    };
+
+    ImGui::TextUnformatted("変数管理");
+    ImGui::SameLine();
+    if (ImGui::Button("+ 変数追加"))
+    {
+        PushUndoSnapshot();
+        std::wstring name = L"var_" + std::to_wstring(variableDefinitions_.size() + 1);
+        int suffix = 1;
+        while (isDuplicateName(name, static_cast<size_t>(-1)))
+        {
+            name = L"var_" + std::to_wstring(++suffix);
+        }
+        VariableDefinition definition;
+        definition.name = name;
+        definition.type = VariableType::Integer;
+        definition.initialValue = L"0";
+        variableDefinitions_.push_back(definition);
+        variables_[name] = definition.initialValue;
+        selectedVariableDefinitionIndex_ = variableDefinitions_.size() - 1;
+        SaveProject();
+        refreshEditor();
+    }
+
+    if (ImGui::BeginTable("variables_table", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY, ImVec2(-1.0f, 230.0f)))
+    {
+        ImGui::TableSetupColumn("名前");
+        ImGui::TableSetupColumn("型", ImGuiTableColumnFlags_WidthFixed, 72.0f);
+        ImGui::TableSetupColumn("現在値");
+        ImGui::TableSetupColumn("参照", ImGuiTableColumnFlags_WidthFixed, 56.0f);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < variableDefinitions_.size(); ++i)
+        {
+            const VariableDefinition& definition = variableDefinitions_[i];
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            const bool selected = i == selectedVariableDefinitionIndex_;
+            if (ImGui::Selectable(WideToUtf8ForImGui(definition.name).c_str(), selected, ImGuiSelectableFlags_SpanAllColumns))
+            {
+                selectedVariableDefinitionIndex_ = i;
+            }
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(WideToUtf8ForImGui(GetVariableTypeLabel(definition.type)).c_str());
+            ImGui::TableSetColumnIndex(2);
+            const auto currentIt = variables_.find(definition.name);
+            ImGui::TextUnformatted(WideToUtf8ForImGui(currentIt == variables_.end() ? definition.initialValue : currentIt->second).c_str());
+            ImGui::TableSetColumnIndex(3);
+            ImGui::Text("%zu", GetVariableUsageCount(definition.name));
+        }
+        ImGui::EndTable();
+    }
+
+    if (selectedVariableDefinitionIndex_ >= variableDefinitions_.size())
+    {
+        ImGui::TextDisabled("変数がありません。");
+        return;
+    }
+
+    VariableDefinition& definition = variableDefinitions_[selectedVariableDefinitionIndex_];
+    ImGui::SeparatorText("選択中の変数");
+
+    std::string name = WideToUtf8ForImGui(definition.name);
+    if (ImGui::InputText("変数名", &name))
+    {
+        beginTrackedEdit(selectedVariableDefinitionIndex_, "name");
+        if (renameVariable(selectedVariableDefinitionIndex_, Utf8ToWide(name)))
+        {
+            refreshEditor();
+        }
+    }
+    if (ImGui::IsItemDeactivated())
+    {
+        finishTrackedEdit();
+    }
+
+    int typeIndex = definition.type == VariableType::Bool ? 0 : (definition.type == VariableType::Integer ? 1 : 2);
+    const char* typeLabels[] = { "フラグ", "数値", "文字列" };
+    if (ImGui::Combo("型", &typeIndex, typeLabels, _countof(typeLabels)))
+    {
+        PushUndoSnapshot();
+        definition.type = typeIndex == 0 ? VariableType::Bool : (typeIndex == 1 ? VariableType::Integer : VariableType::String);
+        if (definition.initialValue.empty())
+        {
+            definition.initialValue = definition.type == VariableType::Bool ? L"false" : (definition.type == VariableType::Integer ? L"0" : L"");
+        }
+        variables_[definition.name] = definition.initialValue;
+        SaveProject();
+        refreshEditor();
+    }
+
+    std::string initialValue = WideToUtf8ForImGui(definition.initialValue);
+    if (ImGui::InputText("初期値", &initialValue))
+    {
+        beginTrackedEdit(selectedVariableDefinitionIndex_, "initial");
+        definition.initialValue = Utf8ToWide(initialValue);
+        refreshEditor();
+    }
+    if (ImGui::IsItemDeactivated())
+    {
+        finishTrackedEdit();
+    }
+
+    std::string currentValue = WideToUtf8ForImGui(variables_[definition.name]);
+    if (ImGui::InputText("現在値", &currentValue))
+    {
+        beginTrackedEdit(selectedVariableDefinitionIndex_, "current");
+        variables_[definition.name] = Utf8ToWide(currentValue);
+        PushVariableHistory(L"EDIT " + definition.name + L" = " + variables_[definition.name]);
+        refreshEditor();
+    }
+    if (ImGui::IsItemDeactivated())
+    {
+        finishTrackedEdit();
+    }
+
+    std::string description = WideToUtf8ForImGui(definition.description);
+    if (ImGui::InputTextMultiline("説明", &description, ImVec2(-1.0f, 80.0f)))
+    {
+        beginTrackedEdit(selectedVariableDefinitionIndex_, "description");
+        definition.description = Utf8ToWide(description);
+        refreshEditor();
+    }
+    if (ImGui::IsItemDeactivated())
+    {
+        finishTrackedEdit();
+    }
+
+    if (ImGui::Button("選択中イベントに割り当て"))
+    {
+        if (selectedCommandIndex_ < scenario_.commands.size())
+        {
+            PushUndoSnapshot();
+            ScriptCommand& command = scenario_.commands[selectedCommandIndex_];
+            if (command.type == ScriptCommand::Type::Choice && selectedChoiceLinkIndex_ < command.links.size())
+            {
+                command.parameters[GetChoiceParamKey(L"__choice_cond_name_", selectedChoiceLinkIndex_)] = definition.name;
+                statusText_ = L"選択肢条件に変数を割り当てました";
+            }
+            else if (command.type == ScriptCommand::Type::SetValue ||
+                command.type == ScriptCommand::Type::AddValue ||
+                command.type == ScriptCommand::Type::IfJump)
+            {
+                command.parameters[L"name"] = definition.name;
+                statusText_ = L"選択中イベントに変数を割り当てました";
+            }
+            else
+            {
+                statusText_ = L"このイベントには変数を直接割り当てられません";
+            }
+            refreshEditor();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("削除"))
+    {
+        ImGui::OpenPopup("delete_variable_confirm");
+    }
+    if (ImGui::BeginPopupModal("delete_variable_confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::Text("変数 '%s' を削除しますか？", WideToUtf8ForImGui(definition.name).c_str());
+        ImGui::TextUnformatted("参照しているイベントの変数名は空になります。");
+        if (ImGui::Button("削除する", ImVec2(120.0f, 0.0f)))
+        {
+            PushUndoSnapshot();
+            const std::wstring deletedName = definition.name;
+            for (ScriptCommand& command : scenario_.commands)
+            {
+                if ((command.type == ScriptCommand::Type::SetValue ||
+                    command.type == ScriptCommand::Type::AddValue ||
+                    command.type == ScriptCommand::Type::IfJump) &&
+                    GetCommandParameter(command, L"name") == deletedName)
+                {
+                    command.parameters[L"name"].clear();
+                }
+                if (command.type == ScriptCommand::Type::Choice)
+                {
+                    for (size_t i = 0; i < command.links.size(); ++i)
+                    {
+                        const std::wstring key = GetChoiceParamKey(L"__choice_cond_name_", i);
+                        if (GetCommandParameter(command, key) == deletedName)
+                        {
+                            command.parameters[key].clear();
+                        }
+                    }
+                }
+            }
+            variables_.erase(deletedName);
+            variableDefinitions_.erase(variableDefinitions_.begin() + static_cast<std::ptrdiff_t>(selectedVariableDefinitionIndex_));
+            selectedVariableDefinitionIndex_ = variableDefinitions_.empty() ? static_cast<size_t>(-1) : 0;
+            SaveProject();
+            refreshEditor();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("キャンセル", ImVec2(120.0f, 0.0f)))
+        {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    ImGui::SeparatorText("参照先");
+    const std::vector<std::pair<size_t, std::wstring>> usageItems = GetVariableUsageItems(definition.name);
+    if (usageItems.empty())
+    {
+        ImGui::TextDisabled("まだ参照されていません。");
+    }
+    for (const auto& item : usageItems)
+    {
+        ImGui::PushID(static_cast<int>(item.first));
+        if (ImGui::Button("移動"))
+        {
+            selectedCommandIndex_ = item.first;
+            selectedChoiceLinkIndex_ = 0;
+            statusText_ = L"参照イベントへ移動しました";
+            RefreshFlowGraphWindow();
+            if (hostWindow_)
+            {
+                InvalidateRect(hostWindow_, nullptr, TRUE);
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextWrapped("%s", WideToUtf8ForImGui(item.second).c_str());
+        ImGui::PopID();
+    }
+
+    if (!variableHistory_.empty())
+    {
+        ImGui::SeparatorText("実行ログ");
+        const size_t first = variableHistory_.size() > 8 ? variableHistory_.size() - 8 : 0;
+        for (size_t i = first; i < variableHistory_.size(); ++i)
+        {
+            ImGui::TextUnformatted(WideToUtf8ForImGui(variableHistory_[i]).c_str());
+        }
+    }
+}
+
+#endif
 
 std::wstring NovelRuntime::GetCommandTypeLabel(const ScriptCommand& command) const
 {
@@ -17940,6 +19577,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
 {
     inspectorEditTargets_.clear();
     inspectorActionTargets_.clear();
+    inspectorSliderTargets_.clear();
     inspectorCommitRect_ = {};
     inspectorCancelRect_ = {};
     SetBkMode(hdc, TRANSPARENT);
@@ -17971,8 +19609,8 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             key == L"time" || key == L"x" || key == L"y" || key == L"scale" || key == L"opacity" ||
             key == L"volume" || key == L"fadein" || key == L"fadeout" || key == L"power" || key == L"value" ||
             key == L"name_x" || key == L"name_y" || key == L"fade_time";
-        RECT textRect = { panelRect.left + 20, cursorY, panelRect.right - (numericField ? 150 : 90), cursorY + lineHeight };
-        RECT buttonRect = { panelRect.right - (numericField ? 140 : 80), cursorY, panelRect.right - (numericField ? 80 : 20), cursorY + lineHeight - 4 };
+        RECT textRect = { panelRect.left + 20, cursorY, panelRect.right - 90, cursorY + lineHeight };
+        RECT buttonRect = { panelRect.right - 80, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
         SetTextColor(hdc, RGB(205, 214, 222));
         DrawWrappedText(hdc, textRect, label + L": " + value, DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER);
         HBRUSH editBrush = CreateSolidBrush(RGB(58, 88, 118));
@@ -17984,19 +19622,48 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
         inspectorEditTargets_.push_back(InspectorEditTarget{ commandIndex, key, label, buttonRect });
         if (numericField)
         {
-            RECT minusRect = { panelRect.right - 72, cursorY, panelRect.right - 46, cursorY + lineHeight - 4 };
-            RECT plusRect = { panelRect.right - 42, cursorY, panelRect.right - 16, cursorY + lineHeight - 4 };
+            int minValue = 0;
+            int maxValue = 100;
+            if (key == L"x" || key == L"name_x") { minValue = -960; maxValue = 960; }
+            else if (key == L"y" || key == L"name_y") { minValue = -540; maxValue = 540; }
+            else if (key == L"scale") { minValue = 10; maxValue = 300; }
+            else if (key == L"opacity") { minValue = 0; maxValue = 255; }
+            else if (key == L"volume") { minValue = 0; maxValue = 100; }
+            else if (key == L"power") { minValue = 0; maxValue = 100; }
+            else if (key == L"time" || key == L"fadein" || key == L"fadeout" || key == L"fade_time") { minValue = 0; maxValue = 3000; }
+            else if (key == L"value") { minValue = 0; maxValue = 200; }
+
+            int currentValue = ParseIntValue(value, minValue);
+            currentValue = (std::max)(minValue, (std::min)(currentValue, maxValue));
+            cursorY += lineHeight;
+            RECT minusRect = { panelRect.left + 20, cursorY + 2, panelRect.left + 44, cursorY + 24 };
+            RECT plusRect = { panelRect.right - 44, cursorY + 2, panelRect.right - 20, cursorY + 24 };
+            RECT trackRect = { minusRect.right + 8, cursorY + 9, plusRect.left - 8, cursorY + 17 };
             HBRUSH spinBrush = CreateSolidBrush(RGB(224, 228, 232));
             FillRect(hdc, &minusRect, spinBrush);
             FillRect(hdc, &plusRect, spinBrush);
             DeleteObject(spinBrush);
             FrameRect(hdc, &minusRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
             FrameRect(hdc, &plusRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+            HBRUSH trackBrush = CreateSolidBrush(RGB(42, 52, 64));
+            FillRect(hdc, &trackRect, trackBrush);
+            DeleteObject(trackBrush);
+            const int trackWidth = (std::max)(1, static_cast<int>(trackRect.right - trackRect.left));
+            const int fillWidth = ((currentValue - minValue) * trackWidth) / (std::max)(1, maxValue - minValue);
+            RECT fillRect = { trackRect.left, trackRect.top, trackRect.left + fillWidth, trackRect.bottom };
+            HBRUSH fillBrush = CreateSolidBrush(RGB(86, 142, 206));
+            FillRect(hdc, &fillRect, fillBrush);
+            DeleteObject(fillBrush);
+            RECT knobRect = { fillRect.right - 5, trackRect.top - 5, fillRect.right + 5, trackRect.bottom + 5 };
+            HBRUSH knobBrush = CreateSolidBrush(RGB(236, 242, 248));
+            FillRect(hdc, &knobRect, knobBrush);
+            DeleteObject(knobBrush);
             SetTextColor(hdc, RGB(40, 56, 72));
             DrawWrappedText(hdc, minusRect, L"-", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             DrawWrappedText(hdc, plusRect, L"+", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"nudge:-:" + key, commandIndex, 0, minusRect });
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"nudge:+:" + key, commandIndex, 0, plusRect });
+            inspectorSliderTargets_.push_back(InspectorSliderTarget{ commandIndex, key, trackRect, minValue, maxValue });
         }
         cursorY += lineHeight;
     };
@@ -18029,6 +19696,40 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             return L"ラベル: " + target;
         }
         return target;
+    };
+    auto findVariableDefinition = [&](const std::wstring& name) -> const VariableDefinition*
+    {
+        for (const VariableDefinition& definition : variableDefinitions_)
+        {
+            if (definition.name == name)
+            {
+                return &definition;
+            }
+        }
+        return nullptr;
+    };
+    auto getVariableDisplay = [&](const std::wstring& name)
+    {
+        const VariableDefinition* definition = findVariableDefinition(name);
+        if (!definition)
+        {
+            return name.empty() ? std::wstring(L"(未設定)") : name + L" (未登録)";
+        }
+        return definition->name + L" [" + GetVariableTypeLabel(definition->type) + L"]";
+    };
+    auto getConditionPreview = [&](const std::wstring& name, const std::wstring& op, const std::wstring& value)
+    {
+        if (name.empty())
+        {
+            return std::wstring(L"条件なし");
+        }
+        const VariableDefinition* definition = findVariableDefinition(name);
+        if (definition && definition->type == VariableType::Bool)
+        {
+            const bool expected = ParseBoolValue(value.empty() ? L"true" : value, true);
+            return name + L" が " + (expected ? L"ON" : L"OFF");
+        }
+        return name + L" " + GetIfOperatorLabel(op.empty() ? L"eq" : op) + L" " + value;
     };
     auto drawTargetPicker = [&](size_t commandIndex, const std::wstring& target, const std::wstring& action, size_t linkIndex)
     {
@@ -18121,6 +19822,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
 
     if (!scenario_.commands.empty() && selectedCommandIndex_ < scenario_.commands.size())
     {
+        SyncVariableDefinitions();
         const ScriptCommand& command = scenario_.commands[selectedCommandIndex_];
         drawLine(GetCommandTypeLabel(command), RGB(255, 225, 160));
         const std::wstring summary = GetCommandSummary(command);
@@ -18378,6 +20080,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
                 const std::wstring conditionValue = GetCommandParameter(command, GetChoiceParamKey(L"__choice_cond_value_", linkIndex));
                 const bool showDisabled = ParseBoolValue(GetCommandParameter(command, GetChoiceParamKey(L"__choice_show_disabled_", linkIndex)), false);
                 drawLine(std::to_wstring(linkIndex + 1) + L". \u679d", linkIndex == selectedChoiceLinkIndex_ ? RGB(255, 225, 160) : RGB(205, 214, 222));
+                drawLine(L"条件: " + getConditionPreview(conditionName, conditionOp, conditionValue), conditionName.empty() ? RGB(148, 158, 168) : RGB(180, 218, 190));
                 drawEditable(selectedCommandIndex_, L"\u6587\u8a00", L"__choice_text_" + std::to_wstring(linkIndex), link.first);
                 drawTargetPicker(selectedCommandIndex_, link.second, L"choice_select_target", linkIndex);
                 RECT condVarTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
@@ -18419,30 +20122,78 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
         }
         else if (command.type == ScriptCommand::Type::IfJump)
         {
+            const std::wstring variableName = GetCommandParameter(command, L"name");
+            const VariableDefinition* definition = findVariableDefinition(variableName);
             RECT varTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
             RECT varButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
             SetTextColor(hdc, RGB(205, 214, 222));
-            DrawWrappedText(hdc, varTextRect, L"変数名: " + GetCommandParameter(command, L"name"), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            DrawWrappedText(hdc, varTextRect, L"変数名: " + getVariableDisplay(variableName), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             drawActionButton(varButtonRect, L"切替", RGB(58, 88, 118));
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"if_cycle_var", selectedCommandIndex_, 0, varButtonRect });
             cursorY += lineHeight;
-            drawEditable(selectedCommandIndex_, L"\u5909\u6570\u540d", L"name", GetCommandParameter(command, L"name"));
-            RECT opTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
-            RECT opButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
-            SetTextColor(hdc, RGB(205, 214, 222));
-            DrawWrappedText(hdc, opTextRect, L"\u6f14\u7b97\u5b50: " + GetIfOperatorLabel(GetCommandParameter(command, L"op")), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
-            drawActionButton(opButtonRect, L"\u5207\u66ff", RGB(58, 88, 118));
-            inspectorActionTargets_.push_back(InspectorActionTarget{ L"if_cycle_op", selectedCommandIndex_, 0, opButtonRect });
-            cursorY += lineHeight;
-            drawEditable(selectedCommandIndex_, L"\u6bd4\u8f03\u5024", L"value", GetCommandParameter(command, L"value"));
+            if (definition && definition->type == VariableType::Bool)
+            {
+                RECT valueTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+                RECT valueButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+                const bool expected = ParseBoolValue(GetCommandParameter(command, L"value"), true);
+                SetTextColor(hdc, RGB(205, 214, 222));
+                DrawWrappedText(hdc, valueTextRect, L"比較値: " + std::wstring(expected ? L"true" : L"false"), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                drawActionButton(valueButtonRect, expected ? L"falseへ" : L"trueへ", RGB(76, 108, 76));
+                inspectorActionTargets_.push_back(InspectorActionTarget{ L"toggle_bool_value", selectedCommandIndex_, 0, valueButtonRect });
+                cursorY += lineHeight;
+            }
+            else
+            {
+                RECT opTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+                RECT opButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+                SetTextColor(hdc, RGB(205, 214, 222));
+                DrawWrappedText(hdc, opTextRect, L"\u6f14\u7b97\u5b50: " + GetIfOperatorLabel(GetCommandParameter(command, L"op")), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                drawActionButton(opButtonRect, L"\u5207\u66ff", RGB(58, 88, 118));
+                inspectorActionTargets_.push_back(InspectorActionTarget{ L"if_cycle_op", selectedCommandIndex_, 0, opButtonRect });
+                cursorY += lineHeight;
+                drawEditable(selectedCommandIndex_, L"\u6bd4\u8f03\u5024", L"value", GetCommandParameter(command, L"value"));
+            }
             drawTargetPicker(selectedCommandIndex_, GetCommandParameter(command, L"target"), L"jump_select_target", 0);
             cursorY += 8;
-            const std::wstring variableName = GetCommandParameter(command, L"name");
             const auto currentValueIt = variables_.find(variableName);
             const std::wstring currentValue = currentValueIt == variables_.end() ? L"(未設定)" : currentValueIt->second;
             drawLine(L"現在値: " + currentValue, RGB(205, 214, 222));
             drawLine(L"現在の評価: " + std::wstring(EvaluateCondition(command) ? L"true" : L"false"), RGB(180, 188, 196));
-            drawLine(L"\u5207\u66ff: \u7b49\u3057\u3044 / \u4e0d\u4e00\u81f4 / \u5927\u306a\u308a / \u4ee5\u4e0a / \u5c0f\u306a\u308a / \u4ee5\u4e0b", RGB(180, 188, 196));
+            if (!definition || definition->type != VariableType::Bool)
+            {
+                drawLine(L"\u5207\u66ff: \u7b49\u3057\u3044 / \u4e0d\u4e00\u81f4 / \u5927\u306a\u308a / \u4ee5\u4e0a / \u5c0f\u306a\u308a / \u4ee5\u4e0b", RGB(180, 188, 196));
+            }
+        }
+        else if (command.type == ScriptCommand::Type::SetValue || command.type == ScriptCommand::Type::AddValue)
+        {
+            const bool addMode = command.type == ScriptCommand::Type::AddValue;
+            drawLine(addMode ? L"変数を増やす/減らす" : L"変数・スイッチを設定", RGB(255, 225, 160));
+            const std::wstring variableName = GetCommandParameter(command, L"name");
+            const VariableDefinition* definition = findVariableDefinition(variableName);
+            RECT varTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+            RECT varButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+            SetTextColor(hdc, RGB(205, 214, 222));
+            DrawWrappedText(hdc, varTextRect, L"対象: " + getVariableDisplay(variableName), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            drawActionButton(varButtonRect, L"選択", RGB(58, 88, 118));
+            inspectorActionTargets_.push_back(InspectorActionTarget{ L"if_cycle_var", selectedCommandIndex_, 0, varButtonRect });
+            cursorY += lineHeight;
+            if (definition && definition->type == VariableType::Bool && !addMode)
+            {
+                RECT valueTextRect = { panelRect.left + 20, cursorY, panelRect.right - 126, cursorY + lineHeight };
+                RECT valueButtonRect = { panelRect.right - 116, cursorY, panelRect.right - 20, cursorY + lineHeight - 4 };
+                const bool boolValue = ParseBoolValue(GetCommandParameter(command, L"value"), false);
+                SetTextColor(hdc, RGB(205, 214, 222));
+                DrawWrappedText(hdc, valueTextRect, L"設定値: " + std::wstring(boolValue ? L"true" : L"false"), DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                drawActionButton(valueButtonRect, boolValue ? L"falseへ" : L"trueへ", RGB(76, 108, 76));
+                inspectorActionTargets_.push_back(InspectorActionTarget{ L"toggle_bool_value", selectedCommandIndex_, 0, valueButtonRect });
+                cursorY += lineHeight;
+            }
+            else
+            {
+                drawEditable(selectedCommandIndex_, addMode ? L"加算値" : L"代入値", L"value", GetCommandParameter(command, L"value"));
+            }
+            const auto currentIt = variables_.find(variableName);
+            drawLine(L"現在値: " + (currentIt == variables_.end() ? std::wstring(L"(未設定)") : currentIt->second), RGB(180, 188, 196));
         }
         else if (command.type == ScriptCommand::Type::Jump)
         {
@@ -18707,25 +20458,42 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
     {
         for (const auto& variable : variables_)
         {
-            RECT valueRect = { panelRect.left + 20, cursorY, panelRect.right - 136, cursorY + lineHeight };
-            RECT editRect = { panelRect.right - 126, cursorY, panelRect.right - 74, cursorY + lineHeight - 4 };
-            RECT minusRect = { panelRect.right - 68, cursorY, panelRect.right - 42, cursorY + lineHeight - 4 };
-            RECT plusRect = { panelRect.right - 38, cursorY, panelRect.right - 12, cursorY + lineHeight - 4 };
+            const VariableDefinition* definition = findVariableDefinition(variable.first);
+            const bool isBoolVariable = definition && definition->type == VariableType::Bool;
+            const bool isIntegerVariable = definition && definition->type == VariableType::Integer;
+            RECT valueRect = { panelRect.left + 20, cursorY, panelRect.right - (isIntegerVariable ? 136 : 90), cursorY + lineHeight };
+            RECT editRect = isIntegerVariable
+                ? RECT{ panelRect.right - 126, cursorY, panelRect.right - 74, cursorY + lineHeight - 4 }
+                : RECT{ panelRect.right - 80, cursorY, panelRect.right - 12, cursorY + lineHeight - 4 };
             SetTextColor(hdc, RGB(205, 214, 222));
             DrawWrappedText(hdc, valueRect, variable.first + L" = " + variable.second, DT_LEFT | DT_END_ELLIPSIS | DT_SINGLELINE | DT_VCENTER);
-            drawActionButton(editRect, L"編集", RGB(58, 88, 118));
-            inspectorActionTargets_.push_back(InspectorActionTarget{ L"var_edit:" + variable.first, 0, 0, editRect });
-            HBRUSH spinBrush = CreateSolidBrush(RGB(224, 228, 232));
-            FillRect(hdc, &minusRect, spinBrush);
-            FillRect(hdc, &plusRect, spinBrush);
-            DeleteObject(spinBrush);
-            FrameRect(hdc, &minusRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
-            FrameRect(hdc, &plusRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
-            SetTextColor(hdc, RGB(40, 56, 72));
-            DrawWrappedText(hdc, minusRect, L"-", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-            DrawWrappedText(hdc, plusRect, L"+", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-            inspectorActionTargets_.push_back(InspectorActionTarget{ L"var_nudge:-:" + variable.first, 0, 0, minusRect });
-            inspectorActionTargets_.push_back(InspectorActionTarget{ L"var_nudge:+:" + variable.first, 0, 0, plusRect });
+            if (isBoolVariable)
+            {
+                const bool currentBool = ParseBoolValue(variable.second, false);
+                drawActionButton(editRect, currentBool ? L"falseへ" : L"trueへ", RGB(76, 108, 76));
+                inspectorActionTargets_.push_back(InspectorActionTarget{ L"var_toggle_bool:" + variable.first, 0, 0, editRect });
+            }
+            else
+            {
+                drawActionButton(editRect, L"編集", RGB(58, 88, 118));
+                inspectorActionTargets_.push_back(InspectorActionTarget{ L"var_edit:" + variable.first, 0, 0, editRect });
+                if (isIntegerVariable)
+                {
+                    RECT minusRect = { panelRect.right - 68, cursorY, panelRect.right - 42, cursorY + lineHeight - 4 };
+                    RECT plusRect = { panelRect.right - 38, cursorY, panelRect.right - 12, cursorY + lineHeight - 4 };
+                    HBRUSH spinBrush = CreateSolidBrush(RGB(224, 228, 232));
+                    FillRect(hdc, &minusRect, spinBrush);
+                    FillRect(hdc, &plusRect, spinBrush);
+                    DeleteObject(spinBrush);
+                    FrameRect(hdc, &minusRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+                    FrameRect(hdc, &plusRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
+                    SetTextColor(hdc, RGB(40, 56, 72));
+                    DrawWrappedText(hdc, minusRect, L"-", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                    DrawWrappedText(hdc, plusRect, L"+", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                    inspectorActionTargets_.push_back(InspectorActionTarget{ L"var_nudge:-:" + variable.first, 0, 0, minusRect });
+                    inspectorActionTargets_.push_back(InspectorActionTarget{ L"var_nudge:+:" + variable.first, 0, 0, plusRect });
+                }
+            }
             cursorY += lineHeight;
         }
     }
