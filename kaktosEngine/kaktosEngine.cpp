@@ -160,10 +160,11 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
     }
     else if (hMenu)
     {
-        const UINT viewCommands[] = { IDM_VIEW_COMPONENTS, IDM_VIEW_INSPECTOR, IDM_VIEW_FLOWGRAPH, IDM_VIEW_PREVIEW, IDM_VIEW_EVENTLIST };
+        const UINT viewCommands[] = { IDM_VIEW_COMPONENTS, IDM_VIEW_INSPECTOR, IDM_VIEW_FLOWGRAPH, IDM_VIEW_PREVIEW, IDM_VIEW_EVENTLIST, IDM_VIEW_VARIABLES };
         for (UINT command : viewCommands)
         {
-            CheckMenuItem(hMenu, command, MF_BYCOMMAND | (g_runtime.IsViewMenuChecked(command) ? MF_CHECKED : MF_UNCHECKED));
+            const bool checked = g_runtime.IsViewMenuChecked(command);
+            CheckMenuItem(hMenu, command, MF_BYCOMMAND | (checked ? MF_CHECKED : MF_UNCHECKED));
         }
     }
 
@@ -388,15 +389,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         case IDM_VIEW_VARIABLES:
         case IDM_VIEW_RESET_LAYOUT:
         {
-            if (g_runtime.HandleViewMenuCommand(static_cast<UINT>(wmId)))
+            const bool handled = g_runtime.HandleViewMenuCommand(static_cast<UINT>(wmId));
+            if (handled)
             {
                 HMENU hMenu = GetMenu(hWnd);
                 if (hMenu)
                 {
-                    const UINT viewCommands[] = { IDM_VIEW_COMPONENTS, IDM_VIEW_INSPECTOR, IDM_VIEW_FLOWGRAPH, IDM_VIEW_PREVIEW, IDM_VIEW_EVENTLIST };
+                    const UINT viewCommands[] = { IDM_VIEW_COMPONENTS, IDM_VIEW_INSPECTOR, IDM_VIEW_FLOWGRAPH, IDM_VIEW_PREVIEW, IDM_VIEW_EVENTLIST, IDM_VIEW_VARIABLES };
                     for (UINT command : viewCommands)
                     {
-                        CheckMenuItem(hMenu, command, MF_BYCOMMAND | (g_runtime.IsViewMenuChecked(command) ? MF_CHECKED : MF_UNCHECKED));
+                        const bool checked = g_runtime.IsViewMenuChecked(command);
+                        CheckMenuItem(hMenu, command, MF_BYCOMMAND | (checked ? MF_CHECKED : MF_UNCHECKED));
                     }
                 }
                 InvalidateRect(hWnd, nullptr, TRUE);
