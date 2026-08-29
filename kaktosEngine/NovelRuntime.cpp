@@ -63,6 +63,9 @@ namespace
 
     constexpr const wchar_t* kRuntimeEditProp = L"KaktosRuntimeEditOwner";
     constexpr const wchar_t* kRuntimeEditOldProcProp = L"KaktosRuntimeEditOldProc";
+    constexpr UINT_PTR kRuntimeTimerId = 1;
+    constexpr UINT kRuntimeTimerMs = 33;
+    constexpr size_t kMaxCachedImages = 128;
 
     LRESULT CALLBACK RuntimeEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
@@ -308,18 +311,18 @@ namespace
             return;
         }
 
-        HDC overlayDc = CreateCompatibleDC(hdc);
-        HBITMAP overlayBitmap = CreateCompatibleBitmap(hdc, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top);
-        HGDIOBJ oldBitmap = SelectObject(overlayDc, overlayBitmap);
-        RECT overlayRect = { 0, 0, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top };
-        HBRUSH overlayBrush = CreateSolidBrush(color);
-        FillRect(overlayDc, &overlayRect, overlayBrush);
-        DeleteObject(overlayBrush);
-        BLENDFUNCTION overlayBlend = { AC_SRC_OVER, 0, static_cast<BYTE>((std::max)(0, (std::min)(255, alpha))), 0 };
-        AlphaBlend(hdc, targetRect.left, targetRect.top, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top, overlayDc, 0, 0, targetRect.right - targetRect.left, targetRect.bottom - targetRect.top, overlayBlend);
-        SelectObject(overlayDc, oldBitmap);
-        DeleteObject(overlayBitmap);
-        DeleteDC(overlayDc);
+        Gdiplus::Graphics graphics(hdc);
+        Gdiplus::SolidBrush overlayBrush(Gdiplus::Color(
+            ClampByteValue(alpha),
+            GetRValue(color),
+            GetGValue(color),
+            GetBValue(color)));
+        graphics.FillRectangle(
+            &overlayBrush,
+            static_cast<INT>(targetRect.left),
+            static_cast<INT>(targetRect.top),
+            static_cast<INT>(targetRect.right - targetRect.left),
+            static_cast<INT>(targetRect.bottom - targetRect.top));
     }
 
     std::wstring GetLegacyAudioAlias(AudioChannel channel)
@@ -903,7 +906,7 @@ void NovelRuntime::Shutdown()
     DestroyChildControls();
     if (hostWindow_)
     {
-        KillTimer(hostWindow_, 1);
+        KillTimer(hostWindow_, kRuntimeTimerId);
     }
     if (previewWindow_)
     {
@@ -998,7 +1001,8 @@ bool NovelRuntime::IsPlayerMode() const
 void NovelRuntime::SetHostWindow(HWND hWnd)
 {
     hostWindow_ = hWnd;
-    SetTimer(hostWindow_, 1, 16, nullptr);
+    // 常時60FPSはエディタ操作の負荷が高いため、必要十分な30FPSに抑えます。
+    SetTimer(hostWindow_, kRuntimeTimerId, kRuntimeTimerMs, nullptr);
     if (!playerMode_)
     {
         EnsureChildControls();
@@ -1642,8 +1646,16 @@ std::shared_ptr<Gdiplus::Image> NovelRuntime::GetCachedImage(const std::wstring&
     std::unique_ptr<Gdiplus::Image> loaded = TryLoadImage(path);
     if (!loaded)
     {
+        if (imageCache_.size() >= kMaxCachedImages)
+        {
+            imageCache_.erase(imageCache_.begin());
+        }
         imageCache_[path] = nullptr;
         return nullptr;
+    }
+    if (imageCache_.size() >= kMaxCachedImages)
+    {
+        imageCache_.erase(imageCache_.begin());
     }
     std::shared_ptr<Gdiplus::Image> image(loaded.release());
     imageCache_[path] = image;
@@ -3663,7 +3675,7 @@ bool NovelRuntime::HandleClick(POINT point)
         return HandleProjectLauncherClick(point);
     }
 
-    if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_ || storyWritingVisible_ || storyCharacterVisible_ || storyWorldVisible_) &&
+    if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_ || storyWritingVisible_ || storyCharacterVisible_ || storyWorldVisible_ || storyRelationVisible_ || storyTemplateVisible_ || storyMemoVisible_) &&
         HandleStoryInlineEditControlClick(point))
     {
         return true;
@@ -3696,6 +3708,18 @@ bool NovelRuntime::HandleClick(POINT point)
     if (storyWorldVisible_)
     {
         return HandleStoryWorldClick(point);
+    }
+    if (storyRelationVisible_)
+    {
+        return HandleStoryRelationClick(point);
+    }
+    if (storyTemplateVisible_)
+    {
+        return HandleStoryTemplateClick(point);
+    }
+    if (storyMemoVisible_)
+    {
+        return HandleStoryMemoClick(point);
     }
 
     if (variableManagerVisible_)
@@ -5209,6 +5233,30 @@ bool NovelRuntime::HandleMouseWheel(short delta, POINT point)
         storyWorldDetailScrollOffset_ = (std::max)(0, (std::min)(storyWorldDetailScrollOffset_ + step, storyWorldDetailScrollMax_));
         return true;
     }
+    if (storyRelationVisible_ && PtInRect(&storyRelationListRect_, point))
+    {
+        const int step = delta > 0 ? -64 : 64;
+        storyRelationListScrollOffset_ = (std::max)(0, (std::min)(storyRelationListScrollOffset_ + step, storyRelationListScrollMax_));
+        return true;
+    }
+    if (storyRelationVisible_ && PtInRect(&storyRelationDetailRect_, point))
+    {
+        const int step = delta > 0 ? -64 : 64;
+        storyRelationDetailScrollOffset_ = (std::max)(0, (std::min)(storyRelationDetailScrollOffset_ + step, storyRelationDetailScrollMax_));
+        return true;
+    }
+    if (storyTemplateVisible_ && PtInRect(&storyTemplateListRect_, point))
+    {
+        const int step = delta > 0 ? -64 : 64;
+        storyTemplateListScrollOffset_ = (std::max)(0, (std::min)(storyTemplateListScrollOffset_ + step, storyTemplateListScrollMax_));
+        return true;
+    }
+    if (storyTemplateVisible_ && PtInRect(&storyTemplateDetailRect_, point))
+    {
+        const int step = delta > 0 ? -64 : 64;
+        storyTemplateDetailScrollOffset_ = (std::max)(0, (std::min)(storyTemplateDetailScrollOffset_ + step, storyTemplateDetailScrollMax_));
+        return true;
+    }
 
     const RECT leftPanelRect = GetLeftPanelRect(lastClientRect_);
     if (leftPanelTab_ == LeftPanelTab::Components && PtInRect(&leftPanelRect, point))
@@ -5318,6 +5366,7 @@ void NovelRuntime::NormalizePlaybackStateAfterScenarioMutation()
     {
         characterAdjustMode_ = false;
         characterAdjustDragging_ = false;
+        characterAdjustUndoCaptured_ = false;
         adjustCharacterCommandIndex_ = static_cast<size_t>(-1);
     }
     if (waitingForChoice_ && currentCommandIndex_ > commandCount)
@@ -6026,6 +6075,7 @@ void NovelRuntime::CommitInspectorEdit()
         else if (editingKey_ == L"story_target_age_gender") storyTargetAgeGender_ = editingBuffer_;
         else if (editingKey_ == L"story_target_taste") storyTargetTaste_ = editingBuffer_;
         else if (editingKey_ == L"story_target_comparable") storyTargetComparable_ = editingBuffer_;
+        else if (editingKey_ == L"story_memo") storyMemoText_ = editingBuffer_;
         else if (StartsWithText(editingKey_, L"story_plot_intro_item.") ||
                  StartsWithText(editingKey_, L"story_plot_development_item.") ||
                  StartsWithText(editingKey_, L"story_plot_turn_item.") ||
@@ -6146,6 +6196,37 @@ void NovelRuntime::CommitInspectorEdit()
                 else if (field == L"image") entry.imagePath = editingBuffer_;
                 else if (field == L"summary") entry.summary = editingBuffer_;
                 else if (field == L"detail") entry.detail = editingBuffer_;
+            }
+        }
+        else if (StartsWithText(editingKey_, L"story_relation."))
+        {
+            const size_t indexStart = wcslen(L"story_relation.");
+            const size_t fieldDot = editingKey_.find(L'.', indexStart);
+            if (fieldDot != std::wstring::npos)
+            {
+                const size_t index = static_cast<size_t>(_wtoi(editingKey_.substr(indexStart, fieldDot - indexStart).c_str()));
+                const std::wstring field = editingKey_.substr(fieldDot + 1);
+                while (storyRelationEntries_.size() <= index) storyRelationEntries_.push_back(StoryRelationEntry{});
+                StoryRelationEntry& entry = storyRelationEntries_[index];
+                if (field == L"source") entry.sourceName = editingBuffer_;
+                else if (field == L"target") entry.targetName = editingBuffer_;
+                else if (field == L"relation") entry.relation = editingBuffer_.empty() ? L"関係" : editingBuffer_;
+                else if (field == L"memo") entry.memo = editingBuffer_;
+            }
+        }
+        else if (StartsWithText(editingKey_, L"story_template."))
+        {
+            const size_t indexStart = wcslen(L"story_template.");
+            const size_t fieldDot = editingKey_.find(L'.', indexStart);
+            if (fieldDot != std::wstring::npos)
+            {
+                const size_t index = static_cast<size_t>(_wtoi(editingKey_.substr(indexStart, fieldDot - indexStart).c_str()));
+                const std::wstring field = editingKey_.substr(fieldDot + 1);
+                while (storyTemplateEntries_.size() <= index) storyTemplateEntries_.push_back(StoryTemplateEntry{});
+                StoryTemplateEntry& entry = storyTemplateEntries_[index];
+                if (field == L"title") entry.title = editingBuffer_.empty() ? L"新しいテンプレート" : editingBuffer_;
+                else if (field == L"category") entry.category = editingBuffer_;
+                else if (field == L"body") entry.body = editingBuffer_;
             }
         }
         else if (editingKey_ == L"story_plot_intro") storyPlotIntro_ = editingBuffer_.empty() ? L"起" : editingBuffer_;
@@ -6573,9 +6654,27 @@ bool NovelRuntime::HandleInspectorClick(POINT point)
         }
         if (target.action == L"character_adjust")
         {
-            characterAdjustMode_ = !characterAdjustMode_;
+            const bool closingCurrentTool = characterAdjustMode_;
             characterAdjustDragging_ = false;
-            adjustCharacterCommandIndex_ = characterAdjustMode_ ? target.commandIndex : static_cast<size_t>(-1);
+            if (closingCurrentTool)
+            {
+                characterAdjustMode_ = false;
+                characterAdjustUndoCaptured_ = false;
+                adjustCharacterCommandIndex_ = static_cast<size_t>(-1);
+                SyncDocumentMetadata();
+                SaveProject();
+                statusText_ = L"位置調整を保存して閉じました";
+                RefreshPreviewWindow();
+                if (hostWindow_)
+                {
+                    InvalidateRect(hostWindow_, nullptr, FALSE);
+                }
+                return true;
+            }
+
+            characterAdjustMode_ = true;
+            characterAdjustUndoCaptured_ = false;
+            adjustCharacterCommandIndex_ = target.commandIndex;
             statusText_ = characterAdjustMode_ ? L"位置調整モードを開始しました" : L"位置調整モードを終了しました";
             if (characterAdjustMode_ && (!previewWindow_ || !IsWindowVisible(previewWindow_)))
             {
@@ -7226,6 +7325,11 @@ bool NovelRuntime::HandlePreviewMouseDown(POINT point)
     }
 
     characterAdjustDragging_ = true;
+    if (!characterAdjustUndoCaptured_)
+    {
+        PushUndoSnapshot();
+        characterAdjustUndoCaptured_ = true;
+    }
     adjustDragStartPoint_ = point;
     adjustStartX_ = ParseIntValue(GetCommandParameter(command, L"x"), 0);
     adjustStartY_ = ParseIntValue(GetCommandParameter(command, L"y"), 0);
@@ -7567,6 +7671,7 @@ bool NovelRuntime::HandleControlCommand(WPARAM wParam, LPARAM lParam)
             else if (editingKey_ == L"story_target_age_gender") storyTargetAgeGender_ = value;
             else if (editingKey_ == L"story_target_taste") storyTargetTaste_ = value;
             else if (editingKey_ == L"story_target_comparable") storyTargetComparable_ = value;
+            else if (editingKey_ == L"story_memo") storyMemoText_ = value;
             else if (StartsWithText(editingKey_, L"story_plot_intro_item.") ||
                      StartsWithText(editingKey_, L"story_plot_development_item.") ||
                      StartsWithText(editingKey_, L"story_plot_turn_item.") ||
@@ -7674,6 +7779,37 @@ bool NovelRuntime::HandleControlCommand(WPARAM wParam, LPARAM lParam)
                     else if (field == L"image") entry.imagePath = value;
                     else if (field == L"summary") entry.summary = value;
                     else if (field == L"detail") entry.detail = value;
+                }
+            }
+            else if (StartsWithText(editingKey_, L"story_relation."))
+            {
+                const size_t indexStart = wcslen(L"story_relation.");
+                const size_t fieldDot = editingKey_.find(L'.', indexStart);
+                if (fieldDot != std::wstring::npos)
+                {
+                    const size_t index = static_cast<size_t>(_wtoi(editingKey_.substr(indexStart, fieldDot - indexStart).c_str()));
+                    const std::wstring field = editingKey_.substr(fieldDot + 1);
+                    while (storyRelationEntries_.size() <= index) storyRelationEntries_.push_back(StoryRelationEntry{});
+                    StoryRelationEntry& entry = storyRelationEntries_[index];
+                    if (field == L"source") entry.sourceName = value;
+                    else if (field == L"target") entry.targetName = value;
+                    else if (field == L"relation") entry.relation = value;
+                    else if (field == L"memo") entry.memo = value;
+                }
+            }
+            else if (StartsWithText(editingKey_, L"story_template."))
+            {
+                const size_t indexStart = wcslen(L"story_template.");
+                const size_t fieldDot = editingKey_.find(L'.', indexStart);
+                if (fieldDot != std::wstring::npos)
+                {
+                    const size_t index = static_cast<size_t>(_wtoi(editingKey_.substr(indexStart, fieldDot - indexStart).c_str()));
+                    const std::wstring field = editingKey_.substr(fieldDot + 1);
+                    while (storyTemplateEntries_.size() <= index) storyTemplateEntries_.push_back(StoryTemplateEntry{});
+                    StoryTemplateEntry& entry = storyTemplateEntries_[index];
+                    if (field == L"title") entry.title = value;
+                    else if (field == L"category") entry.category = value;
+                    else if (field == L"body") entry.body = value;
                 }
             }
             else if (editingKey_ == L"story_plot_intro") storyPlotIntro_ = value.empty() ? L"起" : value;
@@ -7821,12 +7957,12 @@ void NovelRuntime::UpdateChildControls()
         if (inspectorEdit_) ShowWindow(inspectorEdit_, SW_HIDE);
         if (eventTextEdit_) ShowWindow(eventTextEdit_, SW_HIDE);
     }
-    if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_ || storyWritingVisible_ || storyCharacterVisible_ || storyWorldVisible_) && eventSearchEdit_)
+    if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_ || storyWritingVisible_ || storyCharacterVisible_ || storyWorldVisible_ || storyRelationVisible_ || storyTemplateVisible_ || storyMemoVisible_) && eventSearchEdit_)
     {
         ShowWindow(eventSearchEdit_, SW_HIDE);
     }
 
-    if (eventSearchEdit_ && !projectLauncherVisible_ && !projectDialogVisible_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_ && !storyOverviewVisible_ && !storyThemeVisible_ && !storyPlotVisible_ && !storyTimelineVisible_ && !storyWritingVisible_ && !storyCharacterVisible_ && !storyWorldVisible_)
+    if (eventSearchEdit_ && !projectLauncherVisible_ && !projectDialogVisible_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_ && !storyOverviewVisible_ && !storyThemeVisible_ && !storyPlotVisible_ && !storyTimelineVisible_ && !storyWritingVisible_ && !storyCharacterVisible_ && !storyWorldVisible_ && !storyRelationVisible_ && !storyTemplateVisible_ && !storyMemoVisible_)
     {
         if (leftPanelTab_ == LeftPanelTab::Materials && showComponents_)
         {
@@ -7868,6 +8004,9 @@ void NovelRuntime::UpdateChildControls()
     else if (storyWritingVisible_) activeStoryPanelRect = storyWritingPanelRect_;
     else if (storyCharacterVisible_) activeStoryPanelRect = storyCharacterPanelRect_;
     else if (storyWorldVisible_) activeStoryPanelRect = storyWorldPanelRect_;
+    else if (storyRelationVisible_) activeStoryPanelRect = storyRelationPanelRect_;
+    else if (storyTemplateVisible_) activeStoryPanelRect = storyTemplatePanelRect_;
+    else if (storyMemoVisible_) activeStoryPanelRect = storyMemoPanelRect_;
     auto clampEditRect = [&](RECT rect)
     {
         RECT bounds = HasVisibleArea(activeStoryPanelRect)
@@ -7931,7 +8070,7 @@ void NovelRuntime::UpdateChildControls()
 
     if (eventTextEdit_ && !projectLauncherVisible_ && !projectDialogVisible_ && !sceneDialogVisible_ && !characterManagerVisible_ && !variableManagerVisible_ && !settingsDialogVisible_)
     {
-        if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_ || storyWritingVisible_ || storyCharacterVisible_ || storyWorldVisible_) && inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ != L"story_title" && !StartsWithText(editingKey_, L"story_writing_title.") && HasVisibleArea(inspectorEditRect_))
+        if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_ || storyWritingVisible_ || storyCharacterVisible_ || storyWorldVisible_ || storyRelationVisible_ || storyTemplateVisible_ || storyMemoVisible_) && inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ != L"story_title" && !StartsWithText(editingKey_, L"story_writing_title.") && HasVisibleArea(inspectorEditRect_))
         {
             const bool themeRuledInput = storyThemeVisible_ &&
                 (editingKey_ == L"story_theme" ||
@@ -7970,7 +8109,7 @@ void NovelRuntime::UpdateChildControls()
                 SetFocus(eventTextEdit_);
             }
         }
-        else if (!storyOverviewVisible_ && !storyThemeVisible_ && !storyPlotVisible_ && !storyTimelineVisible_ && !storyWritingVisible_ && !storyCharacterVisible_ && !storyWorldVisible_ && expandedTextCommandIndex_ < scenario_.commands.size() && HasVisibleArea(eventTextEditRect_))
+        else if (!storyOverviewVisible_ && !storyThemeVisible_ && !storyPlotVisible_ && !storyTimelineVisible_ && !storyWritingVisible_ && !storyCharacterVisible_ && !storyWorldVisible_ && !storyRelationVisible_ && !storyTemplateVisible_ && !storyMemoVisible_ && expandedTextCommandIndex_ < scenario_.commands.size() && HasVisibleArea(eventTextEditRect_))
         {
             SetWindowPos(eventTextEdit_, nullptr, eventTextEditRect_.left, eventTextEditRect_.top, eventTextEditRect_.right - eventTextEditRect_.left, eventTextEditRect_.bottom - eventTextEditRect_.top, SWP_NOZORDER | SWP_SHOWWINDOW);
             const std::wstring value = GetCommandParameter(scenario_.commands[expandedTextCommandIndex_], L"value");
@@ -8128,6 +8267,9 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
     storyWritingDrafts_.clear();
     storyWritingDeleteChecks_.clear();
     storyWorldEntries_.clear();
+    storyRelationEntries_.clear();
+    storyTemplateEntries_.clear();
+    storyMemoText_.clear();
     std::wistringstream input(content);
     std::wstring line;
     while (std::getline(input, line))
@@ -8165,6 +8307,7 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
         else if (key == L"story_target_age_gender") storyTargetAgeGender_ = UnescapeSaveValue(value);
         else if (key == L"story_target_taste") storyTargetTaste_ = UnescapeSaveValue(value);
         else if (key == L"story_target_comparable") storyTargetComparable_ = UnescapeSaveValue(value);
+        else if (key == L"story_memo") storyMemoText_ = UnescapeSaveValue(value);
         else if (key == L"story_plot_intro") storyPlotIntro_ = UnescapeSaveValue(value);
         else if (key == L"story_plot_development") storyPlotDevelopment_ = UnescapeSaveValue(value);
         else if (key == L"story_plot_turn") storyPlotTurn_ = UnescapeSaveValue(value);
@@ -8234,6 +8377,37 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
                 else if (field == L"image") entry.imagePath = UnescapeSaveValue(value);
                 else if (field == L"summary") entry.summary = UnescapeSaveValue(value);
                 else if (field == L"detail") entry.detail = UnescapeSaveValue(value);
+            }
+        }
+        else if (StartsWithText(key, L"story_relation_entry."))
+        {
+            const size_t indexStart = wcslen(L"story_relation_entry.");
+            const size_t fieldDot = key.find(L'.', indexStart);
+            if (fieldDot != std::wstring::npos)
+            {
+                const size_t index = static_cast<size_t>(_wtoi(key.substr(indexStart, fieldDot - indexStart).c_str()));
+                const std::wstring field = key.substr(fieldDot + 1);
+                while (storyRelationEntries_.size() <= index) storyRelationEntries_.push_back(StoryRelationEntry{});
+                StoryRelationEntry& entry = storyRelationEntries_[index];
+                if (field == L"source") entry.sourceName = UnescapeSaveValue(value);
+                else if (field == L"target") entry.targetName = UnescapeSaveValue(value);
+                else if (field == L"relation") entry.relation = UnescapeSaveValue(value);
+                else if (field == L"memo") entry.memo = UnescapeSaveValue(value);
+            }
+        }
+        else if (StartsWithText(key, L"story_template_entry."))
+        {
+            const size_t indexStart = wcslen(L"story_template_entry.");
+            const size_t fieldDot = key.find(L'.', indexStart);
+            if (fieldDot != std::wstring::npos)
+            {
+                const size_t index = static_cast<size_t>(_wtoi(key.substr(indexStart, fieldDot - indexStart).c_str()));
+                const std::wstring field = key.substr(fieldDot + 1);
+                while (storyTemplateEntries_.size() <= index) storyTemplateEntries_.push_back(StoryTemplateEntry{});
+                StoryTemplateEntry& entry = storyTemplateEntries_[index];
+                if (field == L"title") entry.title = UnescapeSaveValue(value);
+                else if (field == L"category") entry.category = UnescapeSaveValue(value);
+                else if (field == L"body") entry.body = UnescapeSaveValue(value);
             }
         }
         else if (StartsWithText(key, L"story_category."))
@@ -8408,6 +8582,14 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
     if (!storyWorldEntries_.empty() && selectedStoryWorldIndex_ >= storyWorldEntries_.size())
     {
         selectedStoryWorldIndex_ = 0;
+    }
+    if (!storyRelationEntries_.empty() && selectedStoryRelationIndex_ >= storyRelationEntries_.size())
+    {
+        selectedStoryRelationIndex_ = 0;
+    }
+    if (!storyTemplateEntries_.empty() && selectedStoryTemplateIndex_ >= storyTemplateEntries_.size())
+    {
+        selectedStoryTemplateIndex_ = 0;
     }
 
     SyncVariableDefinitions();
@@ -8653,6 +8835,7 @@ std::wstring NovelRuntime::SerializeProjectSettings() const
     projectText += L"story_target_age_gender=" + EscapeSaveValue(storyTargetAgeGender_) + L"\r\n";
     projectText += L"story_target_taste=" + EscapeSaveValue(storyTargetTaste_) + L"\r\n";
     projectText += L"story_target_comparable=" + EscapeSaveValue(storyTargetComparable_) + L"\r\n";
+    projectText += L"story_memo=" + EscapeSaveValue(storyMemoText_) + L"\r\n";
     projectText += L"story_plot_intro=" + EscapeSaveValue(storyPlotIntro_) + L"\r\n";
     projectText += L"story_plot_development=" + EscapeSaveValue(storyPlotDevelopment_) + L"\r\n";
     projectText += L"story_plot_turn=" + EscapeSaveValue(storyPlotTurn_) + L"\r\n";
@@ -8688,6 +8871,19 @@ std::wstring NovelRuntime::SerializeProjectSettings() const
         projectText += L"story_world_entry." + std::to_wstring(i) + L".image=" + EscapeSaveValue(storyWorldEntries_[i].imagePath) + L"\r\n";
         projectText += L"story_world_entry." + std::to_wstring(i) + L".summary=" + EscapeSaveValue(storyWorldEntries_[i].summary) + L"\r\n";
         projectText += L"story_world_entry." + std::to_wstring(i) + L".detail=" + EscapeSaveValue(storyWorldEntries_[i].detail) + L"\r\n";
+    }
+    for (size_t i = 0; i < storyRelationEntries_.size(); ++i)
+    {
+        projectText += L"story_relation_entry." + std::to_wstring(i) + L".source=" + EscapeSaveValue(storyRelationEntries_[i].sourceName) + L"\r\n";
+        projectText += L"story_relation_entry." + std::to_wstring(i) + L".target=" + EscapeSaveValue(storyRelationEntries_[i].targetName) + L"\r\n";
+        projectText += L"story_relation_entry." + std::to_wstring(i) + L".relation=" + EscapeSaveValue(storyRelationEntries_[i].relation) + L"\r\n";
+        projectText += L"story_relation_entry." + std::to_wstring(i) + L".memo=" + EscapeSaveValue(storyRelationEntries_[i].memo) + L"\r\n";
+    }
+    for (size_t i = 0; i < storyTemplateEntries_.size(); ++i)
+    {
+        projectText += L"story_template_entry." + std::to_wstring(i) + L".title=" + EscapeSaveValue(storyTemplateEntries_[i].title) + L"\r\n";
+        projectText += L"story_template_entry." + std::to_wstring(i) + L".category=" + EscapeSaveValue(storyTemplateEntries_[i].category) + L"\r\n";
+        projectText += L"story_template_entry." + std::to_wstring(i) + L".body=" + EscapeSaveValue(storyTemplateEntries_[i].body) + L"\r\n";
     }
     projectText += L"settings_window_width=" + std::to_wstring(editorSettings_.windowWidth) + L"\r\n";
     projectText += L"settings_window_height=" + std::to_wstring(editorSettings_.windowHeight) + L"\r\n";
@@ -8786,6 +8982,7 @@ std::wstring NovelRuntime::BuildDefaultProjectSettingsText(const std::wstring& s
     text += L"story_target_age_gender=\r\n";
     text += L"story_target_taste=\r\n";
     text += L"story_target_comparable=\r\n";
+    text += L"story_memo=\r\n";
     text += L"story_plot_intro=起\r\n";
     text += L"story_plot_development=承\r\n";
     text += L"story_plot_turn=転\r\n";
@@ -8797,6 +8994,13 @@ std::wstring NovelRuntime::BuildDefaultProjectSettingsText(const std::wstring& s
     text += L"story_world_entry.0.image=\r\n";
     text += L"story_world_entry.0.summary=\r\n";
     text += L"story_world_entry.0.detail=\r\n";
+    text += L"story_relation_entry.0.source=\r\n";
+    text += L"story_relation_entry.0.target=\r\n";
+    text += L"story_relation_entry.0.relation=関係\r\n";
+    text += L"story_relation_entry.0.memo=\r\n";
+    text += L"story_template_entry.0.title=キャラクター用\r\n";
+    text += L"story_template_entry.0.category=登場人物\r\n";
+    text += L"story_template_entry.0.body=【概要】\\n【役割】\\n【見た目】\\n【性格・特徴】\\n【シナリオ上の使いどころ】\\n【関連キャラ】\\n【メモ】\r\n";
     text += L"settings_window_width=1280\r\n";
     text += L"settings_window_height=720\r\n";
     text += L"settings_default_font=" + EscapeSaveValue(editorSettings_.defaultFont) + L"\r\n";
@@ -9978,12 +10182,16 @@ bool NovelRuntime::HandleStoryCharacterClick(POINT point)
     }
     if (PtInRect(&storyCharacterEditRect_, point))
     {
-        storyCharacterEditMode_ = !storyCharacterEditMode_;
-        statusText_ = storyCharacterEditMode_ ? L"登場人物を編集できます" : L"登場人物の表示に戻しました";
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CommitInspectorEdit();
+        }
+        SaveProject();
+        statusText_ = L"登場人物を保存しました";
         return true;
     }
     CharacterDefinition& definition = characterDefinitions_[selectedStoryCharacterIndex_];
-    if (storyCharacterEditMode_ && (PtInRect(&storyCharacterImageBrowseRect_, point) || PtInRect(&storyCharacterImageRect_, point)))
+    if (PtInRect(&storyCharacterImageBrowseRect_, point) || PtInRect(&storyCharacterImageRect_, point))
     {
         WCHAR fileBuffer[MAX_PATH] = {};
         OPENFILENAMEW ofn = {};
@@ -10002,7 +10210,7 @@ bool NovelRuntime::HandleStoryCharacterClick(POINT point)
         }
         return true;
     }
-    if (storyCharacterEditMode_)
+    if (true)
     {
         for (const auto& field : storyCharacterFieldRects_)
         {
@@ -10112,11 +10320,15 @@ bool NovelRuntime::HandleStoryWorldClick(POINT point)
     }
     if (PtInRect(&storyWorldEditRect_, point))
     {
-        storyWorldEditMode_ = !storyWorldEditMode_;
-        statusText_ = storyWorldEditMode_ ? L"世界観を編集できます" : L"世界観の表示に戻しました";
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CommitInspectorEdit();
+        }
+        SaveProject();
+        statusText_ = L"世界観を保存しました";
         return true;
     }
-    if (storyWorldEditMode_)
+    if (true)
     {
         for (const auto& field : storyWorldFieldRects_)
         {
@@ -10134,6 +10346,162 @@ bool NovelRuntime::HandleStoryWorldClick(POINT point)
             BeginInspectorEdit(static_cast<size_t>(-2), L"story_world." + std::to_wstring(selectedStoryWorldIndex_) + L"." + key, L"世界観", value);
             return true;
         }
+    }
+    return true;
+}
+
+bool NovelRuntime::HandleStoryRelationClick(POINT point)
+{
+    if (!PtInRect(&storyRelationPanelRect_, point))
+    {
+        if (HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges()) return true;
+        storyRelationVisible_ = false;
+        storyRelationEditMode_ = false;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2)) CancelInspectorEdit();
+        statusText_ = L"相関関係画面を閉じました";
+        return true;
+    }
+    if (PtInRect(&storyRelationAddRect_, point))
+    {
+        storyRelationEntries_.push_back(StoryRelationEntry{ L"", L"", L"関係", L"" });
+        selectedStoryRelationIndex_ = storyRelationEntries_.size() - 1;
+        storyRelationEditMode_ = true;
+        SyncDocumentMetadata();
+        return true;
+    }
+    for (size_t i = 0; i < storyRelationListItemRects_.size() && i < storyRelationEntries_.size(); ++i)
+    {
+        if (PtInRect(&storyRelationListItemRects_[i], point))
+        {
+            selectedStoryRelationIndex_ = i;
+            storyRelationDetailScrollOffset_ = 0;
+            return true;
+        }
+    }
+    if (selectedStoryRelationIndex_ >= storyRelationEntries_.size()) return true;
+    if (PtInRect(&storyRelationCloseRect_, point))
+    {
+        storyRelationVisible_ = false;
+        storyRelationEditMode_ = false;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2)) CancelInspectorEdit();
+        return true;
+    }
+    if (PtInRect(&storyRelationEditRect_, point))
+    {
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CommitInspectorEdit();
+        }
+        SaveProject();
+        statusText_ = L"相関関係を保存しました";
+        return true;
+    }
+    if (true)
+    {
+        StoryRelationEntry& entry = storyRelationEntries_[selectedStoryRelationIndex_];
+        for (const auto& field : storyRelationFieldRects_)
+        {
+            if (!PtInRect(&field.second, point)) continue;
+            std::wstring value;
+            if (field.first == L"source") value = entry.sourceName;
+            else if (field.first == L"target") value = entry.targetName;
+            else if (field.first == L"relation") value = entry.relation;
+            else if (field.first == L"memo") value = entry.memo;
+            BeginInspectorEdit(static_cast<size_t>(-2), L"story_relation." + std::to_wstring(selectedStoryRelationIndex_) + L"." + field.first, L"相関関係", value);
+            return true;
+        }
+    }
+    return true;
+}
+
+bool NovelRuntime::HandleStoryTemplateClick(POINT point)
+{
+    if (!PtInRect(&storyTemplatePanelRect_, point))
+    {
+        if (HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges()) return true;
+        storyTemplateVisible_ = false;
+        storyTemplateEditMode_ = false;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2)) CancelInspectorEdit();
+        statusText_ = L"資料テンプレート画面を閉じました";
+        return true;
+    }
+    if (PtInRect(&storyTemplateAddRect_, point))
+    {
+        storyTemplateEntries_.push_back(StoryTemplateEntry{ L"新しいテンプレート", L"資料", L"【概要】\r\n【設定】\r\n【シナリオ上の使いどころ】\r\n【メモ】" });
+        selectedStoryTemplateIndex_ = storyTemplateEntries_.size() - 1;
+        storyTemplateEditMode_ = true;
+        SyncDocumentMetadata();
+        return true;
+    }
+    for (size_t i = 0; i < storyTemplateListItemRects_.size() && i < storyTemplateEntries_.size(); ++i)
+    {
+        if (PtInRect(&storyTemplateListItemRects_[i], point))
+        {
+            selectedStoryTemplateIndex_ = i;
+            storyTemplateDetailScrollOffset_ = 0;
+            return true;
+        }
+    }
+    if (selectedStoryTemplateIndex_ >= storyTemplateEntries_.size()) return true;
+    if (PtInRect(&storyTemplateCloseRect_, point))
+    {
+        storyTemplateVisible_ = false;
+        storyTemplateEditMode_ = false;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2)) CancelInspectorEdit();
+        return true;
+    }
+    if (PtInRect(&storyTemplateEditRect_, point))
+    {
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2))
+        {
+            CommitInspectorEdit();
+        }
+        SaveProject();
+        statusText_ = L"資料テンプレートを保存しました";
+        return true;
+    }
+    if (true)
+    {
+        StoryTemplateEntry& entry = storyTemplateEntries_[selectedStoryTemplateIndex_];
+        for (const auto& field : storyTemplateFieldRects_)
+        {
+            if (!PtInRect(&field.second, point)) continue;
+            std::wstring value;
+            if (field.first == L"title") value = entry.title;
+            else if (field.first == L"category") value = entry.category;
+            else if (field.first == L"body") value = entry.body;
+            BeginInspectorEdit(static_cast<size_t>(-2), L"story_template." + std::to_wstring(selectedStoryTemplateIndex_) + L"." + field.first, L"資料テンプレート", value);
+            return true;
+        }
+    }
+    return true;
+}
+
+bool NovelRuntime::HandleStoryMemoClick(POINT point)
+{
+    if (!PtInRect(&storyMemoPanelRect_, point))
+    {
+        if (HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges()) return true;
+        storyMemoVisible_ = false;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2)) CancelInspectorEdit();
+        return true;
+    }
+    if (PtInRect(&storyMemoSaveRect_, point))
+    {
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2)) CommitInspectorEdit();
+        SaveProject();
+        return true;
+    }
+    if (PtInRect(&storyMemoCloseRect_, point))
+    {
+        storyMemoVisible_ = false;
+        if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2)) CancelInspectorEdit();
+        return true;
+    }
+    if (PtInRect(&storyMemoBodyRect_, point))
+    {
+        BeginInspectorEdit(static_cast<size_t>(-2), L"story_memo", L"メモ", storyMemoText_);
+        return true;
     }
     return true;
 }
@@ -10364,8 +10732,8 @@ std::wstring NovelRuntime::GetHoverHelpText(POINT point) const
                 {
                     L"登場人物資料を開きます。既存キャラクター管理はここへ移行予定です。",
                     L"世界観資料を開きます。設定や用語をまとめる場所です。",
-                    L"相関関係を開きます。人物や組織のつながりを扱う予定です。",
-                    L"資料テンプレートを開きます。資料作成の雛形を管理する予定です。",
+                    L"相関関係を開きます。人物同士の関係とメモを管理できます。",
+                    L"資料テンプレートを開きます。資料作成の雛形を管理できます。",
                 };
                 return help[(std::min)(i, static_cast<size_t>(3))];
             }
@@ -11741,10 +12109,10 @@ void NovelRuntime::RefreshPreviewIfActive()
 {
     if (previewVisible_ || showPreviewPanel_)
     {
-        StartPreviewFromSelection();
+        RefreshPreviewWindow();
         if (hostWindow_)
         {
-            InvalidateRect(hostWindow_, nullptr, TRUE);
+            InvalidateRect(hostWindow_, nullptr, FALSE);
         }
     }
 }
@@ -12912,7 +13280,22 @@ bool NovelRuntime::HandleSceneClick(POINT point)
         }
         if (PtInRect(&storyMemoRect_, point))
         {
-            statusText_ = L"メモ画面はこれから実装します";
+            if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_ || storyWritingVisible_ || storyCharacterVisible_ || storyWorldVisible_ || storyRelationVisible_ || storyTemplateVisible_) && HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges())
+            {
+                return true;
+            }
+            storyMemoVisible_ = true;
+            storyOverviewVisible_ = false;
+            storyThemeVisible_ = false;
+            storyPlotVisible_ = false;
+            storyTimelineVisible_ = false;
+            storyWritingVisible_ = false;
+            storyCharacterVisible_ = false;
+            storyWorldVisible_ = false;
+            storyRelationVisible_ = false;
+            storyTemplateVisible_ = false;
+            storyPanelStatusDropdownVisible_ = false;
+            statusText_ = L"メモ画面を開きました";
             return true;
         }
         if (PtInRect(&storyAddMaterialTypeRect_, point))
@@ -13014,6 +13397,52 @@ bool NovelRuntime::HandleSceneClick(POINT point)
                     storyCharacterVisible_ = false;
                     storyPanelStatusDropdownVisible_ = false;
                     statusText_ = L"世界観画面を開きました";
+                    return true;
+                }
+                if (i == 2)
+                {
+                    if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_ || storyWritingVisible_ || storyCharacterVisible_ || storyWorldVisible_ || storyMemoVisible_ || storyTemplateVisible_) && HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges())
+                    {
+                        return true;
+                    }
+                    if (storyRelationEntries_.empty()) storyRelationEntries_.push_back(StoryRelationEntry{ L"", L"", L"関係", L"" });
+                    if (selectedStoryRelationIndex_ >= storyRelationEntries_.size()) selectedStoryRelationIndex_ = 0;
+                    storyRelationVisible_ = true;
+                    storyRelationEditMode_ = false;
+                    storyOverviewVisible_ = false;
+                    storyThemeVisible_ = false;
+                    storyPlotVisible_ = false;
+                    storyTimelineVisible_ = false;
+                    storyWritingVisible_ = false;
+                    storyCharacterVisible_ = false;
+                    storyWorldVisible_ = false;
+                    storyTemplateVisible_ = false;
+                    storyMemoVisible_ = false;
+                    storyPanelStatusDropdownVisible_ = false;
+                    statusText_ = L"相関関係画面を開きました";
+                    return true;
+                }
+                if (i == 3)
+                {
+                    if ((storyOverviewVisible_ || storyThemeVisible_ || storyPlotVisible_ || storyTimelineVisible_ || storyWritingVisible_ || storyCharacterVisible_ || storyWorldVisible_ || storyRelationVisible_ || storyMemoVisible_) && HasUnsavedChanges() && !ConfirmDiscardUnsavedChanges())
+                    {
+                        return true;
+                    }
+                    if (storyTemplateEntries_.empty()) storyTemplateEntries_.push_back(StoryTemplateEntry{ L"キャラクター用", L"登場人物", L"【概要】\r\n【役割】\r\n【見た目】\r\n【性格・特徴】\r\n【シナリオ上の使いどころ】\r\n【関連キャラ】\r\n【メモ】" });
+                    if (selectedStoryTemplateIndex_ >= storyTemplateEntries_.size()) selectedStoryTemplateIndex_ = 0;
+                    storyTemplateVisible_ = true;
+                    storyTemplateEditMode_ = false;
+                    storyOverviewVisible_ = false;
+                    storyThemeVisible_ = false;
+                    storyPlotVisible_ = false;
+                    storyTimelineVisible_ = false;
+                    storyWritingVisible_ = false;
+                    storyCharacterVisible_ = false;
+                    storyWorldVisible_ = false;
+                    storyRelationVisible_ = false;
+                    storyMemoVisible_ = false;
+                    storyPanelStatusDropdownVisible_ = false;
+                    statusText_ = L"資料テンプレート画面を開きました";
                     return true;
                 }
                 statusText_ = std::wstring(labels[(std::min)(i, static_cast<size_t>(3))]) + L" を開きます";
@@ -13212,6 +13641,7 @@ bool NovelRuntime::HandleViewMenuCommand(UINT commandId)
         else
         {
             flowGraphScrollOffset_ = 0;
+            flowGraphOffsetY_ = 0;
             showFlowGraph_ = EnsureFlowGraphWindow();
             statusText_ = showFlowGraph_ ? L"\u30d5\u30ed\u30fc\u30b0\u30e9\u30d5\u3092\u5225\u30a6\u30a3\u30f3\u30c9\u30a6\u3067\u8868\u793a" : L"\u30d5\u30ed\u30fc\u30b0\u30e9\u30d5\u30a6\u30a3\u30f3\u30c9\u30a6\u3092\u958b\u3051\u307e\u305b\u3093\u3067\u3057\u305f";
         }
@@ -13875,18 +14305,7 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
         DrawImageFit(graphics, backgroundImage_.get(), backgroundDrawRect, &attributes);
     }
 
-    HBRUSH shadeBrush = CreateSolidBrush(RGB(0, 0, 0));
-    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 45, 0 };
-    HDC memoryDc = CreateCompatibleDC(hdc);
-    HBITMAP overlayBitmap = CreateCompatibleBitmap(hdc, stageRect.right - stageRect.left, stageRect.bottom - stageRect.top);
-    HGDIOBJ originalBitmap = SelectObject(memoryDc, overlayBitmap);
-    RECT overlayRect = { 0, 0, stageRect.right - stageRect.left, stageRect.bottom - stageRect.top };
-    FillRect(memoryDc, &overlayRect, shadeBrush);
-    AlphaBlend(hdc, stageRect.left, stageRect.top, stageRect.right - stageRect.left, stageRect.bottom - stageRect.top, memoryDc, 0, 0, stageRect.right - stageRect.left, stageRect.bottom - stageRect.top, blend);
-    SelectObject(memoryDc, originalBitmap);
-    DeleteObject(overlayBitmap);
-    DeleteDC(memoryDc);
-    DeleteObject(shadeBrush);
+    DrawAlphaOverlay(hdc, stageRect, RGB(0, 0, 0), 45);
 
     const int stageWidth = stageRect.right - stageRect.left;
     if (fadeTarget_ == L"background" && fadeEndTick_ != 0 && fadeEndTick_ > fadeStartTick_)
@@ -13909,18 +14328,7 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
         }
         else
         {
-            HBRUSH messageBrush = CreateSolidBrush(messageWindowColor_);
-            HDC messageDc = CreateCompatibleDC(hdc);
-            HBITMAP messageBitmap = CreateCompatibleBitmap(hdc, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top);
-            HGDIOBJ originalMessageBitmap = SelectObject(messageDc, messageBitmap);
-            RECT localMessageRect = { 0, 0, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top };
-            FillRect(messageDc, &localMessageRect, messageBrush);
-            BLENDFUNCTION messageBlend = { AC_SRC_OVER, 0, static_cast<BYTE>(messageWindowOpacity_), 0 };
-            AlphaBlend(hdc, messageRect.left, messageRect.top, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top, messageDc, 0, 0, messageRect.right - messageRect.left, messageRect.bottom - messageRect.top, messageBlend);
-            SelectObject(messageDc, originalMessageBitmap);
-            DeleteObject(messageBitmap);
-            DeleteDC(messageDc);
-            DeleteObject(messageBrush);
+            DrawAlphaOverlay(hdc, messageRect, messageWindowColor_, messageWindowOpacity_);
             HBRUSH borderBrush = CreateSolidBrush(messageWindowBorderColor_);
             FrameRect(hdc, &messageRect, borderBrush);
             DeleteObject(borderBrush);
@@ -13956,20 +14364,7 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
             }
             else
             {
-                HDC nameDc = CreateCompatibleDC(hdc);
-                HBITMAP nameBitmap = CreateCompatibleBitmap(hdc, namePaintRect.right - namePaintRect.left, namePaintRect.bottom - namePaintRect.top);
-                HBITMAP originalNameBitmap = static_cast<HBITMAP>(SelectObject(nameDc, nameBitmap));
-                RECT localNameRect = { 0, 0, namePaintRect.right - namePaintRect.left, namePaintRect.bottom - namePaintRect.top };
-                HBRUSH nameBrush = CreateSolidBrush(nameWindowColor_);
-                FillRect(nameDc, &localNameRect, nameBrush);
-                BLENDFUNCTION nameBlend = { AC_SRC_OVER, 0, static_cast<BYTE>(nameWindowOpacity_), 0 };
-                AlphaBlend(hdc, namePaintRect.left, namePaintRect.top, namePaintRect.right - namePaintRect.left, namePaintRect.bottom - namePaintRect.top,
-                    nameDc, 0, 0, localNameRect.right, localNameRect.bottom, nameBlend);
-                SelectObject(nameDc, originalNameBitmap);
-                DeleteObject(nameBitmap);
-                DeleteDC(nameDc);
-                DeleteObject(nameBrush);
-
+                DrawAlphaOverlay(hdc, namePaintRect, nameWindowColor_, nameWindowOpacity_);
                 HBRUSH nameBorderBrush = CreateSolidBrush(nameWindowBorderColor_);
                 FrameRect(hdc, &namePaintRect, nameBorderBrush);
                 DeleteObject(nameBorderBrush);
@@ -14736,10 +15131,10 @@ void NovelRuntime::DrawStoryOverviewPanel(HDC hdc, const RECT& clientRect)
     FrameRect(hdc, &storyImageDropRect_, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
     if (!storyImagePath_.empty())
     {
-        auto image = TryLoadImage(CombinePath(GetAssetsRootDirectory(), storyImagePath_));
+        std::shared_ptr<Gdiplus::Image> image = GetCachedImage(CombinePath(GetAssetsRootDirectory(), storyImagePath_));
         if (!image)
         {
-            image = TryLoadImage(storyImagePath_);
+            image = GetCachedImage(storyImagePath_);
         }
         if (image)
         {
@@ -15747,12 +16142,12 @@ void NovelRuntime::DrawStoryCharacterPanel(HDC hdc, const RECT& clientRect)
     CharacterDefinition& definition = characterDefinitions_[selectedStoryCharacterIndex_];
     storyCharacterEditRect_ = { storyCharacterDetailRect_.right - 182, storyCharacterDetailRect_.top + 16, storyCharacterDetailRect_.right - 98, storyCharacterDetailRect_.top + 48 };
     storyCharacterCloseRect_ = { storyCharacterEditRect_.right + 10, storyCharacterEditRect_.top, storyCharacterEditRect_.right + 74, storyCharacterEditRect_.bottom };
-    HBRUSH editBrush = CreateSolidBrush(storyCharacterEditMode_ ? RGB(64, 126, 86) : RGB(72, 118, 178));
+    HBRUSH editBrush = CreateSolidBrush(RGB(64, 126, 86));
     FillRect(hdc, &storyCharacterEditRect_, editBrush);
     DeleteObject(editBrush);
     FrameRect(hdc, &storyCharacterEditRect_, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
     SetTextColor(hdc, RGB(248, 250, 252));
-    DrawWrappedText(hdc, storyCharacterEditRect_, storyCharacterEditMode_ ? L"表示" : L"編集する", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawWrappedText(hdc, storyCharacterEditRect_, L"保存", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     HBRUSH closeBrush = CreateSolidBrush(RGB(76, 82, 92));
     FillRect(hdc, &storyCharacterCloseRect_, closeBrush);
     DeleteObject(closeBrush);
@@ -15766,7 +16161,7 @@ void NovelRuntime::DrawStoryCharacterPanel(HDC hdc, const RECT& clientRect)
     IntersectClipRect(hdc, detailViewport.left, detailViewport.top, detailViewport.right, detailViewport.bottom);
 
     auto valueOrDash = [](const std::wstring& value) { return value.empty() ? L"-" : value; };
-    if (!storyCharacterEditMode_)
+    if (false)
     {
         storyCharacterImageRect_ = { detailViewport.left, y, detailViewport.left + 230, y + 230 };
         HBRUSH imageBrush = CreateSolidBrush(RGB(22, 28, 36));
@@ -16002,12 +16397,12 @@ void NovelRuntime::DrawStoryWorldPanel(HDC hdc, const RECT& clientRect)
     StoryWorldEntry& entry = storyWorldEntries_[selectedStoryWorldIndex_];
     storyWorldEditRect_ = { storyWorldDetailRect_.right - 182, storyWorldDetailRect_.top + 16, storyWorldDetailRect_.right - 98, storyWorldDetailRect_.top + 48 };
     storyWorldCloseRect_ = { storyWorldEditRect_.right + 10, storyWorldEditRect_.top, storyWorldEditRect_.right + 74, storyWorldEditRect_.bottom };
-    HBRUSH editBrush = CreateSolidBrush(storyWorldEditMode_ ? RGB(64, 126, 86) : RGB(72, 118, 178));
+    HBRUSH editBrush = CreateSolidBrush(RGB(64, 126, 86));
     FillRect(hdc, &storyWorldEditRect_, editBrush);
     DeleteObject(editBrush);
     FrameRect(hdc, &storyWorldEditRect_, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
     SetTextColor(hdc, RGB(248, 250, 252));
-    DrawWrappedText(hdc, storyWorldEditRect_, storyWorldEditMode_ ? L"表示" : L"編集する", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawWrappedText(hdc, storyWorldEditRect_, L"保存", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     HBRUSH closeBrush = CreateSolidBrush(RGB(76, 82, 92));
     FillRect(hdc, &storyWorldCloseRect_, closeBrush);
     DeleteObject(closeBrush);
@@ -16033,7 +16428,7 @@ void NovelRuntime::DrawStoryWorldPanel(HDC hdc, const RECT& clientRect)
         SelectObject(hdc, bodyFont);
         SetTextColor(hdc, value.empty() ? RGB(138, 148, 162) : RGB(232, 238, 244));
         DrawWrappedText(hdc, RECT{ rect.left + 14, rect.top + 8, rect.right - 14, rect.bottom - 8 }, value.empty() ? label + L"を入力" : value, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
-        if (storyWorldEditMode_)
+        if (true)
         {
             storyWorldFieldRects_.push_back({ key, rect });
             if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == L"story_world." + std::to_wstring(selectedStoryWorldIndex_) + L"." + key)
@@ -16116,6 +16511,239 @@ void NovelRuntime::DrawStoryWorldPanel(HDC hdc, const RECT& clientRect)
     DeleteObject(smallFont);
 }
 
+void NovelRuntime::DrawStoryRelationPanel(HDC hdc, const RECT& clientRect)
+{
+    storyRelationListItemRects_.clear();
+    storyRelationFieldRects_.clear();
+    storyRelationPanelRect_ = { clientRect.left + 34, clientRect.top + 34, clientRect.right - 34, clientRect.bottom - 44 };
+    HBRUSH panelBrush = CreateSolidBrush(RGB(12, 16, 22));
+    FillRect(hdc, &storyRelationPanelRect_, panelBrush);
+    DeleteObject(panelBrush);
+    FrameRect(hdc, &storyRelationPanelRect_, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+    if (storyRelationEntries_.empty()) storyRelationEntries_.push_back(StoryRelationEntry{ L"", L"", L"関係", L"" });
+    if (selectedStoryRelationIndex_ >= storyRelationEntries_.size()) selectedStoryRelationIndex_ = 0;
+
+    HFONT titleFont = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT bodyFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, bodyFont));
+    SetBkMode(hdc, TRANSPARENT);
+
+    storyRelationListRect_ = { storyRelationPanelRect_.left, storyRelationPanelRect_.top, storyRelationPanelRect_.left + 300, storyRelationPanelRect_.bottom };
+    storyRelationDetailRect_ = { storyRelationListRect_.right, storyRelationPanelRect_.top, storyRelationPanelRect_.right, storyRelationPanelRect_.bottom };
+    HBRUSH listBrush = CreateSolidBrush(RGB(16, 21, 28));
+    FillRect(hdc, &storyRelationListRect_, listBrush);
+    DeleteObject(listBrush);
+    SelectObject(hdc, titleFont);
+    SetTextColor(hdc, RGB(238, 242, 248));
+    DrawWrappedText(hdc, RECT{ storyRelationListRect_.left + 18, storyRelationListRect_.top + 14, storyRelationListRect_.right - 18, storyRelationListRect_.top + 42 }, L"すべての相関関係", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+
+    const int footerHeight = 52;
+    RECT listViewport = { storyRelationListRect_.left, storyRelationListRect_.top + 48, storyRelationListRect_.right, storyRelationListRect_.bottom - footerHeight };
+    const int rowHeight = 72;
+    storyRelationListScrollMax_ = (std::max)(0, static_cast<int>(storyRelationEntries_.size()) * rowHeight + 8 - static_cast<int>(listViewport.bottom - listViewport.top));
+    storyRelationListScrollOffset_ = (std::max)(0, (std::min)(storyRelationListScrollOffset_, storyRelationListScrollMax_));
+    int rowY = listViewport.top + 4 - storyRelationListScrollOffset_;
+    for (size_t i = 0; i < storyRelationEntries_.size(); ++i)
+    {
+        RECT row = { storyRelationListRect_.left, rowY, storyRelationListRect_.right, rowY + rowHeight };
+        storyRelationListItemRects_.push_back(row);
+        if (row.bottom >= listViewport.top && row.top <= listViewport.bottom)
+        {
+            HBRUSH rowBrush = CreateSolidBrush(i == selectedStoryRelationIndex_ ? RGB(30, 38, 48) : RGB(16, 21, 28));
+            FillRect(hdc, &row, rowBrush);
+            DeleteObject(rowBrush);
+            const StoryRelationEntry& entry = storyRelationEntries_[i];
+            const std::wstring title = (entry.sourceName.empty() ? L"未設定" : entry.sourceName) + L" -> " + (entry.targetName.empty() ? L"未設定" : entry.targetName);
+            SelectObject(hdc, bodyFont);
+            SetTextColor(hdc, RGB(232, 238, 244));
+            DrawWrappedText(hdc, RECT{ row.left + 18, row.top + 10, row.right - 18, row.top + 36 }, title, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
+            SetTextColor(hdc, RGB(150, 160, 174));
+            DrawWrappedText(hdc, RECT{ row.left + 18, row.top + 38, row.right - 18, row.bottom - 8 }, entry.relation.empty() ? L"関係" : entry.relation, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
+        }
+        rowY += rowHeight;
+    }
+    storyRelationAddRect_ = { storyRelationListRect_.left + 16, storyRelationListRect_.bottom - 40, storyRelationListRect_.right - 16, storyRelationListRect_.bottom - 12 };
+    HBRUSH addBrush = CreateSolidBrush(RGB(72, 118, 178));
+    FillRect(hdc, &storyRelationAddRect_, addBrush);
+    DeleteObject(addBrush);
+    SetTextColor(hdc, RGB(248, 250, 252));
+    DrawWrappedText(hdc, storyRelationAddRect_, L"+ 新規作成する", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    StoryRelationEntry& selected = storyRelationEntries_[selectedStoryRelationIndex_];
+    storyRelationEditRect_ = { storyRelationDetailRect_.right - 182, storyRelationDetailRect_.top + 16, storyRelationDetailRect_.right - 98, storyRelationDetailRect_.top + 48 };
+    storyRelationCloseRect_ = { storyRelationEditRect_.right + 10, storyRelationEditRect_.top, storyRelationEditRect_.right + 74, storyRelationEditRect_.bottom };
+    HBRUSH editBrush = CreateSolidBrush(RGB(64, 126, 86));
+    FillRect(hdc, &storyRelationEditRect_, editBrush);
+    DeleteObject(editBrush);
+    HBRUSH closeBrush = CreateSolidBrush(RGB(76, 82, 92));
+    FillRect(hdc, &storyRelationCloseRect_, closeBrush);
+    DeleteObject(closeBrush);
+    SetTextColor(hdc, RGB(248, 250, 252));
+    DrawWrappedText(hdc, storyRelationEditRect_, L"保存", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawWrappedText(hdc, storyRelationCloseRect_, L"閉じる", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    RECT viewport = { storyRelationDetailRect_.left + 30, storyRelationDetailRect_.top + 70, storyRelationDetailRect_.right - 30, storyRelationDetailRect_.bottom - 24 };
+    int y = viewport.top - storyRelationDetailScrollOffset_;
+    auto drawField = [&](const std::wstring& label, const std::wstring& key, const std::wstring& value, int height)
+    {
+        SetTextColor(hdc, RGB(150, 160, 174));
+        DrawWrappedText(hdc, RECT{ viewport.left, y, viewport.right, y + 22 }, label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        y += 24;
+        RECT rect = { viewport.left, y, viewport.right, y + height };
+        HBRUSH boxBrush = CreateSolidBrush(RGB(22, 28, 36));
+        FillRect(hdc, &rect, boxBrush);
+        DeleteObject(boxBrush);
+        SetTextColor(hdc, value.empty() ? RGB(138, 148, 162) : RGB(232, 238, 244));
+        DrawWrappedText(hdc, RECT{ rect.left + 14, rect.top + 8, rect.right - 14, rect.bottom - 8 }, value.empty() ? label + L"を入力" : value, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+        if (true)
+        {
+            storyRelationFieldRects_.push_back({ key, rect });
+            if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == L"story_relation." + std::to_wstring(selectedStoryRelationIndex_) + L"." + key) inspectorEditRect_ = rect;
+        }
+        y = rect.bottom + 18;
+    };
+    drawField(L"人物A", L"source", selected.sourceName, 42);
+    drawField(L"関係", L"relation", selected.relation, 42);
+    drawField(L"人物B", L"target", selected.targetName, 42);
+    drawField(L"メモ", L"memo", selected.memo, 150);
+    storyRelationDetailScrollMax_ = (std::max)(0, y - static_cast<int>(viewport.bottom - viewport.top) - static_cast<int>(viewport.top));
+    SelectObject(hdc, oldFont);
+    DeleteObject(titleFont);
+    DeleteObject(bodyFont);
+}
+
+void NovelRuntime::DrawStoryTemplatePanel(HDC hdc, const RECT& clientRect)
+{
+    storyTemplateListItemRects_.clear();
+    storyTemplateFieldRects_.clear();
+    storyTemplatePanelRect_ = { clientRect.left + 34, clientRect.top + 34, clientRect.right - 34, clientRect.bottom - 44 };
+    HBRUSH panelBrush = CreateSolidBrush(RGB(12, 16, 22));
+    FillRect(hdc, &storyTemplatePanelRect_, panelBrush);
+    DeleteObject(panelBrush);
+    FrameRect(hdc, &storyTemplatePanelRect_, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+    if (storyTemplateEntries_.empty()) storyTemplateEntries_.push_back(StoryTemplateEntry{ L"キャラクター用", L"登場人物", L"【概要】\r\n【役割】\r\n【見た目】\r\n【性格・特徴】\r\n【シナリオ上の使いどころ】\r\n【関連キャラ】\r\n【メモ】" });
+    if (selectedStoryTemplateIndex_ >= storyTemplateEntries_.size()) selectedStoryTemplateIndex_ = 0;
+
+    HFONT titleFont = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT bodyFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, bodyFont));
+    SetBkMode(hdc, TRANSPARENT);
+
+    storyTemplateListRect_ = { storyTemplatePanelRect_.left, storyTemplatePanelRect_.top, storyTemplatePanelRect_.left + 300, storyTemplatePanelRect_.bottom };
+    storyTemplateDetailRect_ = { storyTemplateListRect_.right, storyTemplatePanelRect_.top, storyTemplatePanelRect_.right, storyTemplatePanelRect_.bottom };
+    HBRUSH listBrush = CreateSolidBrush(RGB(16, 21, 28));
+    FillRect(hdc, &storyTemplateListRect_, listBrush);
+    DeleteObject(listBrush);
+    SelectObject(hdc, titleFont);
+    SetTextColor(hdc, RGB(238, 242, 248));
+    DrawWrappedText(hdc, RECT{ storyTemplateListRect_.left + 18, storyTemplateListRect_.top + 14, storyTemplateListRect_.right - 18, storyTemplateListRect_.top + 42 }, L"資料テンプレート", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    RECT listViewport = { storyTemplateListRect_.left, storyTemplateListRect_.top + 48, storyTemplateListRect_.right, storyTemplateListRect_.bottom - 52 };
+    const int rowHeight = 72;
+    int rowY = listViewport.top + 4 - storyTemplateListScrollOffset_;
+    for (size_t i = 0; i < storyTemplateEntries_.size(); ++i)
+    {
+        RECT row = { storyTemplateListRect_.left, rowY, storyTemplateListRect_.right, rowY + rowHeight };
+        storyTemplateListItemRects_.push_back(row);
+        if (row.bottom >= listViewport.top && row.top <= listViewport.bottom)
+        {
+            HBRUSH rowBrush = CreateSolidBrush(i == selectedStoryTemplateIndex_ ? RGB(30, 38, 48) : RGB(16, 21, 28));
+            FillRect(hdc, &row, rowBrush);
+            DeleteObject(rowBrush);
+            SetTextColor(hdc, RGB(232, 238, 244));
+            DrawWrappedText(hdc, RECT{ row.left + 18, row.top + 10, row.right - 18, row.top + 36 }, storyTemplateEntries_[i].title.empty() ? L"新しいテンプレート" : storyTemplateEntries_[i].title, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
+            SetTextColor(hdc, RGB(150, 160, 174));
+            DrawWrappedText(hdc, RECT{ row.left + 18, row.top + 38, row.right - 18, row.bottom - 8 }, storyTemplateEntries_[i].category.empty() ? L"資料" : storyTemplateEntries_[i].category, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER);
+        }
+        rowY += rowHeight;
+    }
+    storyTemplateListScrollMax_ = (std::max)(0, static_cast<int>(storyTemplateEntries_.size()) * rowHeight + 8 - static_cast<int>(listViewport.bottom - listViewport.top));
+    storyTemplateAddRect_ = { storyTemplateListRect_.left + 16, storyTemplateListRect_.bottom - 40, storyTemplateListRect_.right - 16, storyTemplateListRect_.bottom - 12 };
+    HBRUSH addBrush = CreateSolidBrush(RGB(72, 118, 178));
+    FillRect(hdc, &storyTemplateAddRect_, addBrush);
+    DeleteObject(addBrush);
+    SetTextColor(hdc, RGB(248, 250, 252));
+    DrawWrappedText(hdc, storyTemplateAddRect_, L"+ 新規作成する", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    StoryTemplateEntry& selected = storyTemplateEntries_[selectedStoryTemplateIndex_];
+    storyTemplateEditRect_ = { storyTemplateDetailRect_.right - 182, storyTemplateDetailRect_.top + 16, storyTemplateDetailRect_.right - 98, storyTemplateDetailRect_.top + 48 };
+    storyTemplateCloseRect_ = { storyTemplateEditRect_.right + 10, storyTemplateEditRect_.top, storyTemplateEditRect_.right + 74, storyTemplateEditRect_.bottom };
+    HBRUSH editBrush = CreateSolidBrush(RGB(64, 126, 86));
+    FillRect(hdc, &storyTemplateEditRect_, editBrush);
+    DeleteObject(editBrush);
+    HBRUSH closeBrush = CreateSolidBrush(RGB(76, 82, 92));
+    FillRect(hdc, &storyTemplateCloseRect_, closeBrush);
+    DeleteObject(closeBrush);
+    DrawWrappedText(hdc, storyTemplateEditRect_, L"保存", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawWrappedText(hdc, storyTemplateCloseRect_, L"閉じる", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+
+    RECT viewport = { storyTemplateDetailRect_.left + 30, storyTemplateDetailRect_.top + 70, storyTemplateDetailRect_.right - 30, storyTemplateDetailRect_.bottom - 24 };
+    int y = viewport.top - storyTemplateDetailScrollOffset_;
+    auto drawField = [&](const std::wstring& label, const std::wstring& key, const std::wstring& value, int height)
+    {
+        SetTextColor(hdc, RGB(150, 160, 174));
+        DrawWrappedText(hdc, RECT{ viewport.left, y, viewport.right, y + 22 }, label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+        y += 24;
+        RECT rect = { viewport.left, y, viewport.right, y + height };
+        HBRUSH boxBrush = CreateSolidBrush(RGB(22, 28, 36));
+        FillRect(hdc, &rect, boxBrush);
+        DeleteObject(boxBrush);
+        SetTextColor(hdc, value.empty() ? RGB(138, 148, 162) : RGB(232, 238, 244));
+        DrawWrappedText(hdc, RECT{ rect.left + 14, rect.top + 8, rect.right - 14, rect.bottom - 8 }, value.empty() ? label + L"を入力" : value, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
+        if (true)
+        {
+            storyTemplateFieldRects_.push_back({ key, rect });
+            if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == L"story_template." + std::to_wstring(selectedStoryTemplateIndex_) + L"." + key) inspectorEditRect_ = rect;
+        }
+        y = rect.bottom + 18;
+    };
+    drawField(L"テンプレート名", L"title", selected.title, 42);
+    drawField(L"カテゴリ", L"category", selected.category, 42);
+    drawField(L"本文", L"body", selected.body, 260);
+    storyTemplateDetailScrollMax_ = (std::max)(0, y - static_cast<int>(viewport.bottom - viewport.top) - static_cast<int>(viewport.top));
+    SelectObject(hdc, oldFont);
+    DeleteObject(titleFont);
+    DeleteObject(bodyFont);
+}
+
+void NovelRuntime::DrawStoryMemoPanel(HDC hdc, const RECT& clientRect)
+{
+    storyMemoPanelRect_ = { clientRect.left + 34, clientRect.top + 34, clientRect.right - 34, clientRect.bottom - 44 };
+    HBRUSH panelBrush = CreateSolidBrush(RGB(12, 16, 22));
+    FillRect(hdc, &storyMemoPanelRect_, panelBrush);
+    DeleteObject(panelBrush);
+    FrameRect(hdc, &storyMemoPanelRect_, static_cast<HBRUSH>(GetStockObject(DKGRAY_BRUSH)));
+    SetBkMode(hdc, TRANSPARENT);
+    HFONT titleFont = CreateFontW(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT bodyFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, bodyFont));
+    storyMemoSaveRect_ = { storyMemoPanelRect_.right - 178, storyMemoPanelRect_.top + 22, storyMemoPanelRect_.right - 98, storyMemoPanelRect_.top + 52 };
+    storyMemoCloseRect_ = { storyMemoSaveRect_.right + 10, storyMemoSaveRect_.top, storyMemoSaveRect_.right + 74, storyMemoSaveRect_.bottom };
+    SelectObject(hdc, titleFont);
+    SetTextColor(hdc, RGB(238, 242, 248));
+    DrawWrappedText(hdc, RECT{ storyMemoPanelRect_.left + 34, storyMemoPanelRect_.top + 22, storyMemoPanelRect_.right - 220, storyMemoPanelRect_.top + 54 }, L"メモ", DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+    HBRUSH saveBrush = CreateSolidBrush(RGB(64, 126, 86));
+    FillRect(hdc, &storyMemoSaveRect_, saveBrush);
+    DeleteObject(saveBrush);
+    HBRUSH closeBrush = CreateSolidBrush(RGB(76, 82, 92));
+    FillRect(hdc, &storyMemoCloseRect_, closeBrush);
+    DeleteObject(closeBrush);
+    SelectObject(hdc, bodyFont);
+    SetTextColor(hdc, RGB(248, 250, 252));
+    DrawWrappedText(hdc, storyMemoSaveRect_, L"保存", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    DrawWrappedText(hdc, storyMemoCloseRect_, L"閉じる", DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    storyMemoBodyRect_ = { storyMemoPanelRect_.left + 34, storyMemoPanelRect_.top + 92, storyMemoPanelRect_.right - 34, storyMemoPanelRect_.bottom - 34 };
+    HBRUSH bodyBrush = CreateSolidBrush(RGB(18, 24, 32));
+    FillRect(hdc, &storyMemoBodyRect_, bodyBrush);
+    DeleteObject(bodyBrush);
+    RECT textRect = { storyMemoBodyRect_.left + 18, storyMemoBodyRect_.top + 14, storyMemoBodyRect_.right - 18, storyMemoBodyRect_.bottom - 14 };
+    if (inspectorEditing_ && editingCommandIndex_ == static_cast<size_t>(-2) && editingKey_ == L"story_memo") inspectorEditRect_ = textRect;
+    SetTextColor(hdc, storyMemoText_.empty() ? RGB(138, 148, 162) : RGB(232, 238, 244));
+    DrawWrappedText(hdc, textRect, storyMemoText_.empty() ? L"クリックしてメモを入力" : storyMemoText_, DT_LEFT | DT_WORDBREAK | DT_TOP);
+    SelectObject(hdc, oldFont);
+    DeleteObject(titleFont);
+    DeleteObject(bodyFont);
+}
+
 void NovelRuntime::DrawStoryInlineEditControls(HDC hdc, const RECT& clientRect)
 {
     storyInlineCommitRect_ = {};
@@ -16133,6 +16761,9 @@ void NovelRuntime::DrawStoryInlineEditControls(HDC hdc, const RECT& clientRect)
     else if (storyWritingVisible_) panelRect = storyWritingPanelRect_;
     else if (storyCharacterVisible_) panelRect = storyCharacterPanelRect_;
     else if (storyWorldVisible_) panelRect = storyWorldPanelRect_;
+    else if (storyRelationVisible_) panelRect = storyRelationPanelRect_;
+    else if (storyTemplateVisible_) panelRect = storyTemplatePanelRect_;
+    else if (storyMemoVisible_) panelRect = storyMemoPanelRect_;
     if (!HasVisibleArea(panelRect))
     {
         panelRect = clientRect;
@@ -16360,6 +16991,18 @@ void NovelRuntime::Draw(HDC hdc, const RECT& clientRect)
     if (storyWorldVisible_)
     {
         DrawStoryWorldPanel(hdc, clientRect);
+    }
+    if (storyRelationVisible_)
+    {
+        DrawStoryRelationPanel(hdc, clientRect);
+    }
+    if (storyTemplateVisible_)
+    {
+        DrawStoryTemplatePanel(hdc, clientRect);
+    }
+    if (storyMemoVisible_)
+    {
+        DrawStoryMemoPanel(hdc, clientRect);
     }
     DrawStoryInlineEditControls(hdc, clientRect);
     DrawHoverHelp(hdc, clientRect);
@@ -17505,7 +18148,7 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
             FillRect(hdc, &iconRect, iconBrush);
             DeleteObject(iconBrush);
             FrameRect(hdc, &iconRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
-            auto iconImage = TryLoadImage(ResolveMaterialIconPath(category.icon));
+            std::shared_ptr<Gdiplus::Image> iconImage = GetCachedImage(ResolveMaterialIconPath(category.icon));
             if (iconImage)
             {
                 Gdiplus::Graphics graphics(hdc);
@@ -17626,7 +18269,7 @@ void NovelRuntime::DrawCommandPalette(HDC hdc, const RECT& panelRect)
         {
             if (selectedAssetPreviewCategory_ == L"background" || selectedAssetPreviewCategory_ == L"picture" || selectedAssetPreviewCategory_ == L"character")
             {
-                auto previewImage = TryLoadImage(selectedAssetPath_);
+                std::shared_ptr<Gdiplus::Image> previewImage = GetCachedImage(selectedAssetPath_);
                 if (previewImage)
                 {
                     Gdiplus::Graphics graphics(hdc);
@@ -17951,21 +18594,21 @@ void NovelRuntime::DrawNodeGraph(HDC hdc, const RECT& panelRect)
 
     const int viewportTop = panelRect.top + 76;
     const int scrollbarHeight = 22;
+    const int verticalScrollbarWidth = 18;
     const int viewportBottom = panelRect.bottom - scrollbarHeight - 12;
     const int viewportHeight = (std::max)(1, viewportBottom - viewportTop);
-    const int viewportWidth = (std::max)(1, static_cast<int>(panelRect.right - panelRect.left));
+    const int viewportWidth = (std::max)(1, static_cast<int>(panelRect.right - panelRect.left - verticalScrollbarWidth));
     const double zoom = static_cast<double>(flowGraphZoomPercent_) / 100.0;
     const int baseNodeWidth = 230;
     const int baseNodeHeight = 74;
-    const int baseGapX = 84;
+    const int baseGapX = 92;
+    const int baseGapY = 48;
     const int baseMargin = 32;
     const int nodeWidth = (std::max)(120, static_cast<int>(baseNodeWidth * zoom));
     const int nodeHeight = (std::max)(44, static_cast<int>(baseNodeHeight * zoom));
     const int gapX = (std::max)(34, static_cast<int>(baseGapX * zoom));
+    const int gapY = (std::max)(28, static_cast<int>(baseGapY * zoom));
     const int margin = (std::max)(16, static_cast<int>(baseMargin * zoom));
-    const int contentWidth = margin * 2 + static_cast<int>(scenario_.commands.size()) * nodeWidth + static_cast<int>((scenario_.commands.size() - 1) * gapX);
-    flowGraphScrollMax_ = (std::max)(0, contentWidth - viewportWidth);
-    flowGraphScrollOffset_ = (std::max)(0, (std::min)(flowGraphScrollOffset_, flowGraphScrollMax_));
 
     std::unordered_map<std::wstring, size_t> labelToIndex;
     for (size_t i = 0; i < scenario_.commands.size(); ++i)
@@ -18034,16 +18677,20 @@ void NovelRuntime::DrawNodeGraph(HDC hdc, const RECT& panelRect)
         }
     }
 
-    const int rowGapY = (std::max)(72, nodeHeight + static_cast<int>(42 * zoom));
-    const int contentHeight = 48 + (maxLane + 1) * nodeHeight + maxLane * (rowGapY - nodeHeight) + 40;
+    // Vertical flow: time runs downward, branches expand to the right.
+    const int rowStepY = nodeHeight + gapY;
+    const int contentWidth = margin * 2 + (maxLane + 1) * nodeWidth + maxLane * gapX;
+    const int contentHeight = margin * 2 + static_cast<int>(scenario_.commands.size()) * nodeHeight + static_cast<int>((scenario_.commands.size() - 1) * gapY);
+    flowGraphScrollMax_ = (std::max)(0, contentWidth - viewportWidth);
+    flowGraphScrollOffset_ = (std::max)(0, (std::min)(flowGraphScrollOffset_, flowGraphScrollMax_));
     flowGraphVerticalMax_ = (std::max)(0, contentHeight - viewportHeight);
     flowGraphOffsetY_ = (std::max)(0, (std::min)(flowGraphOffsetY_, flowGraphVerticalMax_));
 
     std::unordered_map<size_t, RECT> nodeRects;
     auto getNodeRect = [&](size_t index) -> RECT
     {
-        const int x = panelRect.left + margin + static_cast<int>(index) * (nodeWidth + gapX) - flowGraphScrollOffset_;
-        const int y = viewportTop + 24 + nodeLanes[index] * rowGapY - flowGraphOffsetY_;
+        const int x = panelRect.left + margin + nodeLanes[index] * (nodeWidth + gapX) - flowGraphScrollOffset_;
+        const int y = viewportTop + margin + static_cast<int>(index) * rowStepY - flowGraphOffsetY_;
         RECT rect = {
             x,
             y,
@@ -18061,48 +18708,48 @@ void NovelRuntime::DrawNodeGraph(HDC hdc, const RECT& panelRect)
     const int savedDc = SaveDC(hdc);
     IntersectClipRect(hdc, panelRect.left, viewportTop, panelRect.right, viewportBottom);
 
-    auto rightCenter = [](const RECT& rect) -> POINT { return POINT{ rect.right, (rect.top + rect.bottom) / 2 }; };
-    auto leftCenter = [](const RECT& rect) -> POINT { return POINT{ rect.left, (rect.top + rect.bottom) / 2 }; };
+    auto bottomCenter = [](const RECT& rect) -> POINT { return POINT{ (rect.left + rect.right) / 2, rect.bottom }; };
+    auto topCenter = [](const RECT& rect) -> POINT { return POINT{ (rect.left + rect.right) / 2, rect.top }; };
+    auto rightCenter = bottomCenter;
+    auto leftCenter = topCenter;
     auto drawArrow = [&](POINT from, POINT to, COLORREF color, int width, const std::wstring& label, int lane)
     {
         HPEN pen = CreatePen(PS_SOLID, width, color);
         HPEN oldPen = static_cast<HPEN>(SelectObject(hdc, pen));
         const int arrow = 7;
-        if (to.x >= from.x && from.y == to.y)
+        if (from.x == to.x && to.y >= from.y)
         {
             MoveToEx(hdc, from.x, from.y, nullptr);
             LineTo(hdc, to.x, to.y);
         }
-        else if (to.x >= from.x)
+        else if (to.y >= from.y)
         {
-            const int midX = static_cast<int>(from.x) + (std::max)(24, static_cast<int>((to.x - from.x) / 2));
+            const int midY = static_cast<int>(from.y) + (std::max)(24, static_cast<int>((to.y - from.y) / 2));
             MoveToEx(hdc, from.x, from.y, nullptr);
-            LineTo(hdc, midX, from.y);
-            LineTo(hdc, midX, to.y);
+            LineTo(hdc, from.x, midY);
+            LineTo(hdc, to.x, midY);
             LineTo(hdc, to.x, to.y);
         }
         else
         {
-            const int routeY = from.y + (lane % 2 == 0 ? nodeHeight + 28 + lane * 10 : -28 - lane * 10);
+            const int routeX = from.x + (lane % 2 == 0 ? nodeWidth / 2 + 38 + lane * 18 : -nodeWidth / 2 - 38 - lane * 18);
             MoveToEx(hdc, from.x, from.y, nullptr);
-            LineTo(hdc, from.x + 18, routeY);
-            LineTo(hdc, to.x - 18, routeY);
+            LineTo(hdc, routeX, from.y + 18);
+            LineTo(hdc, routeX, to.y - 18);
             LineTo(hdc, to.x, to.y);
         }
         MoveToEx(hdc, to.x, to.y, nullptr);
-        LineTo(hdc, to.x - arrow, to.y - arrow);
+        LineTo(hdc, to.x - arrow, to.y - (to.y >= from.y ? arrow : -arrow));
         MoveToEx(hdc, to.x, to.y, nullptr);
-        LineTo(hdc, to.x - arrow, to.y + arrow);
+        LineTo(hdc, to.x + arrow, to.y - (to.y >= from.y ? arrow : -arrow));
         SelectObject(hdc, oldPen);
         DeleteObject(pen);
         if (!label.empty())
         {
             SelectObject(hdc, smallFont);
             SetTextColor(hdc, color);
-            const int labelX = (from.x + to.x) / 2;
-            const int labelY = to.x >= from.x
-                ? (std::min)(from.y, to.y) - 22 - (lane % 3) * 14
-                : from.y + nodeHeight + 16 + lane * 10;
+            const int labelX = from.x == to.x ? from.x + nodeWidth / 2 + 12 : (from.x + to.x) / 2;
+            const int labelY = (from.y + to.y) / 2 - 12 - (lane % 3) * 10;
             RECT labelRect = { labelX - 78, labelY - 10, labelX + 78, labelY + 12 };
             DrawWrappedText(hdc, labelRect, label, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         }
@@ -18123,7 +18770,8 @@ void NovelRuntime::DrawNodeGraph(HDC hdc, const RECT& panelRect)
     {
         const ScriptCommand& command = scenario_.commands[i];
         const RECT fromRect = nodeRects[i];
-        if (fromRect.right < panelRect.left - 320 || fromRect.left > panelRect.right + 320)
+        if (fromRect.right < panelRect.left - 420 || fromRect.left > panelRect.right + 420 ||
+            fromRect.bottom < viewportTop - 520 || fromRect.top > viewportBottom + 520)
         {
             continue;
         }
@@ -18215,7 +18863,7 @@ void NovelRuntime::DrawNodeGraph(HDC hdc, const RECT& panelRect)
     RestoreDC(hdc, savedDc);
 
     {
-        RECT track = { panelRect.left + 18, panelRect.bottom - scrollbarHeight, panelRect.right - 18, panelRect.bottom - 8 };
+        RECT track = { panelRect.left + 18, panelRect.bottom - scrollbarHeight, panelRect.right - verticalScrollbarWidth - 10, panelRect.bottom - 8 };
         HBRUSH trackBrush = CreateSolidBrush(RGB(30, 38, 48));
         FillRect(hdc, &track, trackBrush);
         DeleteObject(trackBrush);
@@ -18230,6 +18878,26 @@ void NovelRuntime::DrawNodeGraph(HDC hdc, const RECT& panelRect)
             ? track.left + ((trackWidth - thumbWidth) * flowGraphScrollOffset_) / flowGraphScrollMax_
             : track.left;
         RECT thumb = { thumbLeft, track.top + 2, thumbLeft + thumbWidth, track.bottom - 2 };
+        HBRUSH thumbBrush = CreateSolidBrush(RGB(112, 126, 142));
+        FillRect(hdc, &thumb, thumbBrush);
+        DeleteObject(thumbBrush);
+    }
+    {
+        RECT track = { panelRect.right - verticalScrollbarWidth, viewportTop, panelRect.right - 6, viewportBottom };
+        HBRUSH trackBrush = CreateSolidBrush(RGB(30, 38, 48));
+        FillRect(hdc, &track, trackBrush);
+        DeleteObject(trackBrush);
+        HBRUSH frameBrush = CreateSolidBrush(RGB(68, 78, 90));
+        FrameRect(hdc, &track, frameBrush);
+        DeleteObject(frameBrush);
+        const int trackHeight = (std::max)(1, static_cast<int>(track.bottom - track.top));
+        const int thumbHeight = flowGraphVerticalMax_ > 0
+            ? (std::max)(42, (viewportHeight * trackHeight) / (contentHeight + viewportHeight))
+            : trackHeight;
+        const int thumbTop = flowGraphVerticalMax_ > 0
+            ? track.top + ((trackHeight - thumbHeight) * flowGraphOffsetY_) / flowGraphVerticalMax_
+            : track.top;
+        RECT thumb = { track.left + 2, thumbTop, track.right - 2, thumbTop + thumbHeight };
         HBRUSH thumbBrush = CreateSolidBrush(RGB(112, 126, 142));
         FillRect(hdc, &thumb, thumbBrush);
         DeleteObject(thumbBrush);
@@ -18268,6 +18936,8 @@ bool NovelRuntime::HandleFlowGraphMouseWheel(short delta)
     }
     flowGraphScrollOffset_ = (flowGraphScrollOffset_ * flowGraphZoomPercent_) / (std::max)(1, previousZoom);
     flowGraphScrollOffset_ = (std::max)(0, (std::min)(flowGraphScrollOffset_, flowGraphScrollMax_));
+    flowGraphOffsetY_ = (flowGraphOffsetY_ * flowGraphZoomPercent_) / (std::max)(1, previousZoom);
+    flowGraphOffsetY_ = (std::max)(0, (std::min)(flowGraphOffsetY_, flowGraphVerticalMax_));
     return true;
 }
 
@@ -20034,7 +20704,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawEditable(selectedCommandIndex_, L"縦位置", L"y", GetCommandParameter(command, L"y"));
             drawEditable(selectedCommandIndex_, L"並列", L"parallel", GetCommandParameter(command, L"parallel"));
             RECT toolButtonRect = { panelRect.left + 20, cursorY, panelRect.left + 188, cursorY + 30 };
-            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"調整中" : L"パン位置調整ツール", RGB(92, 102, 116));
+            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"保存して閉じる" : L"パン位置調整ツール", RGB(92, 102, 116));
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"character_adjust", selectedCommandIndex_, 0, toolButtonRect });
             cursorY += 40;
             drawEffectTimeline(selectedCommandIndex_, command, true, true);
@@ -20059,7 +20729,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawEditable(selectedCommandIndex_, L"横位置", L"x", GetCommandParameter(command, L"x"));
             drawEditable(selectedCommandIndex_, L"縦位置", L"y", GetCommandParameter(command, L"y"));
             RECT toolButtonRect = { panelRect.left + 20, cursorY, panelRect.left + 188, cursorY + 30 };
-            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"調整中" : L"位置調整ツールを開く", RGB(92, 102, 116));
+            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"保存して閉じる" : L"位置調整ツールを開く", RGB(92, 102, 116));
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"character_adjust", selectedCommandIndex_, 0, toolButtonRect });
             cursorY += 40;
             drawEditable(selectedCommandIndex_, L"ボタン画像", L"button_image", GetCommandParameter(command, L"button_image"));
@@ -20225,7 +20895,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             drawEditable(selectedCommandIndex_, L"\u5ea7\u6a19X", L"x", GetCommandParameter(command, L"x"));
             drawEditable(selectedCommandIndex_, L"\u5ea7\u6a19Y", L"y", GetCommandParameter(command, L"y"));
             RECT toolButtonRect = { panelRect.left + 20, cursorY, panelRect.left + 188, cursorY + 30 };
-            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"調整中" : L"位置調整ツールを開く", RGB(92, 102, 116));
+            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"保存して閉じる" : L"位置調整ツールを開く", RGB(92, 102, 116));
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"character_adjust", selectedCommandIndex_, 0, toolButtonRect });
             cursorY += 40;
             drawEditable(selectedCommandIndex_, L"\u30b9\u30b1\u30fc\u30eb", L"scale", GetCommandParameter(command, L"scale"));
@@ -20301,13 +20971,13 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             DeleteObject(previewBrush);
             FrameRect(hdc, &previewRect, static_cast<HBRUSH>(GetStockObject(GRAY_BRUSH)));
             const std::wstring storage = GetCommandParameter(command, L"storage");
-            std::unique_ptr<Gdiplus::Image> previewImage;
+            std::shared_ptr<Gdiplus::Image> previewImage;
             if (!storage.empty())
             {
-                previewImage = TryLoadImage(CombinePath(scenarioBaseDir_, storage));
+                previewImage = GetCachedImage(CombinePath(scenarioBaseDir_, storage));
                 if (!previewImage)
                 {
-                    previewImage = TryLoadImage(storage);
+                    previewImage = GetCachedImage(storage);
                 }
             }
             if (previewImage)
@@ -20339,7 +21009,7 @@ void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)
             cursorY += 26;
 
             RECT toolButtonRect = { panelRect.left + 20, cursorY, panelRect.left + 188, cursorY + 30 };
-            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"\u8abf\u6574\u4e2d" : L"\u9818\u57df\u8abf\u6574\u30c4\u30fc\u30eb\u3092\u958b\u304f", RGB(92, 102, 116));
+            drawActionButton(toolButtonRect, characterAdjustMode_ && adjustCharacterCommandIndex_ == selectedCommandIndex_ ? L"保存して閉じる" : L"\u9818\u57df\u8abf\u6574\u30c4\u30fc\u30eb\u3092\u958b\u304f", RGB(92, 102, 116));
             inspectorActionTargets_.push_back(InspectorActionTarget{ L"character_adjust", selectedCommandIndex_, 0, toolButtonRect });
             cursorY += 40;
 

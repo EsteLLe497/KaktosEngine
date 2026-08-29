@@ -55,6 +55,21 @@ struct StoryWorldEntry
     std::wstring detail;
 };
 
+struct StoryRelationEntry
+{
+    std::wstring sourceName;
+    std::wstring targetName;
+    std::wstring relation;
+    std::wstring memo;
+};
+
+struct StoryTemplateEntry
+{
+    std::wstring title;
+    std::wstring category;
+    std::wstring body;
+};
+
 struct CharacterSlot
 {
     std::wstring slotName;
@@ -420,6 +435,9 @@ private:
     void DrawStoryWritingPanel(HDC hdc, const RECT& clientRect);
     void DrawStoryCharacterPanel(HDC hdc, const RECT& clientRect);
     void DrawStoryWorldPanel(HDC hdc, const RECT& clientRect);
+    void DrawStoryRelationPanel(HDC hdc, const RECT& clientRect);
+    void DrawStoryTemplatePanel(HDC hdc, const RECT& clientRect);
+    void DrawStoryMemoPanel(HDC hdc, const RECT& clientRect);
     void DrawStoryInlineEditControls(HDC hdc, const RECT& clientRect);
     bool HandleStoryInlineEditControlClick(POINT point);
     bool HandleStoryOverviewClick(POINT point);
@@ -429,6 +447,9 @@ private:
     bool HandleStoryWritingClick(POINT point);
     bool HandleStoryCharacterClick(POINT point);
     bool HandleStoryWorldClick(POINT point);
+    bool HandleStoryRelationClick(POINT point);
+    bool HandleStoryTemplateClick(POINT point);
+    bool HandleStoryMemoClick(POINT point);
     bool BrowseStoryImage();
     void DrawCommandList(HDC hdc, const RECT& panelRect);
     void DrawInspector(HDC hdc, const RECT& panelRect);
@@ -803,6 +824,22 @@ private:
     RECT storyWorldCloseRect_ = {};
     RECT storyWorldImageRect_ = {};
     RECT storyWorldImageBrowseRect_ = {};
+    RECT storyRelationPanelRect_ = {};
+    RECT storyRelationListRect_ = {};
+    RECT storyRelationDetailRect_ = {};
+    RECT storyRelationAddRect_ = {};
+    RECT storyRelationEditRect_ = {};
+    RECT storyRelationCloseRect_ = {};
+    RECT storyTemplatePanelRect_ = {};
+    RECT storyTemplateListRect_ = {};
+    RECT storyTemplateDetailRect_ = {};
+    RECT storyTemplateAddRect_ = {};
+    RECT storyTemplateEditRect_ = {};
+    RECT storyTemplateCloseRect_ = {};
+    RECT storyMemoPanelRect_ = {};
+    RECT storyMemoBodyRect_ = {};
+    RECT storyMemoSaveRect_ = {};
+    RECT storyMemoCloseRect_ = {};
     RECT storyInlineCommitRect_ = {};
     RECT storyInlineCancelRect_ = {};
     std::vector<RECT> storyStructureItemRects_;
@@ -821,6 +858,10 @@ private:
     std::vector<std::pair<std::wstring, RECT>> storyCharacterFieldRects_;
     std::vector<RECT> storyWorldListItemRects_;
     std::vector<std::pair<std::wstring, RECT>> storyWorldFieldRects_;
+    std::vector<RECT> storyRelationListItemRects_;
+    std::vector<std::pair<std::wstring, RECT>> storyRelationFieldRects_;
+    std::vector<RECT> storyTemplateListItemRects_;
+    std::vector<std::pair<std::wstring, RECT>> storyTemplateFieldRects_;
     RECT characterDialogRect_ = {};
     RECT characterDialogAddRect_ = {};
     RECT characterDialogDeleteRect_ = {};
@@ -926,6 +967,14 @@ private:
     int storyWorldListScrollMax_ = 0;
     int storyWorldDetailScrollOffset_ = 0;
     int storyWorldDetailScrollMax_ = 0;
+    int storyRelationListScrollOffset_ = 0;
+    int storyRelationListScrollMax_ = 0;
+    int storyRelationDetailScrollOffset_ = 0;
+    int storyRelationDetailScrollMax_ = 0;
+    int storyTemplateListScrollOffset_ = 0;
+    int storyTemplateListScrollMax_ = 0;
+    int storyTemplateDetailScrollOffset_ = 0;
+    int storyTemplateDetailScrollMax_ = 0;
     DragHandle activeDragHandle_ = DragHandle::None;
     size_t editingCommandIndex_ = 0;
     std::wstring editingKey_;
@@ -1014,6 +1063,7 @@ private:
     bool playerMode_ = false;
     bool characterAdjustMode_ = false;
     bool characterAdjustDragging_ = false;
+    bool characterAdjustUndoCaptured_ = false;
     bool sceneDialogVisible_ = false;
     bool projectDialogVisible_ = false;
     bool projectLauncherVisible_ = false;
@@ -1040,6 +1090,11 @@ private:
     bool storyCharacterEditMode_ = false;
     bool storyWorldVisible_ = false;
     bool storyWorldEditMode_ = false;
+    bool storyRelationVisible_ = false;
+    bool storyRelationEditMode_ = false;
+    bool storyTemplateVisible_ = false;
+    bool storyTemplateEditMode_ = false;
+    bool storyMemoVisible_ = false;
     bool storyStatusDropdownVisible_ = false;
     bool storyPanelStatusDropdownVisible_ = false;
     std::wstring storyProductionStatus_ = L"\u5236\u4f5c\u4e2d";
@@ -1053,6 +1108,7 @@ private:
     std::wstring storyTargetAgeGender_;
     std::wstring storyTargetTaste_;
     std::wstring storyTargetComparable_;
+    std::wstring storyMemoText_;
     std::wstring storyPlotIntro_ = L"\u8d77";
     std::wstring storyPlotDevelopment_ = L"\u627f";
     std::wstring storyPlotTurn_ = L"\u8ee2";
@@ -1066,9 +1122,13 @@ private:
     std::vector<StoryWritingDraft> storyWritingDrafts_;
     std::vector<bool> storyWritingDeleteChecks_;
     std::vector<StoryWorldEntry> storyWorldEntries_;
+    std::vector<StoryRelationEntry> storyRelationEntries_;
+    std::vector<StoryTemplateEntry> storyTemplateEntries_;
     size_t selectedWritingDraftIndex_ = 0;
     size_t selectedStoryCharacterIndex_ = static_cast<size_t>(-1);
     size_t selectedStoryWorldIndex_ = static_cast<size_t>(-1);
+    size_t selectedStoryRelationIndex_ = static_cast<size_t>(-1);
+    size_t selectedStoryTemplateIndex_ = static_cast<size_t>(-1);
     size_t storyWritingDragSourceIndex_ = static_cast<size_t>(-1);
     size_t storyWritingDragInsertIndex_ = static_cast<size_t>(-1);
     POINT storyWritingDragStartPoint_ = {};
