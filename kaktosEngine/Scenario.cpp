@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "Scenario.h"
+#include "Persistence.h"
 
 #include <algorithm>
 #include <cwctype>
@@ -268,22 +269,7 @@ bool TryReadTextFile(const std::wstring& path, std::wstring& content)
 bool TryWriteTextFile(const std::wstring& path, const std::wstring& content)
 {
     const std::string utf8 = WideToUtf8(content);
-    HANDLE fileHandle = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (fileHandle == INVALID_HANDLE_VALUE)
-    {
-        return false;
-    }
-
-    const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
-    DWORD written = 0;
-    BOOL ok = WriteFile(fileHandle, bom, sizeof(bom), &written, nullptr);
-    if (ok && !utf8.empty())
-    {
-        ok = WriteFile(fileHandle, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr);
-    }
-
-    CloseHandle(fileHandle);
-    return ok == TRUE;
+    return Persistence::WriteUtf8Atomic(path, utf8);
 }
 
 void RebuildScenarioLabels(ScenarioDocument& document)

@@ -1,0 +1,8 @@
+[title name="Kaktos Performance Probe"]
+[bg storage="../background/111.png" visible="true" scale="100" opacity="255"]
+[ch pos="center" name="probe" storage="../character/Gat7rfBaAAI6vSs.jpg" visible="true" scale="100" opacity="255" fade="true" fade_time="600"]
+[text_speed time="18"]
+[text value="文字表示と画像フェードのフレーム時間を確認するための長いテキストです。一定の速度で最後まで滑らかに表示されれば正常です。背景と立ち絵は実行中に再デコードせず、拡大済み画像を再利用します。"]
+[hidech pos="center" fade="true" fade_time="600"]
+[ch pos="left" name="probe" storage="../character/Gat7rfBaAAI6vSs.jpg" visible="true" x="80" scale="90" opacity="255" fade="true" fade_time="600"]
+[text value="二回目の画像表示でも停止せず、キャッシュから即座に表示されることを確認します。"]

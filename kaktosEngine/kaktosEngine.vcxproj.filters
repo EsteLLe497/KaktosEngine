@@ -36,6 +36,11 @@
     <ClInclude Include="miniaudio.h">
       <Filter>ヘッダー ファイル</Filter>
     </ClInclude>
+    <ClInclude Include="AsyncTextWriter.h"><Filter>ヘッダー ファイル</Filter></ClInclude>
+    <ClInclude Include="BackBuffer.h"><Filter>ヘッダー ファイル</Filter></ClInclude>
+    <ClInclude Include="GdiFontCache.h"><Filter>ヘッダー ファイル</Filter></ClInclude>
+    <ClInclude Include="Persistence.h"><Filter>ヘッダー ファイル</Filter></ClInclude>
+    <ClInclude Include="StreamingAudioPlayer.h"><Filter>ヘッダー ファイル</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="kaktosEngine.cpp">
@@ -47,6 +52,11 @@
     <ClCompile Include="Scenario.cpp">
       <Filter>ソース ファイル</Filter>
     </ClCompile>
+    <ClCompile Include="AsyncTextWriter.cpp"><Filter>ソース ファイル</Filter></ClCompile>
+    <ClCompile Include="BackBuffer.cpp"><Filter>ソース ファイル</Filter></ClCompile>
+    <ClCompile Include="GdiFontCache.cpp"><Filter>ソース ファイル</Filter></ClCompile>
+    <ClCompile Include="Persistence.cpp"><Filter>ソース ファイル</Filter></ClCompile>
+    <ClCompile Include="StreamingAudioPlayer.cpp"><Filter>ソース ファイル</Filter></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="kaktosEngine.rc">
