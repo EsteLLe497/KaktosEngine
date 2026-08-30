@@ -1,4 +1,6 @@
-﻿scenario_path=C:\Users\PC_User\Documents\solutiioon\kaktosEngine\x64\Debug\..\..\assets\scenario\sa.ks
+format_version=2
+project_id=7ec8bd8c-4f2d-4ee6-9fc4-2ca35ae081be
+scenario_path=scenario\sa.ks
 left_panel_width=280
 right_panel_width=320
 graph_height=162
@@ -11,7 +13,7 @@ show_event_list=1
 settings_window_width=1280
 settings_window_height=720
 settings_default_font=しねきゃぷしょん
-settings_default_text_speed=40
+settings_default_text_speed=20
 settings_master_volume=100
 settings_bgm_volume=100
 settings_se_volume=100

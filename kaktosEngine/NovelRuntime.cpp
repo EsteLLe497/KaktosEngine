@@ -1,5 +1,7 @@
 #include "framework.h"
 #include "NovelRuntime.h"
+#include "AsyncTextWriter.h"
+#include "Persistence.h"
 #include "resource.h"
 
 #include <commdlg.h>
@@ -12,6 +14,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cwctype>
 #include <functional>
@@ -63,9 +66,14 @@ namespace
 
     constexpr const wchar_t* kRuntimeEditProp = L"KaktosRuntimeEditOwner";
     constexpr const wchar_t* kRuntimeEditOldProcProp = L"KaktosRuntimeEditOldProc";
-    constexpr UINT_PTR kRuntimeTimerId = 1;
-    constexpr UINT kRuntimeTimerMs = 33;
     constexpr size_t kMaxCachedImages = 128;
+    constexpr size_t kMaxCachedAudioFiles = 12;
+    constexpr size_t kMaxCachedAudioBytes = 96ull * 1024ull * 1024ull;
+
+    size_t AudioChannelIndex(AudioChannel channel)
+    {
+        return static_cast<size_t>(channel);
+    }
 
     LRESULT CALLBACK RuntimeEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
@@ -385,6 +393,7 @@ namespace
         return result == ERROR_SUCCESS || result == ERROR_ALREADY_EXISTS || result == ERROR_FILE_EXISTS;
     }
 
+
     bool CopyDirectoryTree(const std::wstring& sourceDir, const std::wstring& targetDir)
     {
         if (!EnsureDirectoryExists(targetDir))
@@ -429,6 +438,8 @@ namespace
         return ok;
     }
 }
+
+NovelRuntime::~NovelRuntime() = default;
 
 bool NovelRuntime::InitializeAudioEngine()
 {
@@ -482,6 +493,8 @@ bool NovelRuntime::InitializeAudioEngine()
 
 void NovelRuntime::ShutdownAudioEngine()
 {
+    DiscardPendingAudioDecodes();
+    bgmStream_.Shutdown();
     StopAudioChannel(AudioChannel::Preview);
     StopAudioChannel(AudioChannel::Voice);
     StopAudioChannel(AudioChannel::Se);
@@ -493,6 +506,8 @@ void NovelRuntime::ShutdownAudioEngine()
         masteringVoice_ = nullptr;
     }
     xaudio2_.Reset();
+    decodedAudioCache_.clear();
+    decodedAudioCacheBytes_ = 0;
 
     if (mediaFoundationInitialized_)
     {
@@ -530,6 +545,11 @@ const AudioPlaybackState& NovelRuntime::GetAudioPlaybackState(AudioChannel chann
 
 void NovelRuntime::StopAudioChannel(AudioChannel channel)
 {
+    ++audioRequestGeneration_[AudioChannelIndex(channel)];
+    if (channel == AudioChannel::Bgm)
+    {
+        bgmStream_.Stop();
+    }
     AudioPlaybackState& state = GetAudioPlaybackState(channel);
     if (state.voice)
     {
@@ -543,8 +563,7 @@ void NovelRuntime::StopAudioChannel(AudioChannel channel)
         const std::wstring closeCommand = L"close " + state.legacyAlias;
         mciSendStringW(closeCommand.c_str(), nullptr, 0, nullptr);
     }
-    state.audioBytes.clear();
-    state.formatBytes.clear();
+    state.decoded.reset();
     state.looping = false;
     state.usesLegacyMci = false;
     state.legacyAlias.clear();
@@ -553,6 +572,10 @@ void NovelRuntime::StopAudioChannel(AudioChannel channel)
 
 void NovelRuntime::SetAudioChannelVolume(AudioChannel channel, int volumePercent)
 {
+    if (channel == AudioChannel::Bgm)
+    {
+        bgmStream_.SetVolume(volumePercent);
+    }
     volumePercent = (std::max)(0, (std::min)(100, volumePercent));
     AudioPlaybackState& state = GetAudioPlaybackState(channel);
     if (state.voice)
@@ -797,45 +820,64 @@ bool NovelRuntime::DecodeAudioFile(const std::wstring& fullPath, std::vector<BYT
 bool NovelRuntime::PlayAudioFile(AudioChannel channel, const std::wstring& fullPath, bool loop, int volumePercent)
 {
     const std::wstring resolvedPath = NormalizeFullPath(fullPath);
-
     if (!InitializeAudioEngine())
     {
-        const_cast<NovelRuntime*>(this)->lastAudioDebugMessage_ = L"audio: XAudio2/MediaFoundation 初期化失敗";
+        lastAudioDebugMessage_ = L"audio: XAudio2/MediaFoundation 初期化失敗";
         DebugTrace(lastAudioDebugMessage_);
         return false;
     }
 
-    AudioPlaybackState& state = GetAudioPlaybackState(channel);
     StopAudioChannel(channel);
-    if (!DecodeAudioFile(resolvedPath, state.formatBytes, state.audioBytes))
+    if (channel == AudioChannel::Bgm && bgmStream_.Play(resolvedPath, loop, volumePercent))
     {
-        const std::wstring alias = GetLegacyAudioAlias(channel);
-        if (!TryOpenAudioAlias(resolvedPath, alias))
-        {
-            lastAudioDebugMessage_ = L"audio: デコード失敗 / MCIフォールバック失敗 path=" + resolvedPath;
-            DebugTrace(lastAudioDebugMessage_);
-            return false;
-        }
-        ApplyAudioAliasVolume(alias, volumePercent);
-        const std::wstring playCommand = loop ? L"play " + alias + L" repeat" : L"play " + alias;
-        if (mciSendStringW(playCommand.c_str(), nullptr, 0, nullptr) != 0)
-        {
-            const std::wstring closeCommand = L"close " + alias;
-            mciSendStringW(closeCommand.c_str(), nullptr, 0, nullptr);
-            lastAudioDebugMessage_ = L"audio: MCI play 失敗 path=" + resolvedPath;
-            DebugTrace(lastAudioDebugMessage_);
-            return false;
-        }
-        state.usesLegacyMci = true;
-        state.legacyAlias = alias;
+        AudioPlaybackState& state = GetAudioPlaybackState(channel);
         state.looping = loop;
         state.sourcePath = resolvedPath;
-        lastAudioDebugMessage_ = L"audio: MCIフォールバック再生 path=" + resolvedPath;
-        DebugTrace(lastAudioDebugMessage_);
+        lastAudioDebugMessage_ = L"audio: BGMストリーム再生 path=" + resolvedPath;
         return true;
     }
+    const unsigned long long generation = audioRequestGeneration_[AudioChannelIndex(channel)];
+    const auto cached = decodedAudioCache_.find(resolvedPath);
+    if (cached != decodedAudioCache_.end())
+    {
+        return StartDecodedAudio(channel, resolvedPath, loop, volumePercent, cached->second);
+    }
 
-    const WAVEFORMATEX* waveFormat = reinterpret_cast<const WAVEFORMATEX*>(state.formatBytes.data());
+    PendingAudioDecode request;
+    request.channel = channel;
+    request.path = resolvedPath;
+    request.loop = loop;
+    request.volumePercent = volumePercent;
+    request.generation = generation;
+    request.future = std::async(std::launch::async, [this, resolvedPath]
+    {
+        const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        auto decoded = std::make_shared<DecodedAudioData>();
+        bool succeeded = false;
+        {
+            std::lock_guard<std::mutex> lock(audioDecodeMutex_);
+            succeeded = DecodeAudioFile(resolvedPath, decoded->formatBytes, decoded->audioBytes);
+        }
+        if (SUCCEEDED(comResult))
+        {
+            CoUninitialize();
+        }
+        return succeeded ? decoded : std::shared_ptr<DecodedAudioData>{};
+    });
+    pendingAudioDecodes_.push_back(std::move(request));
+    lastAudioDebugMessage_ = L"audio: 非同期デコード中 path=" + resolvedPath;
+    return true;
+}
+
+bool NovelRuntime::StartDecodedAudio(AudioChannel channel, const std::wstring& path, bool loop, int volumePercent, const std::shared_ptr<DecodedAudioData>& decoded)
+{
+    if (!decoded || decoded->formatBytes.size() < sizeof(WAVEFORMATEX) || decoded->audioBytes.empty())
+    {
+        return false;
+    }
+    AudioPlaybackState& state = GetAudioPlaybackState(channel);
+    state.decoded = decoded;
+    const WAVEFORMATEX* waveFormat = reinterpret_cast<const WAVEFORMATEX*>(decoded->formatBytes.data());
     HRESULT hr = xaudio2_->CreateSourceVoice(&state.voice, waveFormat);
     if (FAILED(hr) || !state.voice)
     {
@@ -846,8 +888,8 @@ bool NovelRuntime::PlayAudioFile(AudioChannel channel, const std::wstring& fullP
     }
 
     XAUDIO2_BUFFER buffer = {};
-    buffer.AudioBytes = static_cast<UINT32>(state.audioBytes.size());
-    buffer.pAudioData = state.audioBytes.data();
+    buffer.AudioBytes = static_cast<UINT32>(decoded->audioBytes.size());
+    buffer.pAudioData = decoded->audioBytes.data();
     buffer.Flags = XAUDIO2_END_OF_STREAM;
     if (loop)
     {
@@ -874,13 +916,82 @@ bool NovelRuntime::PlayAudioFile(AudioChannel channel, const std::wstring& fullP
     }
 
     state.looping = loop;
-    state.sourcePath = resolvedPath;
-    lastAudioDebugMessage_ = L"audio: XAudio2再生開始 path=" + resolvedPath +
+    state.sourcePath = path;
+    lastAudioDebugMessage_ = L"audio: XAudio2再生開始 path=" + path +
         L" channels=" + std::to_wstring(waveFormat->nChannels) +
         L" rate=" + std::to_wstring(waveFormat->nSamplesPerSec) +
-        L" bytes=" + std::to_wstring(state.audioBytes.size());
+        L" bytes=" + std::to_wstring(decoded->audioBytes.size());
     DebugTrace(lastAudioDebugMessage_);
     return true;
+}
+
+void NovelRuntime::PumpPendingAudioDecodes()
+{
+    for (auto it = pendingAudioDecodes_.begin(); it != pendingAudioDecodes_.end();)
+    {
+        if (it->future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+        {
+            ++it;
+            continue;
+        }
+        std::shared_ptr<DecodedAudioData> decoded = it->future.get();
+        const bool current = it->generation == audioRequestGeneration_[AudioChannelIndex(it->channel)];
+        if (decoded)
+        {
+            const size_t decodedBytes = decoded->audioBytes.size() + decoded->formatBytes.size();
+            while (!decodedAudioCache_.empty() &&
+                (decodedAudioCache_.size() >= kMaxCachedAudioFiles || decodedAudioCacheBytes_ + decodedBytes > kMaxCachedAudioBytes))
+            {
+                const auto victim = decodedAudioCache_.begin();
+                decodedAudioCacheBytes_ -= victim->second->audioBytes.size() + victim->second->formatBytes.size();
+                decodedAudioCache_.erase(victim);
+            }
+            if (decodedBytes <= kMaxCachedAudioBytes)
+            {
+                const auto existing = decodedAudioCache_.find(it->path);
+                if (existing != decodedAudioCache_.end())
+                {
+                    decodedAudioCacheBytes_ -= existing->second->audioBytes.size() + existing->second->formatBytes.size();
+                }
+                decodedAudioCache_[it->path] = decoded;
+                decodedAudioCacheBytes_ += decodedBytes;
+            }
+            if (current)
+            {
+                StartDecodedAudio(it->channel, it->path, it->loop, it->volumePercent, decoded);
+            }
+        }
+        else if (current)
+        {
+            const std::wstring alias = GetLegacyAudioAlias(it->channel);
+            if (TryOpenAudioAlias(it->path, alias))
+            {
+                ApplyAudioAliasVolume(alias, it->volumePercent);
+                const std::wstring playCommand = it->loop ? L"play " + alias + L" repeat" : L"play " + alias;
+                if (mciSendStringW(playCommand.c_str(), nullptr, 0, nullptr) == 0)
+                {
+                    AudioPlaybackState& state = GetAudioPlaybackState(it->channel);
+                    state.usesLegacyMci = true;
+                    state.legacyAlias = alias;
+                    state.looping = it->loop;
+                    state.sourcePath = it->path;
+                }
+            }
+        }
+        it = pendingAudioDecodes_.erase(it);
+    }
+}
+
+void NovelRuntime::DiscardPendingAudioDecodes()
+{
+    for (PendingAudioDecode& request : pendingAudioDecodes_)
+    {
+        if (request.future.valid())
+        {
+            request.future.wait();
+        }
+    }
+    pendingAudioDecodes_.clear();
 }
 
 bool NovelRuntime::Initialize()
@@ -895,6 +1006,7 @@ bool NovelRuntime::Initialize()
     {
         return false;
     }
+    autosaveWriter_ = std::make_unique<AsyncTextWriter>();
     RefreshAvailableFonts();
     LoadRecentProjects();
     return InitializeAudioEngine();
@@ -902,12 +1014,14 @@ bool NovelRuntime::Initialize()
 
 void NovelRuntime::Shutdown()
 {
+    autosavePending_ = false;
+    if (autosaveWriter_)
+    {
+        autosaveWriter_->Flush();
+        autosaveWriter_.reset();
+    }
     DeleteAutosaveSnapshot();
     DestroyChildControls();
-    if (hostWindow_)
-    {
-        KillTimer(hostWindow_, kRuntimeTimerId);
-    }
     if (previewWindow_)
     {
         DestroyWindow(previewWindow_);
@@ -920,6 +1034,12 @@ void NovelRuntime::Shutdown()
     }
 
     ShutdownAudioEngine();
+    // Every GDI+ object must die before GdiplusShutdown. Cached shared images
+    // otherwise survive until the global NovelRuntime destructor runs.
+    scaledImageCache_.clear();
+    messageWindowImage_.reset();
+    nameWindowImage_.reset();
+    choiceButtonImage_.reset();
     backgroundImage_.reset();
     leftCharacter_.image.reset();
     centerCharacter_.image.reset();
@@ -929,6 +1049,12 @@ void NovelRuntime::Shutdown()
         item.iconImage.reset();
     }
     toolbarItems_.clear();
+    for (UiButtonDefinition& button : uiButtons_)
+    {
+        button.iconImage.reset();
+    }
+    uiButtons_.clear();
+    imageCache_.clear();
 
     for (const std::wstring& path : loadedPrivateFontPaths_)
     {
@@ -936,6 +1062,7 @@ void NovelRuntime::Shutdown()
     }
     loadedPrivateFontPaths_.clear();
     availableFonts_.clear();
+    fontCache_.Clear();
 
     if (gdiplusToken_ != 0)
     {
@@ -1002,7 +1129,6 @@ void NovelRuntime::SetHostWindow(HWND hWnd)
 {
     hostWindow_ = hWnd;
     // 常時60FPSはエディタ操作の負荷が高いため、必要十分な30FPSに抑えます。
-    SetTimer(hostWindow_, kRuntimeTimerId, kRuntimeTimerMs, nullptr);
     if (!playerMode_)
     {
         EnsureChildControls();
@@ -1662,6 +1788,93 @@ std::shared_ptr<Gdiplus::Image> NovelRuntime::GetCachedImage(const std::wstring&
     return image;
 }
 
+std::shared_ptr<Gdiplus::Image> NovelRuntime::ResolveCachedImage(const std::wstring& path) const
+{
+    if (path.empty())
+    {
+        return nullptr;
+    }
+    auto image = GetCachedImage(CombinePath(scenarioBaseDir_, path));
+    return image ? image : GetCachedImage(path);
+}
+
+Gdiplus::Image* NovelRuntime::GetScaledImage(const std::wstring& id, const std::shared_ptr<Gdiplus::Image>& source, int width, int height) const
+{
+    if (!source || width <= 0 || height <= 0)
+    {
+        return nullptr;
+    }
+    const std::wstring key = id + L"|" + std::to_wstring(width) + L"x" + std::to_wstring(height);
+    auto found = scaledImageCache_.find(key);
+    if (found != scaledImageCache_.end() && found->second.source.get() == source.get())
+    {
+        return found->second.bitmap.get();
+    }
+
+    auto bitmap = std::make_unique<Gdiplus::Bitmap>(width, height, PixelFormat32bppPARGB);
+    if (bitmap->GetLastStatus() != Gdiplus::Ok)
+    {
+        return source.get();
+    }
+    Gdiplus::Graphics graphics(bitmap.get());
+    graphics.Clear(Gdiplus::Color(0, 0, 0, 0));
+    graphics.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+    graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+    const RECT target = { 0, 0, width, height };
+    DrawImageFit(graphics, source.get(), target);
+
+    if (scaledImageCache_.size() >= 12)
+    {
+        scaledImageCache_.erase(scaledImageCache_.begin());
+    }
+    ScaledImageEntry& entry = scaledImageCache_[key];
+    entry.source = source;
+    entry.bitmap = std::move(bitmap);
+    return entry.bitmap.get();
+}
+
+void NovelRuntime::PreloadScenarioImages()
+{
+    const auto preload = [this](const std::wstring& path)
+    {
+        if (!path.empty())
+        {
+            const auto image = ResolveCachedImage(path);
+            if (image)
+            {
+                Gdiplus::Bitmap warmup(1, 1, PixelFormat32bppPARGB);
+                Gdiplus::Graphics graphics(&warmup);
+                graphics.DrawImage(image.get(), 0, 0, 1, 1);
+            }
+        }
+    };
+    for (const ScriptCommand& command : scenario_.commands)
+    {
+        if (command.type == ScriptCommand::Type::Background || command.type == ScriptCommand::Type::Character)
+        {
+            preload(GetCommandParameter(command, L"storage"));
+        }
+        else if (command.type == ScriptCommand::Type::MessageStyle || command.type == ScriptCommand::Type::NameWindow)
+        {
+            preload(GetCommandParameter(command, L"image"));
+        }
+        else if (command.type == ScriptCommand::Type::Choice)
+        {
+            preload(GetCommandParameter(command, L"button_image"));
+        }
+    }
+    preload(editorSettings_.defaultMessageWindowImage);
+    preload(editorSettings_.defaultNameWindowImage);
+    for (const CharacterDefinition& character : characterDefinitions_)
+    {
+        preload(character.baseImagePath);
+        for (const CharacterExpressionDefinition& expression : character.expressions)
+        {
+            preload(expression.imagePath);
+        }
+    }
+}
+
 std::wstring NovelRuntime::GetFontsDirectory() const
 {
     return CombinePath(GetAssetsRootDirectory(), L"fonts");
@@ -1802,10 +2015,10 @@ void NovelRuntime::ApplyBackgroundCommand(const ScriptCommand& command)
     if (!relativePath.empty())
     {
         std::wstring fullPath = CombinePath(scenarioBaseDir_, relativePath);
-        auto image = TryLoadImage(fullPath);
+        auto image = GetCachedImage(fullPath);
         if (!image)
         {
-            image = TryLoadImage(relativePath);
+            image = GetCachedImage(relativePath);
             fullPath = relativePath;
         }
 
@@ -1896,10 +2109,10 @@ void NovelRuntime::ApplyCharacterCommand(const ScriptCommand& command)
     if (!storage.empty())
     {
         std::wstring fullPath = CombinePath(scenarioBaseDir_, storage);
-        auto image = TryLoadImage(fullPath);
+        auto image = GetCachedImage(fullPath);
         if (!image)
         {
-            image = TryLoadImage(storage);
+            image = GetCachedImage(storage);
             fullPath = storage;
         }
 
@@ -2196,10 +2409,10 @@ void NovelRuntime::ApplyMessageStyleCommand(const ScriptCommand& command)
     if (!imagePath.empty())
     {
         std::wstring fullPath = CombinePath(scenarioBaseDir_, imagePath);
-        auto image = TryLoadImage(fullPath);
+        auto image = GetCachedImage(fullPath);
         if (!image)
         {
-            image = TryLoadImage(imagePath);
+            image = GetCachedImage(imagePath);
             fullPath = imagePath;
         }
         if (image)
@@ -2297,10 +2510,10 @@ void NovelRuntime::ApplyNameWindowCommand(const ScriptCommand& command)
         if (!imagePath.empty())
         {
             std::wstring fullPath = CombinePath(scenarioBaseDir_, imagePath);
-            auto image = TryLoadImage(fullPath);
+            auto image = GetCachedImage(fullPath);
             if (!image)
             {
-                image = TryLoadImage(imagePath);
+                image = GetCachedImage(imagePath);
                 fullPath = imagePath;
             }
             if (image)
@@ -2713,10 +2926,10 @@ void NovelRuntime::ActivateChoice(const ScriptCommand& command)
     if (!buttonImagePath.empty())
     {
         std::wstring fullPath = CombinePath(scenarioBaseDir_, buttonImagePath);
-        auto image = TryLoadImage(fullPath);
+        auto image = GetCachedImage(fullPath);
         if (!image)
         {
-            image = TryLoadImage(buttonImagePath);
+            image = GetCachedImage(buttonImagePath);
             fullPath = buttonImagePath;
         }
         if (image)
@@ -2855,6 +3068,10 @@ void NovelRuntime::SelectChoice(size_t index)
 
 std::vector<ScenarioIssue> NovelRuntime::ValidateScenario() const
 {
+    if (!scenarioIssueCacheDirty_)
+    {
+        return scenarioIssueCache_;
+    }
     std::vector<ScenarioIssue> issues;
     std::unordered_map<std::wstring, size_t> labelFirstIndex;
     std::unordered_set<std::wstring> knownVariables;
@@ -2889,7 +3106,12 @@ std::vector<ScenarioIssue> NovelRuntime::ValidateScenario() const
         };
         for (const std::wstring& candidate : candidates)
         {
-            if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
+            std::wstring normalized = NormalizeFullPath(candidate);
+            if (!normalized.empty())
+            {
+                CharLowerBuffW(&normalized[0], static_cast<DWORD>(normalized.size()));
+            }
+            if (assetPathIndex_.find(normalized) != assetPathIndex_.end() || GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES)
             {
                 return true;
             }
@@ -2912,6 +3134,15 @@ std::vector<ScenarioIssue> NovelRuntime::ValidateScenario() const
         };
         for (const std::wstring& candidate : candidates)
         {
+            std::wstring normalized = NormalizeFullPath(candidate);
+            if (!normalized.empty())
+            {
+                CharLowerBuffW(&normalized[0], static_cast<DWORD>(normalized.size()));
+            }
+            if (assetPathIndex_.find(normalized) != assetPathIndex_.end())
+            {
+                return true;
+            }
             const DWORD attributes = GetFileAttributesW(candidate.c_str());
             if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
             {
@@ -3226,7 +3457,44 @@ std::vector<ScenarioIssue> NovelRuntime::ValidateScenario() const
         }
     }
 
-    return issues;
+    scenarioIssueCache_ = issues;
+    scenarioIssueCacheDirty_ = false;
+    return scenarioIssueCache_;
+}
+
+void NovelRuntime::InvalidateScenarioCaches()
+{
+    scenarioIssueCacheDirty_ = true;
+}
+
+void NovelRuntime::RebuildAssetPathIndex()
+{
+    assetPathIndex_.clear();
+    const auto add = [this](const std::wstring& path)
+    {
+        if (path.empty())
+        {
+            return;
+        }
+        std::wstring normalized = NormalizeFullPath(path);
+        if (!normalized.empty())
+        {
+            CharLowerBuffW(&normalized[0], static_cast<DWORD>(normalized.size()));
+        }
+        assetPathIndex_.insert(std::move(normalized));
+    };
+    for (const AssetListItem& item : assetItems_)
+    {
+        if (!item.isDirectory)
+        {
+            add(item.path);
+        }
+    }
+    for (const SceneListItem& item : sceneItems_)
+    {
+        add(item.path);
+    }
+    InvalidateScenarioCaches();
 }
 
 std::wstring NovelRuntime::GetFirstIssueForCommand(size_t commandIndex) const
@@ -3259,6 +3527,7 @@ bool NovelRuntime::SelectFirstScenarioIssue()
 
 void NovelRuntime::LoadScenario(const std::wstring& requestedPath)
 {
+    InvalidateScenarioCaches();
     StopBgmPlayback();
     StopAssetPreviewAudio();
     currentBgmPath_.clear();
@@ -3281,6 +3550,7 @@ void NovelRuntime::LoadScenario(const std::wstring& requestedPath)
     scenarioBaseDir_.clear();
     scenarioPath_.clear();
     projectPath_.clear();
+    projectId_.clear();
     selectedScenePath_.clear();
     scenario_ = ScenarioDocument{};
     variables_.clear();
@@ -3377,8 +3647,10 @@ void NovelRuntime::LoadScenario(const std::wstring& requestedPath)
     scenarioPath_ = loadedPath;
     selectedScenePath_ = loadedPath;
     scenarioBaseDir_ = GetDirectoryPath(loadedPath);
+    NormalizeLoadedAssetPaths();
     projectPath_ = CombinePath(GetAssetsRootDirectory(), L"project.kproj");
     LoadProjectSettings(projectPath_);
+    PreloadScenarioImages();
     if (!autosaveRestoreChecked_ && !restoringAutosave_)
     {
         autosaveRestoreChecked_ = true;
@@ -5308,6 +5580,8 @@ const ScriptCommand* NovelRuntime::GetSelectedCommand() const
 
 void NovelRuntime::SyncDocumentMetadata()
 {
+    InvalidateScenarioCaches();
+    documentDirty_ = true;
     RebuildScenarioLabels(scenario_);
     NormalizePlaybackStateAfterScenarioMutation();
     SyncVariableDefinitions();
@@ -5325,7 +5599,7 @@ void NovelRuntime::SyncDocumentMetadata()
             }
         }
     }
-    SaveAutosaveSnapshot();
+    ScheduleAutosave();
 }
 
 void NovelRuntime::NormalizePlaybackStateAfterScenarioMutation()
@@ -7422,15 +7696,33 @@ bool NovelRuntime::HandlePreviewMouseUp(POINT point)
 bool NovelRuntime::HandleTimer()
 {
     const DWORD now = GetTickCount();
+    const ULONGLONG now64 = GetTickCount64();
     bool needsRedraw = false;
+
+    PumpPendingAudioDecodes();
+
+    if (autosavePending_ && now64 >= autosaveDueTick_)
+    {
+        autosavePending_ = false;
+        SaveAutosaveSnapshot();
+    }
 
     if (textRevealActive_ && now >= nextTextRevealTick_)
     {
         if (textRevealIndex_ < currentText_.size())
         {
-            ++textRevealIndex_;
+            const DWORD interval = static_cast<DWORD>((std::max)(0, textSpeedMs_));
+            if (interval == 0)
+            {
+                textRevealIndex_ = currentText_.size();
+            }
+            else
+            {
+                const size_t elapsedSteps = 1 + static_cast<size_t>((now - nextTextRevealTick_) / interval);
+                textRevealIndex_ = (std::min)(currentText_.size(), textRevealIndex_ + elapsedSteps);
+                nextTextRevealTick_ += static_cast<DWORD>(elapsedSteps * interval);
+            }
             displayedText_ = currentText_.substr(0, textRevealIndex_);
-            nextTextRevealTick_ = now + static_cast<DWORD>((std::max)(0, textSpeedMs_));
             needsRedraw = true;
         }
 
@@ -8255,6 +8547,7 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
         return;
     }
 
+    projectId_.clear();
     characterDefinitions_.clear();
     variableDefinitions_.clear();
     storyCategories_.clear();
@@ -8286,7 +8579,8 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
 
         const std::wstring key = Trim(line.substr(0, split));
         const std::wstring value = Trim(line.substr(split + 1));
-        if (key == L"left_panel_width") leftPanelWidth_ = _wtoi(value.c_str());
+        if (key == L"project_id") projectId_ = UnescapeSaveValue(value);
+        else if (key == L"left_panel_width") leftPanelWidth_ = _wtoi(value.c_str());
         else if (key == L"right_panel_width") rightPanelWidth_ = _wtoi(value.c_str());
         else if (key == L"graph_height") graphHeight_ = _wtoi(value.c_str());
         else if (key == L"event_list_height") eventListHeight_ = _wtoi(value.c_str());
@@ -8607,6 +8901,7 @@ void NovelRuntime::LoadProjectSettings(const std::wstring& projectPath)
 
 bool NovelRuntime::SaveProject()
 {
+    EnsureProjectId();
     if (scenarioPath_.empty())
     {
         scenarioPath_ = CombinePath(GetScenarioDirectory(), L"main.ks");
@@ -8634,6 +8929,43 @@ bool NovelRuntime::SaveProject()
     statusText_ = L"\u30d7\u30ed\u30b8\u30a7\u30af\u30c8\u3092\u4fdd\u5b58\u3057\u307e\u3057\u305f";
     ShowToast(L"保存しました");
     return true;
+}
+
+void NovelRuntime::NormalizeLoadedAssetPaths()
+{
+    const std::wstring assetsRoot = GetAssetsRootDirectory();
+    for (ScriptCommand& command : scenario_.commands)
+    {
+        for (auto& parameter : command.parameters)
+        {
+            std::wstring lower = parameter.second;
+            if (!lower.empty())
+            {
+                CharLowerBuffW(&lower[0], static_cast<DWORD>(lower.size()));
+            }
+            const size_t assets = lower.rfind(L"\\assets\\");
+            if (assets == std::wstring::npos)
+            {
+                continue;
+            }
+            const std::wstring relative = parameter.second.substr(assets + 8);
+            const std::wstring localPath = CombinePath(assetsRoot, relative);
+            const DWORD attributes = GetFileAttributesW(localPath.c_str());
+            if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            {
+                parameter.second = relative;
+                documentDirty_ = true;
+            }
+        }
+    }
+}
+
+void NovelRuntime::EnsureProjectId()
+{
+    if (projectId_.empty())
+    {
+        projectId_ = Persistence::CreateId();
+    }
 }
 
 std::wstring NovelRuntime::BuildProjectFileText() const
@@ -8681,17 +9013,12 @@ std::wstring NovelRuntime::BuildProjectFileText() const
 
 void NovelRuntime::MarkCurrentStateSaved()
 {
-    lastSavedScenarioText_ = SerializeScenario(scenario_);
-    lastSavedProjectText_ = BuildProjectFileText();
+    documentDirty_ = false;
 }
 
 bool NovelRuntime::HasUnsavedChanges() const
 {
-    if (scenarioPath_.empty() && projectPath_.empty())
-    {
-        return false;
-    }
-    return SerializeScenario(scenario_) != lastSavedScenarioText_ || BuildProjectFileText() != lastSavedProjectText_;
+    return documentDirty_ && (!scenarioPath_.empty() || !projectPath_.empty());
 }
 
 bool NovelRuntime::ConfirmDiscardUnsavedChanges()
@@ -8810,7 +9137,14 @@ void NovelRuntime::DrawToast(HDC hdc, const RECT& clientRect) const
 std::wstring NovelRuntime::SerializeProjectSettings() const
 {
     std::wstring projectText;
-    projectText += L"scenario_path=" + scenarioPath_ + L"\r\n";
+    std::wstring scenarioValue = scenarioPath_;
+    if (!projectPath_.empty())
+    {
+        scenarioValue = MakeRelativePath(NormalizeFullPath(scenarioPath_), NormalizeFullPath(GetDirectoryPath(projectPath_)));
+    }
+    projectText += L"format_version=2\r\n";
+    projectText += L"project_id=" + EscapeSaveValue(projectId_) + L"\r\n";
+    projectText += L"scenario_path=" + EscapeSaveValue(scenarioValue) + L"\r\n";
     projectText += L"left_panel_width=" + std::to_wstring(leftPanelWidth_) + L"\r\n";
     projectText += L"right_panel_width=" + std::to_wstring(rightPanelWidth_) + L"\r\n";
     projectText += L"graph_height=" + std::to_wstring(graphHeight_) + L"\r\n";
@@ -8961,6 +9295,8 @@ bool NovelRuntime::SaveProjectAs()
 std::wstring NovelRuntime::BuildDefaultProjectSettingsText(const std::wstring& scenarioPath) const
 {
     std::wstring text;
+    text += L"format_version=2\r\n";
+    text += L"project_id=" + Persistence::CreateId() + L"\r\n";
     text += L"scenario_path=" + EscapeSaveValue(scenarioPath) + L"\r\n";
     text += L"left_panel_width=280\r\n";
     text += L"right_panel_width=320\r\n";
@@ -9004,7 +9340,7 @@ std::wstring NovelRuntime::BuildDefaultProjectSettingsText(const std::wstring& s
     text += L"settings_window_width=1280\r\n";
     text += L"settings_window_height=720\r\n";
     text += L"settings_default_font=" + EscapeSaveValue(editorSettings_.defaultFont) + L"\r\n";
-    text += L"settings_default_text_speed=40\r\n";
+    text += L"settings_default_text_speed=20\r\n";
     text += L"settings_master_volume=100\r\n";
     text += L"settings_bgm_volume=100\r\n";
     text += L"settings_se_volume=100\r\n";
@@ -9409,7 +9745,6 @@ bool NovelRuntime::LoadProjectFile(const std::wstring& projectPath)
         if (Trim(line.substr(0, split)) == L"scenario_path")
         {
             scenarioValue = UnescapeSaveValue(Trim(line.substr(split + 1)));
-            break;
         }
     }
 
@@ -9431,12 +9766,14 @@ bool NovelRuntime::LoadProjectFile(const std::wstring& projectPath)
     }
 
     LoadScenario(scenarioPath);
+    const std::wstring inferredProjectPath = projectPath_;
     projectPath_ = projectPath;
-    LoadProjectSettings(projectPath_);
-    RefreshSceneList();
-    RefreshAssetList();
-    LoadToolbarIcons();
-    LoadUiButtonIcons();
+    if (_wcsicmp(inferredProjectPath.c_str(), projectPath_.c_str()) != 0)
+    {
+        LoadProjectSettings(projectPath_);
+        LoadToolbarIcons();
+        LoadUiButtonIcons();
+    }
     AddRecentProject(projectPath);
     projectLauncherVisible_ = false;
     MarkCurrentStateSaved();
@@ -10906,7 +11243,20 @@ std::wstring NovelRuntime::GetAutosavePath() const
 
 std::wstring NovelRuntime::GetQuickSavePath() const
 {
-    const std::wstring root = editorSettings_.saveDirectory.empty() ? GetAssetsRootDirectory() : editorSettings_.saveDirectory;
+    std::wstring root = editorSettings_.saveDirectory;
+    if (root.empty())
+    {
+        WCHAR localAppData[MAX_PATH] = {};
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppData)))
+        {
+            const std::wstring identity = projectId_.empty() ? Persistence::HashText(projectPath_.empty() ? scenarioPath_ : projectPath_) : projectId_;
+            root = CombinePath(CombinePath(CombinePath(localAppData, L"KaktosEngine"), L"Saves"), identity);
+        }
+        else
+        {
+            root = CombinePath(GetAssetsRootDirectory(), L"save");
+        }
+    }
     EnsureDirectoryExists(root);
     return CombinePath(root, L"quicksave.ksav");
 }
@@ -10923,7 +11273,24 @@ void NovelRuntime::SaveAutosaveSnapshot()
     text += L"selected_command_index=" + std::to_wstring(selectedCommandIndex_) + L"\r\n";
     text += L"project_text=" + EscapeSaveValue(SerializeProjectSettings()) + L"\r\n";
     text += L"scenario_text=" + EscapeSaveValue(SerializeScenario(scenario_)) + L"\r\n";
-    TryWriteTextFile(GetAutosavePath(), text);
+    if (autosaveWriter_)
+    {
+        autosaveWriter_->Submit(GetAutosavePath(), std::move(text));
+    }
+    else
+    {
+        TryWriteTextFile(GetAutosavePath(), text);
+    }
+}
+
+void NovelRuntime::ScheduleAutosave()
+{
+    if (!editorSettings_.autosaveEnabled || scenarioPath_.empty() || restoringAutosave_)
+    {
+        return;
+    }
+    autosavePending_ = true;
+    autosaveDueTick_ = GetTickCount64() + 800;
 }
 
 void NovelRuntime::DeleteAutosaveSnapshot()
@@ -11109,8 +11476,31 @@ std::wstring NovelRuntime::BrowseForFolder(const std::wstring& title, const std:
 
 bool NovelRuntime::SaveRuntimeStateToPath(const std::wstring& savePath)
 {
+    EnsureProjectId();
     std::wstring saveText;
-    saveText += L"scenario_path=" + EscapeSaveValue(scenarioPath_) + L"\r\n";
+    std::wstring scenarioValue = MakeRelativePath(NormalizeFullPath(scenarioPath_), NormalizeFullPath(GetAssetsRootDirectory()));
+    std::wstring resumeLabel;
+    size_t resumeLabelIndex = 0;
+    for (const auto& label : scenario_.labels)
+    {
+        if (label.second <= currentCommandIndex_ && (resumeLabel.empty() || label.second >= resumeLabelIndex))
+        {
+            resumeLabel = label.first;
+            resumeLabelIndex = label.second;
+        }
+    }
+    FILETIME savedAt = {};
+    GetSystemTimeAsFileTime(&savedAt);
+    ULARGE_INTEGER savedAtValue = {};
+    savedAtValue.LowPart = savedAt.dwLowDateTime;
+    savedAtValue.HighPart = savedAt.dwHighDateTime;
+
+    saveText += L"format_version=2\r\n";
+    saveText += L"project_id=" + EscapeSaveValue(projectId_) + L"\r\n";
+    saveText += L"saved_at=" + std::to_wstring(savedAtValue.QuadPart) + L"\r\n";
+    saveText += L"scenario_path=" + EscapeSaveValue(scenarioValue) + L"\r\n";
+    saveText += L"resume_label=" + EscapeSaveValue(resumeLabel) + L"\r\n";
+    saveText += L"resume_offset=" + std::to_wstring(currentCommandIndex_ - resumeLabelIndex) + L"\r\n";
     saveText += L"story_title=" + EscapeSaveValue(storyTitle_) + L"\r\n";
     saveText += L"speaker=" + EscapeSaveValue(speakerName_) + L"\r\n";
     saveText += L"name_visible=" + std::to_wstring(nameBoxVisible_ ? 1 : 0) + L"\r\n";
@@ -11176,6 +11566,7 @@ bool NovelRuntime::SaveRuntimeStateToPath(const std::wstring& savePath)
         saveText += L"choice." + std::to_wstring(i) + L".enabled=" + std::wstring(activeChoices_[i].enabled ? L"1" : L"0") + L"\r\n";
     }
 
+    saveText += L"payload_checksum=" + Persistence::HashText(saveText) + L"\r\n";
     if (!TryWriteTextFile(savePath, saveText))
     {
         statusText_ = L"\u30bb\u30fc\u30d6\u30c7\u30fc\u30bf\u306e\u4fdd\u5b58\u306b\u5931\u6557\u3057\u307e\u3057\u305f";
@@ -11218,10 +11609,10 @@ void NovelRuntime::ApplyLoadedCharacterState(CharacterSlot& slot, const std::wst
     slot.imagePath = imagePath;
     if (!imagePath.empty() && imagePath != L"solid")
     {
-        auto image = TryLoadImage(imagePath);
+        auto image = GetCachedImage(imagePath);
         if (!image)
         {
-            image = TryLoadImage(CombinePath(scenarioBaseDir_, imagePath));
+            image = GetCachedImage(CombinePath(scenarioBaseDir_, imagePath));
         }
         slot.image = std::move(image);
     }
@@ -11234,6 +11625,19 @@ bool NovelRuntime::LoadRuntimeStateFromPath(const std::wstring& savePath)
     {
         statusText_ = L"\u30bb\u30fc\u30d6\u30c7\u30fc\u30bf\u3092\u958b\u3051\u307e\u305b\u3093";
         return false;
+    }
+
+    const std::wstring checksumMarker = L"payload_checksum=";
+    const size_t checksumPosition = content.rfind(checksumMarker);
+    if (checksumPosition != std::wstring::npos)
+    {
+        const size_t checksumEnd = content.find_first_of(L"\r\n", checksumPosition);
+        const std::wstring expected = content.substr(checksumPosition + checksumMarker.size(), checksumEnd - checksumPosition - checksumMarker.size());
+        if (_wcsicmp(expected.c_str(), Persistence::HashText(content.substr(0, checksumPosition)).c_str()) != 0)
+        {
+            statusText_ = L"セーブデータが破損しています";
+            return false;
+        }
     }
 
     std::unordered_map<std::wstring, std::wstring> values;
@@ -11254,6 +11658,13 @@ bool NovelRuntime::LoadRuntimeStateFromPath(const std::wstring& savePath)
         values[Trim(line.substr(0, split))] = UnescapeSaveValue(line.substr(split + 1));
     }
 
+    const std::wstring savedProjectId = values[L"project_id"];
+    if (!savedProjectId.empty() && !projectId_.empty() && _wcsicmp(savedProjectId.c_str(), projectId_.c_str()) != 0)
+    {
+        statusText_ = L"別のプロジェクトのセーブデータです";
+        return false;
+    }
+
     const auto scenarioPathIt = values.find(L"scenario_path");
     if (scenarioPathIt == values.end() || scenarioPathIt->second.empty())
     {
@@ -11261,7 +11672,12 @@ bool NovelRuntime::LoadRuntimeStateFromPath(const std::wstring& savePath)
         return false;
     }
 
-    LoadScenario(scenarioPathIt->second);
+    std::wstring savedScenarioPath = scenarioPathIt->second;
+    if (savedScenarioPath.find(L':') == std::wstring::npos && !(savedScenarioPath.size() >= 2 && savedScenarioPath[0] == L'\\' && savedScenarioPath[1] == L'\\'))
+    {
+        savedScenarioPath = CombinePath(GetAssetsRootDirectory(), savedScenarioPath);
+    }
+    LoadScenario(savedScenarioPath);
 
     auto getValue = [&](const std::wstring& key) -> std::wstring
     {
@@ -11326,6 +11742,12 @@ bool NovelRuntime::LoadRuntimeStateFromPath(const std::wstring& savePath)
     }
 
     currentCommandIndex_ = static_cast<size_t>(_wtoi(getValue(L"current_command_index").c_str()));
+    const std::wstring resumeLabel = getValue(L"resume_label");
+    const auto resume = scenario_.labels.find(resumeLabel);
+    if (!resumeLabel.empty() && resume != scenario_.labels.end())
+    {
+        currentCommandIndex_ = resume->second + static_cast<size_t>((std::max)(0, _wtoi(getValue(L"resume_offset").c_str())));
+    }
     selectedCommandIndex_ = static_cast<size_t>(_wtoi(getValue(L"selected_command_index").c_str()));
     selectedChoiceLinkIndex_ = static_cast<size_t>(_wtoi(getValue(L"selected_choice_link_index").c_str()));
     waitingForChoice_ = getValue(L"waiting_for_choice") == L"1";
@@ -11616,6 +12038,7 @@ void NovelRuntime::RefreshAssetList()
 
         appendTree(dir, L"", 1);
     }
+    RebuildAssetPathIndex();
 }
 
 bool NovelRuntime::AddMaterialFile()
@@ -14066,7 +14489,7 @@ void NovelRuntime::DrawCharacterSlot(HDC hdc, const RECT& stageRect, const Chara
     if (slot.image)
     {
         Gdiplus::Graphics graphics(hdc);
-        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
         Gdiplus::ImageAttributes attributes;
         Gdiplus::ColorMatrix matrix =
         {
@@ -14077,7 +14500,12 @@ void NovelRuntime::DrawCharacterSlot(HDC hdc, const RECT& stageRect, const Chara
             0, 0, 0, 0, 1.0f
         };
         attributes.SetColorMatrix(&matrix);
-        DrawImageFit(graphics, slot.image.get(), characterRect, &attributes);
+        Gdiplus::Image* renderImage = GetScaledImage(
+            L"character:" + slot.imagePath,
+            slot.image,
+            characterRect.right - characterRect.left,
+            characterRect.bottom - characterRect.top);
+        DrawImageFit(graphics, renderImage, characterRect, &attributes);
     }
     else
     {
@@ -14124,7 +14552,7 @@ void NovelRuntime::DrawChoices(HDC hdc, const RECT& messageRect)
         if (choiceButtonImage_)
         {
             Gdiplus::Graphics graphics(hdc);
-            graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            graphics.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
             Gdiplus::ImageAttributes attributes;
             Gdiplus::ColorMatrix matrix =
             {
@@ -14135,7 +14563,12 @@ void NovelRuntime::DrawChoices(HDC hdc, const RECT& messageRect)
                 0, 0, 0, 0, 1.0f
             };
             attributes.SetColorMatrix(&matrix);
-            DrawImageFit(graphics, choiceButtonImage_.get(), optionRect, &attributes);
+            Gdiplus::Image* renderImage = GetScaledImage(
+                L"choice:" + choiceButtonImagePath_,
+                choiceButtonImage_,
+                optionRect.right - optionRect.left,
+                optionRect.bottom - optionRect.top);
+            DrawImageFit(graphics, renderImage, optionRect, &attributes);
         }
         else
         {
@@ -14271,10 +14704,10 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
 
     SetBkMode(hdc, TRANSPARENT);
     const wchar_t* messageFont = messageFontFace_.empty() ? L"Yu Gothic UI" : messageFontFace_.c_str();
-    HFONT titleFont = CreateFontW(28, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, messageFont);
-    HFONT bodyFont = CreateFontW(24, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, messageFont);
-    HFONT speakerFont = CreateFontW(24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, messageFont);
-    HFONT hintFont = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, messageFont);
+    HFONT titleFont = fontCache_.Get(28, FW_SEMIBOLD, messageFont);
+    HFONT bodyFont = fontCache_.Get(24, FW_NORMAL, messageFont);
+    HFONT speakerFont = fontCache_.Get(24, FW_BOLD, messageFont);
+    HFONT hintFont = fontCache_.Get(18, FW_NORMAL, messageFont);
     HFONT originalFont = static_cast<HFONT>(SelectObject(hdc, titleFont));
 
     HBRUSH stageBrush = CreateSolidBrush(backgroundColor_);
@@ -14284,7 +14717,7 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
     if (backgroundImage_ && backgroundVisible_)
     {
         Gdiplus::Graphics graphics(hdc);
-        graphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        graphics.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
         const int stageWidth = stageRect.right - stageRect.left;
         const int stageHeight = stageRect.bottom - stageRect.top;
         const int drawWidth = (stageWidth * backgroundScale_ * stageScale_) / 10000;
@@ -14302,7 +14735,8 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
         };
         attributes.SetColorMatrix(&matrix);
         const RECT backgroundDrawRect = { drawLeft, drawTop, drawLeft + drawWidth, drawTop + drawHeight };
-        DrawImageFit(graphics, backgroundImage_.get(), backgroundDrawRect, &attributes);
+        Gdiplus::Image* renderImage = GetScaledImage(L"background:" + backgroundPath_, backgroundImage_, drawWidth, drawHeight);
+        DrawImageFit(graphics, renderImage, backgroundDrawRect, &attributes);
     }
 
     DrawAlphaOverlay(hdc, stageRect, RGB(0, 0, 0), 45);
@@ -14323,8 +14757,13 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
         if (messageWindowImage_)
         {
             Gdiplus::Graphics messageGraphics(hdc);
-            messageGraphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-            DrawImageFit(messageGraphics, messageWindowImage_.get(), messageRect);
+            messageGraphics.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
+            Gdiplus::Image* renderImage = GetScaledImage(
+                L"message:" + messageWindowImagePath_,
+                messageWindowImage_,
+                messageRect.right - messageRect.left,
+                messageRect.bottom - messageRect.top);
+            DrawImageFit(messageGraphics, renderImage, messageRect);
         }
         else
         {
@@ -14359,8 +14798,13 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
             if (nameWindowImage_)
             {
                 Gdiplus::Graphics nameGraphics(hdc);
-                nameGraphics.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-                DrawImageFit(nameGraphics, nameWindowImage_.get(), namePaintRect);
+                nameGraphics.SetInterpolationMode(Gdiplus::InterpolationModeNearestNeighbor);
+                Gdiplus::Image* renderImage = GetScaledImage(
+                    L"name:" + nameWindowImagePath_,
+                    nameWindowImage_,
+                    namePaintRect.right - namePaintRect.left,
+                    namePaintRect.bottom - namePaintRect.top);
+                DrawImageFit(nameGraphics, renderImage, namePaintRect);
             }
             else
             {
@@ -14643,7 +15087,7 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
         FillRect(debugDc, &localDebugRect, debugBrush);
         DeleteObject(debugBrush);
         SetBkMode(debugDc, TRANSPARENT);
-        HFONT debugFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+        HFONT debugFont = fontCache_.Get(16, FW_NORMAL, L"Yu Gothic UI");
         HFONT oldDebugFont = static_cast<HFONT>(SelectObject(debugDc, debugFont));
 
         int debugY = 10;
@@ -14685,7 +15129,6 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
         }
 
         SelectObject(debugDc, oldDebugFont);
-        DeleteObject(debugFont);
         HBRUSH debugBorderBrush = CreateSolidBrush(RGB(88, 104, 122));
         FrameRect(debugDc, &localDebugRect, debugBorderBrush);
         DeleteObject(debugBorderBrush);
@@ -14698,10 +15141,6 @@ void NovelRuntime::DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool stan
     }
 
     SelectObject(hdc, originalFont);
-    DeleteObject(titleFont);
-    DeleteObject(bodyFont);
-    DeleteObject(speakerFont);
-    DeleteObject(hintFont);
 }
 
 void NovelRuntime::DrawPreviewWindow(HDC hdc, const RECT& clientRect)
@@ -19966,8 +20405,8 @@ std::wstring NovelRuntime::GetCommandSummary(const ScriptCommand& command) const
 void NovelRuntime::DrawCommandList(HDC hdc, const RECT& panelRect)
 {
     SetBkMode(hdc, TRANSPARENT);
-    HFONT headerFont = CreateFontW(22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
-    HFONT rowFont = CreateFontW(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT headerFont = fontCache_.Get(22, FW_BOLD, L"Yu Gothic UI");
+    HFONT rowFont = fontCache_.Get(18, FW_NORMAL, L"Yu Gothic UI");
     HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, headerFont));
 
     SetTextColor(hdc, RGB(240, 242, 246));
@@ -20018,8 +20457,6 @@ void NovelRuntime::DrawCommandList(HDC hdc, const RECT& panelRect)
     }
 
     SelectObject(hdc, oldFont);
-    DeleteObject(headerFont);
-    DeleteObject(rowFont);
 }
 
 void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
@@ -20027,9 +20464,15 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
     currentEventListRect_ = panelRect;
     eventTextEditRect_ = {};
     const std::vector<ScenarioIssue> scenarioIssues = ValidateScenario();
+    std::unordered_map<size_t, std::wstring> issueByCommand;
+    issueByCommand.reserve(scenarioIssues.size());
+    for (const ScenarioIssue& issue : scenarioIssues)
+    {
+        issueByCommand.emplace(issue.commandIndex, issue.message);
+    }
     SetBkMode(hdc, TRANSPARENT);
-    HFONT headerFont = CreateFontW(18, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
-    HFONT bodyFont = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Yu Gothic UI");
+    HFONT headerFont = fontCache_.Get(18, FW_BOLD, L"Yu Gothic UI");
+    HFONT bodyFont = fontCache_.Get(16, FW_NORMAL, L"Yu Gothic UI");
     HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, headerFont));
 
     HBRUSH listBrush = CreateSolidBrush(RGB(18, 24, 32));
@@ -20086,15 +20529,8 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
     {
         const size_t commandIndex = filteredIndices[filteredIndex];
         const ScriptCommand& command = scenario_.commands[commandIndex];
-        std::wstring issueMessage;
-        for (const ScenarioIssue& issue : scenarioIssues)
-        {
-            if (issue.commandIndex == commandIndex)
-            {
-                issueMessage = issue.message;
-                break;
-            }
-        }
+        const auto issue = issueByCommand.find(commandIndex);
+        const std::wstring issueMessage = issue == issueByCommand.end() ? L"" : issue->second;
         const bool disabled = ParseBoolValue(GetCommandParameter(command, L"disabled"), false);
         const bool expanded = command.type == ScriptCommand::Type::Text && expandedTextCommandIndex_ == commandIndex;
         const int fullHeight = rowHeight + (expanded ? expandedHeight : 0);
@@ -20207,8 +20643,6 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
             RECT scrollContentRect = { panelRect.left, startY, panelRect.right, panelRect.bottom - 8 };
             DrawVerticalScrollbar(hdc, scrollContentRect, eventListScrollOffset_, maxOffset, RGB(24, 30, 38), RGB(106, 120, 136));
             SelectObject(hdc, oldFont);
-            DeleteObject(headerFont);
-            DeleteObject(bodyFont);
             return;
         }
         int indicatorY = panelRect.top + 52;
@@ -20239,8 +20673,6 @@ void NovelRuntime::DrawEventList(HDC hdc, const RECT& panelRect)
     DrawVerticalScrollbar(hdc, scrollContentRect, eventListScrollOffset_, maxOffset, RGB(24, 30, 38), RGB(106, 120, 136));
 
     SelectObject(hdc, oldFont);
-    DeleteObject(headerFont);
-    DeleteObject(bodyFont);
 }
 
 void NovelRuntime::DrawInspector(HDC hdc, const RECT& panelRect)

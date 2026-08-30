@@ -1,8 +1,12 @@
 #include "framework.h"
 #include "kaktosEngine.h"
 #include "NovelRuntime.h"
+#include "BackBuffer.h"
 #include <shellapi.h>
+#include <mmsystem.h>
 #include <vector>
+
+#pragma comment(lib, "winmm.lib")
 
 #define MAX_LOADSTRING 100
 
@@ -13,6 +17,9 @@ const wchar_t* kPreviewWindowClass = L"KaktosPreviewWindow";
 NovelRuntime g_runtime;
 bool g_playerMode = false;
 HBRUSH g_darkEditBrush = nullptr;
+BackBuffer g_mainBackBuffer;
+BackBuffer g_previewBackBuffer;
+HWND g_mainWindow = nullptr;
 
 ATOM MyRegisterClass(HINSTANCE hInstance);
 BOOL InitInstance(HINSTANCE, int);
@@ -85,14 +92,69 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     }
 
     HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_KAKTOSENGINE));
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0))
+    MSG msg = {};
+    LARGE_INTEGER frequency = {};
+    LARGE_INTEGER nextFrame = {};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&nextFrame);
+    const LONGLONG frameStep = (std::max<LONGLONG>)(1, frequency.QuadPart / 60);
+    HANDLE frameTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    timeBeginPeriod(1);
+    bool running = true;
+    while (running)
     {
-        if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
         {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+            if (msg.message == WM_QUIT)
+            {
+                running = false;
+                break;
+            }
+            if (!TranslateAccelerator(msg.hwnd, hAccelTable, &msg))
+            {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
         }
+        if (!running)
+        {
+            break;
+        }
+
+        LARGE_INTEGER now = {};
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart >= nextFrame.QuadPart)
+        {
+            if (g_runtime.HandleTimer() && g_mainWindow)
+            {
+                InvalidateRect(g_mainWindow, nullptr, FALSE);
+            }
+            nextFrame.QuadPart += frameStep;
+            if (now.QuadPart - nextFrame.QuadPart > frameStep)
+            {
+                nextFrame.QuadPart = now.QuadPart + frameStep;
+            }
+        }
+
+        QueryPerformanceCounter(&now);
+        const LONGLONG remaining = (std::max<LONGLONG>)(0, nextFrame.QuadPart - now.QuadPart);
+        if (frameTimer)
+        {
+            LARGE_INTEGER due = {};
+            due.QuadPart = -(std::max<LONGLONG>)(1, (remaining * 10000000) / frequency.QuadPart);
+            SetWaitableTimer(frameTimer, &due, 0, nullptr, nullptr, FALSE);
+            MsgWaitForMultipleObjectsEx(1, &frameTimer, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+        else
+        {
+            const DWORD waitMs = static_cast<DWORD>((remaining * 1000 + frequency.QuadPart - 1) / frequency.QuadPart);
+            MsgWaitForMultipleObjectsEx(0, nullptr, waitMs, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+    }
+    timeEndPeriod(1);
+    if (frameTimer)
+    {
+        CloseHandle(frameTimer);
     }
 
     g_runtime.Shutdown();
@@ -150,6 +212,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
         return FALSE;
     }
 
+    g_mainWindow = hWnd;
     g_runtime.SetHostWindow(hWnd);
     DragAcceptFiles(hWnd, TRUE);
 
@@ -441,9 +504,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         GetClientRect(hWnd, &clientRect);
         const int width = clientRect.right - clientRect.left;
         const int height = clientRect.bottom - clientRect.top;
-        HDC memoryDc = CreateCompatibleDC(hdc);
-        HBITMAP backBuffer = CreateCompatibleBitmap(hdc, width, height);
-        HGDIOBJ oldBitmap = SelectObject(memoryDc, backBuffer);
+        HDC memoryDc = g_mainBackBuffer.Begin(hdc, width, height);
+        if (!memoryDc)
+        {
+            EndPaint(hWnd, &ps);
+            return 0;
+        }
         if (g_playerMode)
         {
             g_runtime.DrawPreviewWindow(memoryDc, clientRect);
@@ -452,23 +518,14 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         {
             g_runtime.Draw(memoryDc, clientRect);
         }
-        BitBlt(hdc, 0, 0, width, height, memoryDc, 0, 0, SRCCOPY);
-        SelectObject(memoryDc, oldBitmap);
-        DeleteObject(backBuffer);
-        DeleteDC(memoryDc);
+        g_mainBackBuffer.Present(hdc, ps.rcPaint);
         EndPaint(hWnd, &ps);
         return 0;
     }
     case WM_ERASEBKGND:
         return 1;
-    case WM_TIMER:
-        if (g_runtime.HandleTimer())
-        {
-            InvalidateRect(hWnd, nullptr, FALSE);
-            return 0;
-        }
-        break;
     case WM_DESTROY:
+        g_mainBackBuffer.Reset();
         if (g_darkEditBrush)
         {
             DeleteObject(g_darkEditBrush);
@@ -564,20 +621,21 @@ LRESULT CALLBACK PreviewWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM l
         GetClientRect(hWnd, &clientRect);
         const int width = clientRect.right - clientRect.left;
         const int height = clientRect.bottom - clientRect.top;
-        HDC memoryDc = CreateCompatibleDC(hdc);
-        HBITMAP backBuffer = CreateCompatibleBitmap(hdc, width, height);
-        HGDIOBJ oldBitmap = SelectObject(memoryDc, backBuffer);
+        HDC memoryDc = g_previewBackBuffer.Begin(hdc, width, height);
+        if (!memoryDc)
+        {
+            EndPaint(hWnd, &ps);
+            return 0;
+        }
         g_runtime.DrawPreviewWindow(memoryDc, clientRect);
-        BitBlt(hdc, 0, 0, width, height, memoryDc, 0, 0, SRCCOPY);
-        SelectObject(memoryDc, oldBitmap);
-        DeleteObject(backBuffer);
-        DeleteDC(memoryDc);
+        g_previewBackBuffer.Present(hdc, ps.rcPaint);
         EndPaint(hWnd, &ps);
         return 0;
     }
     case WM_ERASEBKGND:
         return 1;
     case WM_DESTROY:
+        g_previewBackBuffer.Reset();
         g_runtime.NotifyPreviewWindowDestroyed();
         return 0;
     default:

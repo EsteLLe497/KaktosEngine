@@ -1,13 +1,20 @@
 ﻿#pragma once
 
 #include "Scenario.h"
+#include "AsyncTextWriter.h"
+#include "GdiFontCache.h"
+#include "StreamingAudioPlayer.h"
 
 #include <objidl.h>
 #include <wrl/client.h>
 #include <xaudio2.h>
 #include <gdiplus.h>
+#include <array>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <windows.h>
 
 struct EditorSnapshot
@@ -76,7 +83,7 @@ struct CharacterSlot
     std::wstring characterId;
     std::wstring displayName;
     std::wstring imagePath;
-    std::unique_ptr<Gdiplus::Image> image;
+    std::shared_ptr<Gdiplus::Image> image;
     bool visible = true;
     int offsetX = 0;
     int offsetY = 0;
@@ -198,7 +205,7 @@ struct EditorSettings
     int windowWidth = 1280;
     int windowHeight = 720;
     std::wstring defaultFont = L"Yu Gothic UI";
-    int defaultTextSpeed = 40;
+    int defaultTextSpeed = 20;
     int masterVolume = 100;
     int bgmVolume = 100;
     int seVolume = 100;
@@ -286,12 +293,33 @@ enum class AudioChannel
 struct AudioPlaybackState
 {
     IXAudio2SourceVoice* voice = nullptr;
-    std::vector<BYTE> formatBytes;
-    std::vector<BYTE> audioBytes;
+    std::shared_ptr<struct DecodedAudioData> decoded;
     bool looping = false;
     bool usesLegacyMci = false;
     std::wstring legacyAlias;
     std::wstring sourcePath;
+};
+
+struct ScaledImageEntry
+{
+    std::shared_ptr<Gdiplus::Image> source;
+    std::unique_ptr<Gdiplus::Bitmap> bitmap;
+};
+
+struct DecodedAudioData
+{
+    std::vector<BYTE> formatBytes;
+    std::vector<BYTE> audioBytes;
+};
+
+struct PendingAudioDecode
+{
+    AudioChannel channel = AudioChannel::Bgm;
+    std::wstring path;
+    bool loop = false;
+    int volumePercent = 100;
+    unsigned long long generation = 0;
+    std::future<std::shared_ptr<DecodedAudioData>> future;
 };
 
 struct ProjectLauncherRow
@@ -305,6 +333,7 @@ struct ProjectLauncherRow
 class NovelRuntime
 {
 public:
+    ~NovelRuntime();
     enum class LeftPanelTab
     {
         Components,
@@ -404,6 +433,9 @@ private:
     void ShutdownAudioEngine();
     bool DecodeAudioFile(const std::wstring& fullPath, std::vector<BYTE>& formatBytes, std::vector<BYTE>& audioBytes);
     bool PlayAudioFile(AudioChannel channel, const std::wstring& fullPath, bool loop, int volumePercent);
+    bool StartDecodedAudio(AudioChannel channel, const std::wstring& path, bool loop, int volumePercent, const std::shared_ptr<DecodedAudioData>& decoded);
+    void PumpPendingAudioDecodes();
+    void DiscardPendingAudioDecodes();
     void StopAudioChannel(AudioChannel channel);
     void SetAudioChannelVolume(AudioChannel channel, int volumePercent);
     AudioPlaybackState& GetAudioPlaybackState(AudioChannel channel);
@@ -419,6 +451,9 @@ private:
     bool TryGetNumber(const std::wstring& value, long long& number) const;
     std::unique_ptr<Gdiplus::Image> TryLoadImage(const std::wstring& fullPath) const;
     std::shared_ptr<Gdiplus::Image> GetCachedImage(const std::wstring& path) const;
+    std::shared_ptr<Gdiplus::Image> ResolveCachedImage(const std::wstring& path) const;
+    Gdiplus::Image* GetScaledImage(const std::wstring& id, const std::shared_ptr<Gdiplus::Image>& source, int width, int height) const;
+    void PreloadScenarioImages();
     void DrawWrappedText(HDC hdc, const RECT& bounds, const std::wstring& text, UINT format) const;
     void DrawVerticalText(HDC hdc, const RECT& bounds, const std::wstring& text, int lineHeight) const;
     void DrawCharacterSlot(HDC hdc, const RECT& stageRect, const CharacterSlot& slot, int centerX) const;
@@ -507,6 +542,7 @@ private:
     void MoveSelectedCommand(int delta);
     void ToggleSelectedCommandEnabled();
     bool SaveProject();
+    void EnsureProjectId();
     bool SaveProjectAs();
     bool CreateProjectFromDialog();
     bool LoadProjectFromDialog();
@@ -577,6 +613,7 @@ private:
     bool RenameCurrentScene();
     bool RestoreAutosaveSnapshot(bool notifyOnMissing);
     void SaveAutosaveSnapshot();
+    void ScheduleAutosave();
     void DeleteAutosaveSnapshot();
     std::wstring GetAutosavePath() const;
     std::wstring GetQuickSavePath() const;
@@ -588,6 +625,8 @@ private:
     bool BrowseCommandAsset(size_t commandIndex, const std::wstring& key, bool audio);
     bool UpdateInspectorSliderFromPoint(size_t sliderIndex, POINT point);
     std::vector<ScenarioIssue> ValidateScenario() const;
+    void InvalidateScenarioCaches();
+    void RebuildAssetPathIndex();
     std::wstring GetFirstIssueForCommand(size_t commandIndex) const;
     bool SelectFirstScenarioIssue();
     void RefreshAvailableFonts();
@@ -622,6 +661,7 @@ private:
     void TogglePreviewWindow();
     void DrawPreviewSurface(HDC hdc, const RECT& clientRect, bool standalone);
     void NormalizePlaybackStateAfterScenarioMutation();
+    void NormalizeLoadedAssetPaths();
     std::wstring GetVariableTypeLabel(VariableType type) const;
     std::wstring GetAssetsRootDirectory() const;
     std::wstring GetScenarioDirectory() const;
@@ -642,6 +682,7 @@ private:
 
 private:
     ULONG_PTR gdiplusToken_ = 0;
+    GdiFontCache fontCache_;
     bool comInitialized_ = false;
     bool mediaFoundationInitialized_ = false;
     Microsoft::WRL::ComPtr<IXAudio2> xaudio2_;
@@ -650,6 +691,12 @@ private:
     AudioPlaybackState sePlayback_;
     AudioPlaybackState voicePlayback_;
     AudioPlaybackState previewPlayback_;
+    StreamingAudioPlayer bgmStream_;
+    std::array<unsigned long long, 4> audioRequestGeneration_ = {};
+    std::vector<PendingAudioDecode> pendingAudioDecodes_;
+    std::unordered_map<std::wstring, std::shared_ptr<DecodedAudioData>> decodedAudioCache_;
+    size_t decodedAudioCacheBytes_ = 0;
+    std::mutex audioDecodeMutex_;
     HWND hostWindow_ = nullptr;
     HWND previewWindow_ = nullptr;
     HWND flowGraphWindow_ = nullptr;
@@ -671,6 +718,7 @@ private:
     std::wstring scenarioBaseDir_;
     std::wstring scenarioPath_;
     std::wstring projectPath_;
+    std::wstring projectId_;
     std::wstring currentBgmPath_;
     std::wstring lastAudioDebugMessage_;
     std::wstring messageFontFace_ = L"Yu Gothic UI";
@@ -679,11 +727,12 @@ private:
     std::wstring choiceButtonImagePath_;
     std::wstring backgroundPath_;
     std::wstring backgroundDisplayName_;
-    std::unique_ptr<Gdiplus::Image> messageWindowImage_;
-    std::unique_ptr<Gdiplus::Image> nameWindowImage_;
-    std::unique_ptr<Gdiplus::Image> choiceButtonImage_;
-    std::unique_ptr<Gdiplus::Image> backgroundImage_;
+    std::shared_ptr<Gdiplus::Image> messageWindowImage_;
+    std::shared_ptr<Gdiplus::Image> nameWindowImage_;
+    std::shared_ptr<Gdiplus::Image> choiceButtonImage_;
+    std::shared_ptr<Gdiplus::Image> backgroundImage_;
     mutable std::unordered_map<std::wstring, std::shared_ptr<Gdiplus::Image>> imageCache_;
+    mutable std::unordered_map<std::wstring, ScaledImageEntry> scaledImageCache_;
     COLORREF backgroundColor_ = RGB(28, 36, 48);
     COLORREF messageWindowColor_ = RGB(8, 10, 14);
     COLORREF messageWindowBorderColor_ = RGB(122, 128, 138);
@@ -728,6 +777,9 @@ private:
     std::vector<RECT> variableDefinitionRects_;
     std::vector<VariableManagerActionTarget> variableManagerActionTargets_;
     ScenarioDocument scenario_;
+    mutable std::vector<ScenarioIssue> scenarioIssueCache_;
+    mutable bool scenarioIssueCacheDirty_ = true;
+    std::unordered_set<std::wstring> assetPathIndex_;
     std::unordered_map<std::wstring, std::wstring> variables_;
     std::vector<std::wstring> variableHistory_;
     size_t currentCommandIndex_ = 0;
@@ -988,8 +1040,7 @@ private:
     std::wstring selectedAssetPreviewCategory_;
     int assetPreviewVolume_ = 100;
     std::wstring selectedScenePath_;
-    std::wstring lastSavedScenarioText_;
-    std::wstring lastSavedProjectText_;
+    bool documentDirty_ = false;
     std::wstring toastText_;
     DWORD toastStartTick_ = 0;
     DWORD toastDurationMs_ = 2200;
@@ -1051,6 +1102,9 @@ private:
     bool assetDragMoved_ = false;
     bool autosaveRestoreChecked_ = false;
     bool restoringAutosave_ = false;
+    bool autosavePending_ = false;
+    ULONGLONG autosaveDueTick_ = 0;
+    std::unique_ptr<AsyncTextWriter> autosaveWriter_;
     bool previewMenuVisible_ = false;
     bool previewLogVisible_ = false;
     bool previewVisible_ = false;
